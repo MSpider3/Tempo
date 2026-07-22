@@ -199,7 +199,7 @@ To ensure a responsive UI, heavy operations are offloaded to background threads.
 - **Engine**: `python-mpv` embedded within a `QWidget`.
 - **Source**: Plays the generated proxy files for performance.
 - **Synchronization**: Syncs with the timeline playhead position.
-- **Text Overlays**: Composited via the `drawtext` filter piped to MPV, or overlaid using a Qt painter on top of the video widget.
+- **Text Overlays**: Composited via FFmpeg `drawtext` filter applied to the proxy stream. When text properties change in the inspector, a lightweight FFmpeg subprocess re-generates the overlay frame(s) and pipes them to MPV. This keeps text rendering consistent between preview and export — both use the same `drawtext` pipeline.
 - **Transport Controls**: Maps UI actions (play, pause, seek, step frame) to MPV commands.
 - **Shuttle Control**: J/K/L keyboard shortcuts managed by a state machine for fast forward, rewind, and normal playback speeds.
 
@@ -221,7 +221,27 @@ To ensure a responsive UI, heavy operations are offloaded to background threads.
 - **FFmpeg Errors**: Parse `stderr`, present user-friendly error dialogs, and log details.
 - **Missing Media**: Display a distinct icon indicator in the UI and provide a dialog to re-link missing files.
 - **Project Corruption**: Validate project data on load. Always backup the existing project file before overwriting.
-- **Crash Recovery**: Implement an auto-save mechanism that serializes the project state every N minutes.
+- **Crash Recovery**: See auto-save mechanism in Section 12a below.
+
+## 12a. Auto-Save Design
+
+Auto-save provides crash recovery and guards against data loss.
+
+- **Interval**: Every 3 minutes (configurable, minimum 1 minute).
+- **File Location**: `~/.tempo/autosave.tempo` — a standard `.tempo` JSON project file.
+- **Trigger**: A `QTimer` on the main thread fires every 3 minutes. On each tick:
+  1. Serialize the current `Project` dataclass to JSON (same path as `core/project.py:save_project`).
+  2. Write atomically: write to a `.tmp` file first, then `os.replace()` to the final path.
+  3. Log the auto-save timestamp.
+- **Recovery on Launch**:
+  1. On startup, check if `~/.tempo/autosave.tempo` exists.
+  2. Compare its `modified_at` timestamp against the most recently opened project.
+  3. If the auto-save is newer, show a dialog: *"Tempo found unsaved changes from a previous session. Recover?"*
+  4. If the user accepts, load the auto-save as the active project.
+  5. If the user declines, delete the auto-save file.
+- **Clean Exit**: On normal application shutdown (`QApplication.aboutToQuit`), delete the auto-save file.
+- **Dirty Flag**: Auto-save only writes if the project has unsaved changes (a `dirty` flag set by any `EditCommand.execute()` or `undo()`, cleared on manual save).
+- **Thread Safety**: Serialization runs on the main thread (fast for JSON). If projects grow large enough to cause UI hitches, move serialization to a `QThread` with a snapshot of the project state.
 
 ## 13. Testing Strategy
 

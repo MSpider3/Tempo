@@ -384,6 +384,10 @@ overlays, and proper export settings.
   - Fade in/out via `fade` filter
   - Cut to black/white via color source + xfade
 - [ ] `AddTransitionCommand` for undo support
+- [ ] **Export filter graph prototype** (de-risk Week 13):
+  - Build a minimal end-to-end FFmpeg filter graph: 2 clips + 1 transition
+  - Validate the concat → xfade → output pipeline works with real files
+  - This prototype becomes the foundation for the full export engine in Week 13
 
 **Dependencies:** Week 8 (inspector panel).
 
@@ -467,6 +471,14 @@ reflects speed visually. Speed badge appears. Duration adjusts correctly.
 
 **Exit criteria:** TX track visible. Can create, edit, and delete text blocks.
 Text properties editable in inspector. Text preview renders in player.
+
+> ⚠️ **Schedule Risk:** Week 12 (text overlays) + Week 13 (export with full
+> filter graph) is the tightest window in the entire roadmap. The FFmpeg filter
+> graph for multi-track export with transitions AND drawtext AND speed changes
+> stacked together gets complex fast. The export prototype from Week 10 helps,
+> but if anything slips, it will be here. **Budget Week 13 as two weeks** if
+> the filter graph proves more complex than expected. Do not compress Week 14
+> to compensate — packaging and auto-save are not optional.
 
 ---
 

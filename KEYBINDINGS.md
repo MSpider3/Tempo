@@ -100,6 +100,7 @@ Text blocks can also be created by **double-clicking** directly on the TX track 
 |-----|--------|---------|
 | `Ctrl+=` / `Ctrl++` | Zoom in timeline | Timeline |
 | `Ctrl+-` | Zoom out timeline | Timeline |
+| `Alt+Scroll` | Zoom in/out timeline (mouse wheel) | Timeline |
 | `Ctrl+Shift+F` | Fit timeline to window (zoom to fit all clips) | Timeline |
 | `Shift+Z` | Zoom timeline to fit (alias for Ctrl+Shift+F) | Timeline |
 

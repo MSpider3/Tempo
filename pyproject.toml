@@ -30,7 +30,9 @@ classifiers = [
 
 dependencies = [
     "PySide6>=6.7.0",
-    "ffmpeg-python>=0.2.0",
+    # No ffmpeg-python — uses subprocess directly via utils/ffmpeg.py.
+    # The ffmpeg-python package (kkroening) hasn't been released since 2020
+    # and has open bugs. Raw subprocess + json for ffprobe gives more control.
     "python-mpv>=1.0.7",
 ]
 
@@ -100,7 +102,6 @@ warn_unused_ignores = true
 [[tool.mypy.overrides]]
 module = [
     "mpv.*",
-    "ffmpeg.*",
 ]
 ignore_missing_imports = true
 

@@ -107,3 +107,4 @@ dmypy.json
 *.bak
 *.tmp
 *.temp
+MASTER_PROMPT.md

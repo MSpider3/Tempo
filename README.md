@@ -59,6 +59,9 @@ brew install ffmpeg mpv
 **Windows:**
 Download FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) and MPV from
 [mpv.io](https://mpv.io/installation/). Add both to your PATH.
+Also download `mpv-2.dll` from the MPV releases page and place it in the same
+folder as your Python executable or add to PATH — `python-mpv` needs this DLL
+at runtime and will fail silently without it.
 
 ---
 

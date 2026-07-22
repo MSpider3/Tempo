@@ -161,7 +161,7 @@ Interactions within the Lower Timeline:
 - **Cut (Blade Tool)**: Pressing `B` cuts all selected clips exactly at the playhead position. If no clips are selected, it cuts all clips on all tracks at the playhead. The clip is split into two independent blocks.
 - **Copy/Paste**: 
   - `Copy` (`Ctrl+C`): Copies the selected clip and all its inspector properties (speed, transitions).
-  - `Paste` (`Ctrl+V`): Pastes the copied clip at the current playhead position on the originally targeted track. If it overlaps an existing clip, it overwrites that portion.
+  - `Paste` (`Ctrl+V`): Pastes the copied clip at the current playhead position on the originally targeted track. Existing clips at or after the paste point are pushed to the right (ripple insert) to make room. This avoids the complexity of partial clip splitting and is more intuitive for beginners.
 - **Delete**: 
   - `Backspace`: Standard delete. Removes the clip and leaves a blank gap in the timeline.
   - `Delete` (or `Shift+Backspace`): Ripple delete. Removes the clip and shifts all subsequent clips on that track to the left to close the gap.
@@ -194,7 +194,7 @@ Allows creating fast-motion or slow-motion effects.
 - **Options**: `0.25x`, `0.5x`, `0.75x`, `1x`, `1.25x`, `1.5x`, `2x`, `4x`.
 - **Controls**: Adjustable via the Inspector Dropdown, the `Ctrl+R` speed change dialog, or quick keys `Ctrl+Up` / `Ctrl+Down`.
 - **Timeline Behavior**: When speed changes, the clip duration instantly adjusts. Subsequent clips on the track ripple forward or backward to accommodate the new duration.
-- **Visuals**: A speed badge (e.g., `🐰 2x` or `🐢 0.5x`) appears on the clip block.
+- **Visuals**: A text-only speed badge (e.g., `[2×]` or `[0.5×]`) appears on the clip block. Emoji are avoided because Qt emoji rendering is platform-inconsistent — on some Linux setups they render as boxes or missing glyphs.
 - **Audio Pitch**: If Pitch Correction is ON, FFmpeg uses the `asetrate` and `atempo` filters to maintain normal pitch. If OFF, pitch shifts up (chipmunk) or down (deep voice).
 - **Export Handling**: Handled via `setpts` for video and `atempo` for audio during the FFmpeg export pipeline.
 
