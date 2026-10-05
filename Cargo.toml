@@ -1,0 +1,79 @@
+[workspace]
+members = [
+    "crates/tempo-app",
+    "crates/tempo-ui",
+    "crates/tempo-timeline",
+    "crates/tempo-media",
+    "crates/tempo-audio",
+    "crates/tempo-proxy",
+    "crates/tempo-export",
+    "crates/tempo-plugin",
+    "crates/tempo-project",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Mehul <MSpider3>"]
+license = "GPL-3.0-only"
+repository = "https://github.com/MSpider3/Tempo"
+
+[workspace.dependencies]
+# UI
+gtk4          = { version = "0.9",  features = ["v4_14"] }
+libadwaita    = { version = "0.7",  features = ["v1_6"] }
+glib          = { version = "0.20" }
+gio           = { version = "0.20" }
+gdk4          = { version = "0.9"  }
+
+# Media and audio
+ffmpeg-next   = { version = "9",    features = ["codec", "format", "software-resampling", "software-scaling"] }
+pipewire      = { version = "0.10", features = ["v0_3_49"] }
+
+# Plugins
+mlua          = { version = "0.10", features = ["lua54", "vendored"] }
+toml          = { version = "0.8"  }
+
+# Project file
+rusqlite      = { version = "0.32", features = ["bundled", "serde_json"] }
+
+# Concurrency
+crossbeam     = { version = "0.8"  }
+libc          = { version = "0.2"  }
+parking_lot   = { version = "0.12" }
+
+# Serialization
+serde         = { version = "1",    features = ["derive"] }
+serde_json    = { version = "1"    }
+
+# Errors, ids, time, logging
+thiserror     = { version = "2"    }
+uuid          = { version = "1",    features = ["v4", "serde"] }
+chrono        = { version = "0.4",  features = ["serde"] }
+tempfile      = { version = "3"    }
+tracing       = { version = "0.1"  }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Style lints that do not fit this code: GTK callbacks need long closure types,
+# and a clip really is described by eight values.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+# `as_chunks` needs a newer compiler than some distributions ship.
+chunks_exact_to_as_chunks = "allow"
+
+[profile.dev]
+opt-level = 1          # Faster builds than 0, still debuggable
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"           # Link-time optimization (smaller binary, faster)
+codegen-units = 1
+strip = "symbols"      # Smaller binary for distribution
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = "none"         # Use this for performance profiling

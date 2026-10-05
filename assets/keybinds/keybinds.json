@@ -1,0 +1,784 @@
+{
+ "version": 2,
+ "comment": "Keys are GTK accelerator strings. 'resolve' is the command name in EX/DaVinci Resolve Keys.txt; a test checks the two agree. 'alt' lists extra spellings of the same physical key and is not checked.",
+ "keybinds": [
+  {
+   "group": "Playback",
+   "action": "win.play-toggle",
+   "keys": [
+    "space"
+   ],
+   "alt": [],
+   "label": "Play / Stop",
+   "resolve": "controlPlayToggle"
+  },
+  {
+   "group": "Playback",
+   "action": "win.play-forward",
+   "keys": [
+    "l"
+   ],
+   "alt": [],
+   "label": "Play Forward (press again: faster)",
+   "resolve": "controlPlayForward"
+  },
+  {
+   "group": "Playback",
+   "action": "win.play-reverse",
+   "keys": [
+    "j"
+   ],
+   "alt": [],
+   "label": "Play Reverse (press again: faster)",
+   "resolve": "controlPlayReverse"
+  },
+  {
+   "group": "Playback",
+   "action": "win.stop",
+   "keys": [
+    "k"
+   ],
+   "alt": [],
+   "label": "Stop",
+   "resolve": "controlStop"
+  },
+  {
+   "group": "Playback",
+   "action": "win.step-forward",
+   "keys": [
+    "Right"
+   ],
+   "alt": [],
+   "label": "One Frame Forward",
+   "resolve": "controlStepForward"
+  },
+  {
+   "group": "Playback",
+   "action": "win.step-reverse",
+   "keys": [
+    "Left"
+   ],
+   "alt": [],
+   "label": "One Frame Back",
+   "resolve": "controlStepReverse"
+  },
+  {
+   "group": "Playback",
+   "action": "win.large-step-forward",
+   "keys": [
+    "<Shift>Right"
+   ],
+   "alt": [],
+   "label": "One Second Forward",
+   "resolve": "controlLargeStepForward"
+  },
+  {
+   "group": "Playback",
+   "action": "win.large-step-reverse",
+   "keys": [
+    "<Shift>Left"
+   ],
+   "alt": [],
+   "label": "One Second Back",
+   "resolve": "controlLargeStepReverse"
+  },
+  {
+   "group": "Playback",
+   "action": "win.clip-next",
+   "keys": [
+    "Down"
+   ],
+   "alt": [],
+   "label": "Next Edit",
+   "resolve": "controlClipNext"
+  },
+  {
+   "group": "Playback",
+   "action": "win.clip-prev",
+   "keys": [
+    "Up"
+   ],
+   "alt": [],
+   "label": "Previous Edit",
+   "resolve": "controlClipPrev"
+  },
+  {
+   "group": "Playback",
+   "action": "win.timeline-start",
+   "keys": [
+    "Home"
+   ],
+   "alt": [],
+   "label": "Go to Start",
+   "resolve": "controlTimelineStart"
+  },
+  {
+   "group": "Playback",
+   "action": "win.timeline-end",
+   "keys": [
+    "End"
+   ],
+   "alt": [],
+   "label": "Go to End",
+   "resolve": "controlTimelineEnd"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.mark-in",
+   "keys": [
+    "i"
+   ],
+   "alt": [],
+   "label": "Mark In",
+   "resolve": "markIn"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.mark-out",
+   "keys": [
+    "o"
+   ],
+   "alt": [],
+   "label": "Mark Out",
+   "resolve": "markOut"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.clear-in",
+   "keys": [
+    "<Alt>i"
+   ],
+   "alt": [],
+   "label": "Clear In",
+   "resolve": "markResetIn"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.clear-out",
+   "keys": [
+    "<Alt>o"
+   ],
+   "alt": [],
+   "label": "Clear Out",
+   "resolve": "markResetOut"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.clear-in-out",
+   "keys": [
+    "<Alt>x"
+   ],
+   "alt": [],
+   "label": "Clear In and Out",
+   "resolve": "markResetInOut"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.mark-clip",
+   "keys": [
+    "x"
+   ],
+   "alt": [],
+   "label": "Mark Clip",
+   "resolve": "markClip"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.goto-in",
+   "keys": [
+    "<Shift>i"
+   ],
+   "alt": [],
+   "label": "Go to In",
+   "resolve": "controlGotoIn"
+  },
+  {
+   "group": "In and Out",
+   "action": "win.goto-out",
+   "keys": [
+    "<Shift>o"
+   ],
+   "alt": [],
+   "label": "Go to Out",
+   "resolve": "controlGotoOut"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-add",
+   "keys": [
+    "m"
+   ],
+   "alt": [],
+   "label": "Add Marker",
+   "resolve": "markMarkerAdd"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-add-modify",
+   "keys": [
+    "<Primary>m"
+   ],
+   "alt": [],
+   "label": "Add and Edit Marker",
+   "resolve": "markMarkerAddAndModify"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-modify",
+   "keys": [
+    "<Shift>m"
+   ],
+   "alt": [],
+   "label": "Edit Marker",
+   "resolve": "markMarkerModify"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-delete",
+   "keys": [
+    "<Alt>m"
+   ],
+   "alt": [],
+   "label": "Delete Marker",
+   "resolve": "markMarkerClear"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-next",
+   "keys": [
+    "<Shift>Down"
+   ],
+   "alt": [],
+   "label": "Next Marker",
+   "resolve": "controlMarkersNext"
+  },
+  {
+   "group": "Markers",
+   "action": "win.marker-prev",
+   "keys": [
+    "<Shift>Up"
+   ],
+   "alt": [],
+   "label": "Previous Marker",
+   "resolve": "controlMarkersPrev"
+  },
+  {
+   "group": "Edit Modes",
+   "action": "win.tool-select",
+   "keys": [
+    "a"
+   ],
+   "alt": [],
+   "label": "Selection Mode",
+   "resolve": "editPointer"
+  },
+  {
+   "group": "Edit Modes",
+   "action": "win.tool-trim",
+   "keys": [
+    "t"
+   ],
+   "alt": [],
+   "label": "Trim Mode",
+   "resolve": "editTrim"
+  },
+  {
+   "group": "Edit Modes",
+   "action": "win.tool-blade",
+   "keys": [
+    "b"
+   ],
+   "alt": [],
+   "label": "Blade Mode",
+   "resolve": "editBlade"
+  },
+  {
+   "group": "Edit Modes",
+   "action": "win.snap-toggle",
+   "keys": [
+    "n"
+   ],
+   "alt": [],
+   "label": "Snapping",
+   "resolve": "editSnapping"
+  },
+  {
+   "group": "Edit Modes",
+   "action": "win.linked-selection-toggle",
+   "keys": [
+    "<Primary><Shift>l"
+   ],
+   "alt": [],
+   "label": "Linked Selection",
+   "resolve": "editLinkedSelection"
+  },
+  {
+   "group": "Editing",
+   "action": "win.edit-insert",
+   "keys": [
+    "F9"
+   ],
+   "alt": [],
+   "label": "Insert",
+   "resolve": "editInsertOverwriteActionInsert"
+  },
+  {
+   "group": "Editing",
+   "action": "win.edit-overwrite",
+   "keys": [
+    "F10"
+   ],
+   "alt": [],
+   "label": "Overwrite",
+   "resolve": "editInsertOverwriteActionOverwrite"
+  },
+  {
+   "group": "Editing",
+   "action": "win.edit-replace",
+   "keys": [
+    "F11"
+   ],
+   "alt": [],
+   "label": "Replace",
+   "resolve": "editInsertOverwriteActionReplace"
+  },
+  {
+   "group": "Editing",
+   "action": "win.edit-place-on-top",
+   "keys": [
+    "F12"
+   ],
+   "alt": [],
+   "label": "Place on Top",
+   "resolve": "editInsertOverwriteActionPlaceOnTop"
+  },
+  {
+   "group": "Editing",
+   "action": "win.edit-append",
+   "keys": [
+    "<Shift>F12"
+   ],
+   "alt": [],
+   "label": "Append at End",
+   "resolve": "editInsertOverwriteActionAppendAtEnd"
+  },
+  {
+   "group": "Editing",
+   "action": "win.razor",
+   "keys": [
+    "<Primary>b"
+   ],
+   "alt": [],
+   "label": "Razor (cut at playhead)",
+   "resolve": "editBladeRazor"
+  },
+  {
+   "group": "Editing",
+   "action": "win.split-clip",
+   "keys": [
+    "<Primary>backslash"
+   ],
+   "alt": [],
+   "label": "Split Clip",
+   "resolve": "editM2SplitClip"
+  },
+  {
+   "group": "Editing",
+   "action": "win.delete",
+   "keys": [
+    "BackSpace"
+   ],
+   "alt": [],
+   "label": "Delete (leave gap)",
+   "resolve": "editBackspace"
+  },
+  {
+   "group": "Editing",
+   "action": "win.ripple-delete",
+   "keys": [
+    "<Shift>BackSpace",
+    "Delete"
+   ],
+   "alt": [],
+   "label": "Ripple Delete (close gap)",
+   "resolve": "editDelete"
+  },
+  {
+   "group": "Editing",
+   "action": "win.clip-enable-toggle",
+   "keys": [
+    "d"
+   ],
+   "alt": [],
+   "label": "Enable / Disable Clip",
+   "resolve": "editClipEnabled"
+  },
+  {
+   "group": "Editing",
+   "action": "win.cut",
+   "keys": [
+    "<Primary>x"
+   ],
+   "alt": [],
+   "label": "Cut",
+   "resolve": null
+  },
+  {
+   "group": "Editing",
+   "action": "win.copy",
+   "keys": [
+    "<Primary>c"
+   ],
+   "alt": [],
+   "label": "Copy",
+   "resolve": null
+  },
+  {
+   "group": "Editing",
+   "action": "win.paste",
+   "keys": [
+    "<Primary>v"
+   ],
+   "alt": [],
+   "label": "Paste",
+   "resolve": null
+  },
+  {
+   "group": "Editing",
+   "action": "win.undo",
+   "keys": [
+    "<Primary>z"
+   ],
+   "alt": [],
+   "label": "Undo",
+   "resolve": "editUndo"
+  },
+  {
+   "group": "Editing",
+   "action": "win.redo",
+   "keys": [
+    "<Primary><Shift>z"
+   ],
+   "alt": [],
+   "label": "Redo",
+   "resolve": "editRedo"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-all",
+   "keys": [
+    "<Primary>a"
+   ],
+   "alt": [],
+   "label": "Select All",
+   "resolve": "editSelectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.deselect-all",
+   "keys": [
+    "<Primary><Shift>a"
+   ],
+   "alt": [],
+   "label": "Deselect All",
+   "resolve": "editDeselectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.link-toggle",
+   "keys": [
+    "<Primary><Alt>l"
+   ],
+   "alt": [],
+   "label": "Link / Unlink Clips",
+   "resolve": "editLink"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.trim-start",
+   "keys": [
+    "<Shift>bracketleft"
+   ],
+   "alt": [
+    "braceleft"
+   ],
+   "label": "Trim Start to Playhead",
+   "resolve": "editNudgeTrimStepTrimStart"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.trim-end",
+   "keys": [
+    "<Shift>bracketright"
+   ],
+   "alt": [
+    "braceright"
+   ],
+   "label": "Trim End to Playhead",
+   "resolve": "editNudgeTrimStepTrimEnd"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.nudge-reverse",
+   "keys": [
+    "comma"
+   ],
+   "alt": [],
+   "label": "Nudge One Frame Left",
+   "resolve": "editNudgeTrimStepNudgeReverse"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.nudge-forward",
+   "keys": [
+    "period"
+   ],
+   "alt": [],
+   "label": "Nudge One Frame Right",
+   "resolve": "editNudgeTrimStepNudgeForward"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.nudge-multi-left",
+   "keys": [
+    "<Shift>comma"
+   ],
+   "alt": [
+    "less"
+   ],
+   "label": "Nudge Five Frames Left",
+   "resolve": "editNudgeTrimStepTrimMultiFrameLeft"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.nudge-multi-right",
+   "keys": [
+    "<Shift>period"
+   ],
+   "alt": [
+    "greater"
+   ],
+   "label": "Nudge Five Frames Right",
+   "resolve": "editNudgeTrimStepTrimMultiFrameRight"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.clip-move-up",
+   "keys": [
+    "<Alt>Up"
+   ],
+   "alt": [],
+   "label": "Move Clip Up a Track",
+   "resolve": "editMoveClipsUp"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.clip-move-down",
+   "keys": [
+    "<Alt>Down"
+   ],
+   "alt": [],
+   "label": "Move Clip Down a Track",
+   "resolve": "editMoveClipsDown"
+  },
+  {
+   "group": "View",
+   "action": "win.zoom-in",
+   "keys": [
+    "<Primary>equal"
+   ],
+   "alt": [
+    "<Primary>plus"
+   ],
+   "label": "Zoom In",
+   "resolve": "viewZoomSubZoomIn"
+  },
+  {
+   "group": "View",
+   "action": "win.zoom-out",
+   "keys": [
+    "<Primary>minus"
+   ],
+   "alt": [],
+   "label": "Zoom Out",
+   "resolve": "viewZoomSubZoomOut"
+  },
+  {
+   "group": "View",
+   "action": "win.zoom-fit",
+   "keys": [
+    "<Shift>z"
+   ],
+   "alt": [],
+   "label": "Zoom to Fit",
+   "resolve": "viewZoomSubZoomToFit"
+  },
+  {
+   "group": "View",
+   "action": "win.viewer-toggle",
+   "keys": [
+    "q"
+   ],
+   "alt": [],
+   "label": "Source / Timeline Viewer",
+   "resolve": "viewViewerToggle"
+  },
+  {
+   "group": "View",
+   "action": "win.viewer-cinema",
+   "keys": [
+    "<Primary>f",
+    "p"
+   ],
+   "alt": [],
+   "label": "Full-Screen Viewer",
+   "resolve": "workspaceViewerModeCinemaViewer"
+  },
+  {
+   "group": "Panels",
+   "action": "win.focus-media-pool",
+   "keys": [
+    "<Primary>2"
+   ],
+   "alt": [],
+   "label": "Go to Media Pool",
+   "resolve": "viewActiveWindowSelectionMediaPoolClips"
+  },
+  {
+   "group": "Panels",
+   "action": "win.focus-timeline",
+   "keys": [
+    "<Primary>4"
+   ],
+   "alt": [],
+   "label": "Go to Timeline",
+   "resolve": "viewActiveWindowSelectionTimeline"
+  },
+  {
+   "group": "Panels",
+   "action": "win.focus-inspector",
+   "keys": [
+    "<Primary>9"
+   ],
+   "alt": [],
+   "label": "Go to Inspector",
+   "resolve": "viewActiveWindowSelectionInspector"
+  },
+  {
+   "group": "Pages",
+   "action": "app.project-manager",
+   "keys": [
+    "<Shift>1"
+   ],
+   "alt": [
+    "exclam"
+   ],
+   "label": "Project Manager",
+   "resolve": "fileProjectManager"
+  },
+  {
+   "group": "Pages",
+   "action": "win.page-edit",
+   "keys": [
+    "<Shift>4"
+   ],
+   "alt": [
+    "dollar"
+   ],
+   "label": "Edit Page",
+   "resolve": "workspacePrimaryWorkspaceEdit"
+  },
+  {
+   "group": "Pages",
+   "action": "win.page-export",
+   "keys": [
+    "<Shift>8"
+   ],
+   "alt": [
+    "asterisk"
+   ],
+   "label": "Export Page",
+   "resolve": "workspacePrimaryWorkspaceDeliver"
+  },
+  {
+   "group": "File",
+   "action": "app.save",
+   "keys": [
+    "<Primary>s"
+   ],
+   "alt": [],
+   "label": "Save Project",
+   "resolve": "fileSaveProject"
+  },
+  {
+   "group": "File",
+   "action": "app.preferences",
+   "keys": [
+    "<Primary>comma"
+   ],
+   "alt": [],
+   "label": "Preferences",
+   "resolve": "resolvePreferences"
+  },
+  {
+   "group": "File",
+   "action": "win.import-media",
+   "keys": [
+    "<Primary>i"
+   ],
+   "alt": [],
+   "label": "Import Media",
+   "resolve": "fileImportMedia"
+  },
+  {
+   "group": "File",
+   "action": "app.quit",
+   "keys": [
+    "<Primary>q"
+   ],
+   "alt": [],
+   "label": "Quit",
+   "resolve": "resolveQuit"
+  },
+  {
+   "group": "Tempo only",
+   "action": "win.copy-chapters",
+   "keys": [
+    "<Primary><Alt>m"
+   ],
+   "alt": [],
+   "label": "Copy Chapter List",
+   "resolve": null
+  },
+  {
+   "group": "Tempo only",
+   "action": "win.queue-add",
+   "keys": [
+    "<Primary>Return"
+   ],
+   "alt": [],
+   "label": "Export Page: Add to Render Queue",
+   "resolve": null
+  },
+  {
+   "group": "Tempo only",
+   "action": "win.queue-render-all",
+   "keys": [
+    "<Primary><Shift>Return"
+   ],
+   "alt": [],
+   "label": "Export Page: Render All",
+   "resolve": null
+  },
+  {
+   "group": "Tempo only",
+   "action": "win.show-shortcuts",
+   "keys": [
+    "F1"
+   ],
+   "alt": [],
+   "label": "Keyboard Shortcuts",
+   "resolve": null
+  }
+ ]
+}

@@ -1,0 +1,13 @@
+[plugin]
+id = "dev.tempo.remove-silence"
+name = "Remove Silence"
+version = "1.0.0"
+description = "Cuts the quiet stretches out of the selected audio clips."
+
+[permissions]
+timeline = "write"
+
+[[command]]
+id = "remove-silence"
+name = "Remove Silence"
+function = "remove_silence"

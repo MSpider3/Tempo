@@ -1,0 +1,19 @@
+[package]
+name = "tempo-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempo-project = { path = "../tempo-project" }

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    # Tempo needs libadwaita 1.6 or newer; Fedora ships current GNOME libraries.
+    container: fedora:44
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git gcc clang-devel pkgconf-pkg-config rust cargo clippy \
+            gtk4-devel libadwaita-devel glib2-devel pipewire-devel \
+            ffmpeg-free ffmpeg-free-devel
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fedora44-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: fedora44-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

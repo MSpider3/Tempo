@@ -1,0 +1,16 @@
+[package]
+name = "tempo-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+ffmpeg-next = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

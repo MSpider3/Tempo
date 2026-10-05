@@ -1,0 +1,18 @@
+[package]
+name = "tempo-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+mlua = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

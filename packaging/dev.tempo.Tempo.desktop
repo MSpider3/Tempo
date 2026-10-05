@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Tempo
+GenericName=Video Editor
+Comment=Fast, modern video editor for Linux
+Exec=tempo %u
+Icon=dev.tempo.Tempo
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;GTK;
+Keywords=video;editor;cut;edit;render;timeline;davinci;resolve;
+MimeType=application/x-tempo-project;
+StartupNotify=true
