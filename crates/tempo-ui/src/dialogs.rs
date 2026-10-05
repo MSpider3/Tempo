@@ -178,3 +178,98 @@ pub fn shortcuts(parent: &impl IsA<gtk::Widget>) {
     dialog.add_responses(&[("close", "Close")]);
     dialog.present(Some(parent));
 }
+
+/// Offer to find media files that have moved. The folder search runs on a worker.
+pub fn relink_missing(parent: &impl IsA<gtk::Window>, state: &Rc<AppState>) {
+    let missing: Vec<String> = state
+        .with_project(|p| {
+            let mut names: Vec<String> = p
+                .sources
+                .values()
+                .filter(|s| s.is_missing)
+                .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
+    if missing.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
+    let more = if missing.len() > shown.len() { format!("\n… and {} more", missing.len() - shown.len()) } else { String::new() };
+    let dialog = adw::AlertDialog::builder()
+        .heading("Some media files were not found")
+        .body(format!("{}{more}\n\nIf you moved them, pick the folder they are in now.", shown.join("\n")))
+        .build();
+    dialog.add_responses(&[("skip", "Keep Offline"), ("locate", "Locate Folder…")]);
+    dialog.set_default_response(Some("locate"));
+    dialog.set_close_response("skip");
+    let state = state.clone();
+    let window: gtk::Window = parent.as_ref().clone();
+    let present_on = window.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "locate" {
+            return;
+        }
+        let state = state.clone();
+        let chooser = gtk::FileDialog::builder().title("Folder with the Missing Files").modal(true).build();
+        chooser.select_folder(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
+            let Some(folder) = result.ok().and_then(|f| f.path()) else { return };
+            let wanted: Vec<(uuid::Uuid, std::ffi::OsString)> = state
+                .with_project(|p| {
+                    p.sources.values().filter(|s| s.is_missing).filter_map(|s| s.path.file_name().map(|n| (s.id, n.to_os_string()))).collect()
+                })
+                .unwrap_or_default();
+            let total = wanted.len();
+            let state = state.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let found = gtk::gio::spawn_blocking(move || find_files(&folder, &wanted)).await.unwrap_or_default();
+                let count = found.len();
+                if let Some(project) = state.project.borrow_mut().as_mut() {
+                    for (id, path) in found {
+                        if let Some(source) = project.sources.get_mut(&id) {
+                            source.path = path;
+                            source.is_missing = false;
+                        }
+                    }
+                }
+                if count > 0 {
+                    state.sync_player();
+                    state.set_dirty(true);
+                    state.emit(crate::state::Change::Media);
+                    state.emit(crate::state::Change::Timeline);
+                }
+                state.message(format!("Found {count} of {total} missing files"));
+            });
+        });
+    });
+    dialog.present(Some(&present_on));
+}
+
+/// Look for files by name under `folder`, a few levels deep.
+fn find_files(folder: &std::path::Path, wanted: &[(uuid::Uuid, std::ffi::OsString)]) -> Vec<(uuid::Uuid, PathBuf)> {
+    const MAX_DEPTH: usize = 6;
+    const MAX_ENTRIES: usize = 100_000;
+    let mut found = Vec::new();
+    let mut stack = vec![(folder.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES || found.len() == wanted.len() {
+                return found;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if let Some((id, _)) = wanted.iter().find(|(id, name)| *name == entry.file_name() && !found.iter().any(|(f, _)| f == id)) {
+                found.push((*id, path));
+            }
+        }
+    }
+    found
+}

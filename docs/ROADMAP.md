@@ -14,43 +14,41 @@
 
 ### Where the code is today (updated 2026-10-05)
 
-The interface was rebuilt on 2026-10-05 to match `VISUAL_DESIGN.md`, together with the parts
-of the engine it needs. Measured on the development machine (not yet on the reference i3):
-about 0.5 % CPU while paused, about a third of one core while playing a 540p proxy, about
-200 MB of memory with a project open.
+Boxes ticked below are built and were checked by tests or by running the app. A box is left
+open if any part of its line is missing.
 
-| Area | State |
+**Measured** on the development machine, an Intel Core i3-1005G1 (2 cores, 4 threads,
+integrated graphics), release build, with a 2400 × 1080 HEVC variable-frame-rate phone
+recording:
+
+| Measure | Result |
 |---|---|
-| Screens | Loading, Project Manager, Edit page and Export page exist and work |
-| Timeline UI | One custom-drawn widget: ruler, tracks, clips, markers, playhead; move, trim, blade, snapping, drag from Media Pool |
-| Undo | Every edit, marker and track change goes through `CommandLog` |
-| Keys | Loaded from `assets/keybinds/keybinds.json`; a test checks them against the Resolve export |
-| Playback | Decoding runs on its own thread; nothing is decoded while paused; frame-threaded; preview at reduced size |
-| Viewer | Drawn by GTK's renderer; zoom, position, rotation and opacity are applied on the GPU. Up to four video layers |
-| Proxies | 540p proxies made in the background at lowest priority for footage above 720p or not H.264 |
-| Save | On a worker thread; autosave every two minutes; restore prompt after a crash |
-| Export | Real: FFmpeg reads the original files, composites tracks, mixes audio, writes chapters. Queue with cancel |
-| Chapters | From named markers; embedded in the file; copy as text with YouTube checks |
+| Start to window | 0.7 s |
+| Probe a file on import | about 55 ms |
+| Paused, project open | 0.6 % of one core, 193 MB |
+| Playing the original HEVC file at Half quality | 124 % of one core (about a third of the machine), 220 MB, 6 dropped frames in 25 s |
+| Playing its 540p proxy | 25 % of one core, 186 MB, no dropped frames |
+| Making the proxy | 51 s for a 135 s clip, in the background |
+| Program size | 4.4 MB |
 
-**Not done yet — the main gaps**
+This is a newer i3 than the i3-6100 reference machine, and it has more memory, so the
+reference machine still needs its own run.
+
+**Main gaps**
 
 | Gap | Note |
 |---|---|
-| **Sound during preview** | There is no audio output yet. Playback is timed by a clock. Audio is present in exports. This is the next piece of work (PipeWire) |
-| Hardware (VA-API) decode | Still software only |
-| Waveforms on audio clips | Not drawn |
-| Transitions and titles | Not rendered in viewer or export; the Effects panel is empty |
-| Ripple trim and roll | Trim mode currently trims like Selection mode |
-| Linked video and audio clips | A dropped video places two separate clips |
-| Replace edit (`F11`), multi-select, copy and paste, clip enable (`D`) | Not implemented; their keys are unbound |
-| Source In/Out, dual viewer, vertical layout | Source In/Out works; dual viewer and vertical layout are not built |
-| Inspector live drag | Values change in steps, one undo step each |
-| Preferences, Project Settings, Missing Media relink, first-use hints | Not built |
-| Icons | Taken from the system icon theme; some names are missing on some themes. Tempo should ship its own set |
-| Lua plugins | Not started. The old WASM crate is no longer linked into the app |
-| Old code | `tempo-render` (wgpu), `tempo-audio`, `tempo-plugin`, `tempo-compute` and the old `RenderQueue` remain in the workspace but the app no longer uses them |
-
-The next phase starts with sound.
+| Hardware (VA-API) decode | Not built. It could not be tested on the development machine, whose VA-API driver fails to start |
+| Transitions and titles | Not rendered; the Effects panel is empty |
+| Lua plugins | Not started |
+| Multi-select, linked clips, roll trim, duplicate | Not built |
+| Dual viewer, vertical layout | Not built |
+| Preferences and Project Settings windows | Not built |
+| Inspector | Transform, Composite and Audio only; values change in steps |
+| Project Manager | No rename, duplicate or move to trash |
+| Export | Uses the `ffmpeg` program, not the libraries; no hardware encode |
+| Proxies | Made for all heavy footage on import, not only when playback drops frames |
+| A/V sync | Picture follows the audio clock; the 40 ms target has not been measured |
 
 ---
 
@@ -58,16 +56,16 @@ The next phase starts with sound.
 
 **Goal:** a single clip plays with sound, smoothly, with the UI thread doing no media work.
 
-- [ ] Playback worker thread owns decoding. The UI only receives finished frames.
-- [ ] No decoding when the playhead has not moved.
-- [ ] Frame-threaded software decode. Separate demuxers for audio and video.
+- [x] Playback worker thread owns decoding. The UI only receives finished frames.
+- [x] No decoding when the playhead has not moved.
+- [x] Frame-threaded software decode. Separate demuxers for audio and video.
 - [ ] Real VA-API decode with automatic fallback to software.
 - [ ] Viewer shows frames without a round trip through CPU memory: `GdkDmabufTexture` in
       `GtkGraphicsOffload` when hardware decode is active, YUV upload otherwise.
-- [ ] Real PipeWire output. Audio is the clock; video follows it.
+- [x] Real PipeWire output. Audio is the clock; video follows it.
 - [ ] Look-ahead that fills a small frame cache (frames kept in YUV).
-- [ ] Scrubbing: keyframes while dragging, exact frame on pause or release.
-- [ ] `Space`, `J` `K` `L`, arrow keys, `Home`, `End`.
+- [x] Scrubbing: keyframes while dragging, exact frame on pause or release.
+- [x] `Space`, `J` `K` `L`, arrow keys, `Home`, `End`.
 - [ ] Variable-frame-rate files play in sync.
 
 **Done when**
@@ -84,37 +82,37 @@ The next phase starts with sound.
 **Goal:** a real editor. Someone can make a rough cut and save it.
 
 **Shell**
-- [ ] Root stack: Loading, Project Manager, project view. Page bar at the bottom.
-- [ ] Design tokens in `tempo.css`; forced dark scheme.
-- [ ] Loading screen driven by real start-up steps.
+- [x] Root stack: Loading, Project Manager, project view. Page bar at the bottom.
+- [x] Design tokens in `tempo.css`; forced dark scheme.
+- [x] Loading screen driven by real start-up steps.
 - [ ] Project Manager: grid, search, new, open, import, rename, duplicate, trash.
 
 **Timeline**
-- [ ] `TimelineWidget`: one custom-drawn, scrollable widget. Ruler, tracks, clips, playhead.
-- [ ] Remove the button-based timeline and all sample clips.
+- [x] `TimelineWidget`: one custom-drawn, scrollable widget. Ruler, tracks, clips, playhead.
+- [x] Remove the button-based timeline and all sample clips.
 - [ ] Selection, Trim and Blade modes; move, trim, ripple, roll, split.
-- [ ] Insert, Overwrite, Replace, Place on Top, Append.
+- [x] Insert, Overwrite, Replace, Place on Top, Append.
 - [ ] Snapping; linked clips and linked selection.
 - [ ] Copy, cut, paste, duplicate, enable/disable clip, lock track.
-- [ ] **Every change goes through `CommandLog`.** Undo and redo.
+- [x] **Every change goes through `CommandLog`.** Undo and redo.
 - [ ] Zoom and scroll with Resolve's mouse gestures.
 
 **Media and viewer**
 - [ ] Media Pool on `GtkGridView`; background probing; thumbnails cached on disk.
-- [ ] Source mode in the viewer with In/Out; `Q` to switch.
-- [ ] Multi-track compositing for `V1`–`V4`; audio mixing for `A1`–`A4`.
-- [ ] Waveforms, generated in the background and cached on disk.
-- [ ] Audio meter.
+- [x] Source mode in the viewer with In/Out; `Q` to switch.
+- [x] Multi-track compositing for `V1`–`V4`; audio mixing for `A1`–`A4`.
+- [x] Waveforms, generated in the background and cached on disk.
+- [x] Audio meter.
 
 **Markers**
 - [ ] Add, name, colour, move, delete (all undoable). Jump to next and previous.
 
 **Project**
-- [ ] Save and load on a worker thread. Autosave. Crash recovery prompt.
-- [ ] Missing-media dialog with relink.
+- [x] Save and load on a worker thread. Autosave. Crash recovery prompt.
+- [x] Missing-media dialog with relink.
 
 **Keys**
-- [ ] `keybinds.json` matches `KEYBINDS.md`. Tests pass: no duplicate keys, no reserved keys, and every Resolve-named binding equals the key in `EX/DaVinci Resolve Keys.txt`.
+- [x] `keybinds.json` matches `KEYBINDS.md`. Tests pass: no duplicate keys, no reserved keys, and every Resolve-named binding equals the key in `EX/DaVinci Resolve Keys.txt`.
 
 **Done when**
 1. Ten mixed clips (H.264 and HEVC, 720p and 1080p, 24 and 30 fps) are cut into a
@@ -137,13 +135,13 @@ The next phase starts with sound.
 - [ ] Title clips: Text and Lower Third.
 - [ ] Vertical-project layout.
 - [ ] Automatic small proxies, made only when playback drops frames, paused during playback.
-- [ ] Export page: presets, settings, viewer with range, render queue.
+- [x] Export page: presets, settings, viewer with range, render queue.
 - [ ] Export engine in-process (no `ffmpeg` program): timeline video and mixed audio,
       correct colour tagging, hardware encode when available.
-- [ ] Quick Export dialog. Activity area in the page bar.
-- [ ] Chapters from markers: written into the file, and Copy chapters with the YouTube checks.
-- [ ] Share: open the platform's upload page and reveal the file.
-- [ ] Marker dialog (name, colour, note).
+- [x] Quick Export dialog. Activity area in the page bar.
+- [x] Chapters from markers: written into the file, and Copy chapters with the YouTube checks.
+- [x] Share: open the platform's upload page and reveal the file.
+- [x] Marker dialog (name, colour, note).
 - [ ] Preferences and Project Settings dialogs. First-use hints.
 
 **Done when**
@@ -176,7 +174,7 @@ The next phase starts with sound.
 - [ ] `tempo` API: project, timeline read and write, markers, media, ui.
 - [ ] Commands in context menus; one undo step per run.
 - [ ] Built-in example: Remove Silence.
-- [ ] Remove `wasmtime` and `tempo-compute` from the build.
+- [x] Remove `wasmtime` and `tempo-compute` from the build.
 
 **Done when**
 1. A transition plugin made of one manifest and one shader installs, appears in Effects,

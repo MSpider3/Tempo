@@ -671,6 +671,7 @@ impl Command for SplitClipCommand {
 
 #[derive(Debug)]
 pub enum PropertyChange {
+    Enabled(bool),
     Opacity(f32),
     Volume(f32),
     Muted(bool),
@@ -707,6 +708,10 @@ impl Command for SetClipPropertyCommand {
             .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
 
         match &self.change {
+            PropertyChange::Enabled(val) => {
+                self.old_change = Some(PropertyChange::Enabled(clip.properties.enabled));
+                clip.properties.enabled = *val;
+            }
             PropertyChange::Opacity(val) => {
                 self.old_change = Some(PropertyChange::Opacity(clip.properties.opacity));
                 clip.properties.opacity = *val;
@@ -758,6 +763,7 @@ impl Command for SetClipPropertyCommand {
             .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
 
         match old {
+            PropertyChange::Enabled(val) => clip.properties.enabled = *val,
             PropertyChange::Opacity(val) => clip.properties.opacity = *val,
             PropertyChange::Volume(val) => clip.properties.volume = *val,
             PropertyChange::Muted(val) => clip.properties.muted = *val,
@@ -1339,6 +1345,82 @@ impl Command for SetTrackFlagCommand {
             TrackFlag::Locked => "Lock track",
             TrackFlag::Enabled => "Enable track",
         }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// RippleTrimCommand — trim an edge and move everything after it by the same amount
+// ----------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct RippleTrimCommand {
+    clip_id: Uuid,
+    edge: TrimEdge,
+    delta_us: i64,
+    track_id: Option<Uuid>,
+    previous_clips: Option<Vec<Clip>>,
+}
+
+impl RippleTrimCommand {
+    /// `delta_us` moves the chosen edge: positive is later, negative is earlier.
+    pub fn new(clip_id: Uuid, edge: TrimEdge, delta_us: i64) -> Self {
+        Self { clip_id, edge, delta_us, track_id: None, previous_clips: None }
+    }
+}
+
+impl Command for RippleTrimCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let track_id = timeline.find_clip(self.clip_id).map(|(t, _)| t.id).ok_or(TimelineError::ClipNotFound(self.clip_id))?;
+        let track = timeline.find_track_mut(track_id).ok_or(TimelineError::TrackNotFound(track_id))?;
+        if track.locked {
+            return Err(TimelineError::TrackLocked(track_id));
+        }
+        let before = track.clips.clone();
+        let clip = track.find_clip_mut(self.clip_id).ok_or(TimelineError::ClipNotFound(self.clip_id))?;
+        let old_out = clip.timeline_out;
+
+        // The clip keeps its start on the timeline; only its length changes.
+        let shift = match self.edge {
+            TrimEdge::In => {
+                let new_source_in = clip.source_in + self.delta_us;
+                if new_source_in < 0 || new_source_in >= clip.source_out {
+                    return Err(TimelineError::InvalidTimeRange(new_source_in, clip.source_out));
+                }
+                clip.source_in = new_source_in;
+                clip.timeline_out -= self.delta_us;
+                -self.delta_us
+            }
+            TrimEdge::Out => {
+                let new_out = clip.timeline_out + self.delta_us;
+                if new_out <= clip.timeline_in {
+                    return Err(TimelineError::InvalidTimeRange(clip.timeline_in, new_out));
+                }
+                clip.timeline_out = new_out;
+                clip.source_out += self.delta_us;
+                self.delta_us
+            }
+        };
+        for other in track.clips.iter_mut().filter(|c| c.id != self.clip_id && c.timeline_in >= old_out) {
+            other.timeline_in += shift;
+            other.timeline_out += shift;
+        }
+        track.sort_clips();
+        self.track_id = Some(track_id);
+        self.previous_clips = Some(before);
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let track_id = self.track_id.ok_or(TimelineError::ClipNotFound(self.clip_id))?;
+        let track = timeline.find_track_mut(track_id).ok_or(TimelineError::TrackNotFound(track_id))?;
+        if let Some(previous) = self.previous_clips.take() {
+            track.clips = previous;
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        "Ripple Trim"
     }
 }
 
@@ -2029,6 +2111,39 @@ mod tests {
         log.execute(Box::new(SetTrackFlagCommand::new(id, TrackFlag::Locked, true)), &mut timeline).unwrap();
         assert!(timeline.tracks[0].locked);
         log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn test_ripple_trim_moves_later_clips_and_undoes() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let src = Uuid::new_v4();
+        let a = Clip::new(track_id, src, ClipType::Video, "a", 0, 4_000_000, 1_000_000, 5_000_000);
+        let b = Clip::new(track_id, src, ClipType::Video, "b", 4_000_000, 6_000_000, 0, 2_000_000);
+        let (a_id, b_id) = (a.id, b.id);
+        timeline.tracks[0].clips = vec![a, b];
+        let before = timeline.clone();
+        let mut log = CommandLog::new();
+
+        // Shorten the end of `a` by one second: `b` closes the gap.
+        log.execute(Box::new(RippleTrimCommand::new(a_id, TrimEdge::Out, -1_000_000)), &mut timeline).unwrap();
+        let (_, a) = timeline.find_clip(a_id).unwrap();
+        assert_eq!((a.timeline_in, a.timeline_out, a.source_out), (0, 3_000_000, 4_000_000));
+        assert_eq!(timeline.find_clip(b_id).unwrap().1.timeline_in, 3_000_000);
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        // Trim the start of `a` by one second: it stays at zero, gets shorter, `b` follows.
+        log.execute(Box::new(RippleTrimCommand::new(a_id, TrimEdge::In, 1_000_000)), &mut timeline).unwrap();
+        let (_, a) = timeline.find_clip(a_id).unwrap();
+        assert_eq!((a.timeline_in, a.timeline_out, a.source_in), (0, 3_000_000, 2_000_000));
+        assert_eq!(timeline.find_clip(b_id).unwrap().1.timeline_in, 3_000_000);
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        // Trimming before the start of the media is refused and changes nothing.
+        assert!(log.execute(Box::new(RippleTrimCommand::new(a_id, TrimEdge::In, -2_000_000)), &mut timeline).is_err());
         assert_eq!(timeline, before);
     }
 }

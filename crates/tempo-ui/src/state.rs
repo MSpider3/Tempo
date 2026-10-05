@@ -24,6 +24,8 @@ pub enum Change {
     Options,
     /// Saved / unsaved state flipped.
     Dirty,
+    /// Waveform data for a source became available.
+    Waveform,
     /// Something the user should be told.
     Message(String),
 }
@@ -56,6 +58,10 @@ pub struct AppState {
     pub src_out: Cell<Option<i64>>,
     /// Item selected in the Media Pool.
     pub media_selection: Cell<Option<Uuid>>,
+    /// The clip last copied or cut.
+    pub clipboard: RefCell<Option<Clip>>,
+    /// Loudness of each source, 50 values a second, for drawing waveforms.
+    pub waveforms: RefCell<std::collections::HashMap<Uuid, Rc<Vec<u8>>>>,
     pub player: Player,
     listeners: RefCell<Vec<Rc<dyn Fn(&Change)>>>,
 }
@@ -78,6 +84,8 @@ impl AppState {
             src_in: Cell::new(None),
             src_out: Cell::new(None),
             media_selection: Cell::new(None),
+            clipboard: RefCell::new(None),
+            waveforms: RefCell::new(Default::default()),
             player: Player::new(),
             listeners: RefCell::new(Vec::new()),
         })
@@ -124,6 +132,7 @@ impl AppState {
         self.log.borrow_mut().clear();
         self.selection.set(None);
         self.source_clip.set(None);
+        self.waveforms.borrow_mut().clear();
         self.media_selection.set(None);
         self.src_in.set(None);
         self.src_out.set(None);

@@ -59,7 +59,7 @@ struct Piece<'a> {
 fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Piece<'a>> {
     let mut out: Vec<Piece> = clips
         .iter()
-        .filter(|c| kinds.contains(&c.clip_type) && c.timeline_out > r0 && c.timeline_in < r1)
+        .filter(|c| c.properties.enabled && kinds.contains(&c.clip_type) && c.timeline_out > r0 && c.timeline_in < r1)
         .map(|c| {
             let start = c.timeline_in.max(r0);
             Piece { clip: c, start: start - r0, end: c.timeline_out.min(r1) - r0, source_in: c.source_in + (start - c.timeline_in) }
@@ -243,13 +243,8 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
     if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
+    args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
     args.extend([
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
-        e.crf.min(51).to_string(),
         "-movflags".into(),
         "+faststart".into(),
         "-t".into(),
@@ -277,11 +272,10 @@ pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBoo
     };
     let (args, total) = build_ffmpeg_args(project, e, metadata_file.as_ref())?;
 
-    let mut child = Command::new("ffmpeg")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut command = Command::new("ffmpeg");
+    command.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::ffmpeg::die_with_parent(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|err| ExportError::Ffmpeg(format!("Could not start ffmpeg: {err}")))?;
 

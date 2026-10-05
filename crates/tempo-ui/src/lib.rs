@@ -16,6 +16,7 @@ pub mod timeline;
 pub mod util;
 pub mod video_surface;
 pub mod viewer;
+pub mod waveforms;
 pub mod window;
 
 pub use app::TempoApp;

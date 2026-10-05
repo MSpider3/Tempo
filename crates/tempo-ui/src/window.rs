@@ -22,6 +22,7 @@ use crate::proxies::Proxies;
 use crate::state::{AppState, Change, Tool};
 use crate::util::{label, labelled_toggle, tool_button};
 use crate::viewer::Viewer;
+use crate::waveforms::Waveforms;
 
 const AUTOSAVE_SECONDS: u32 = 120;
 
@@ -36,6 +37,7 @@ pub struct MainWindow {
     edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
+    _waveforms: Rc<Waveforms>,
     manager: std::cell::RefCell<Option<Rc<ProjectManager>>>,
     project_name: gtk::Label,
     edited: gtk::Label,
@@ -139,6 +141,30 @@ impl MainWindow {
 
         let project_view = adw::ToolbarView::builder().content(&pages).build();
         project_view.add_top_bar(&header);
+        // A one-time hint for first-time users, shown under the top bar.
+        let hint = adw::Banner::builder()
+            .title("Drop clips into the Media Pool, then drag them to the timeline. Space plays, B is the blade, Shift+Backspace deletes and closes the gap. F1 lists every key.")
+            .button_label("Got it")
+            .build();
+        hint.connect_button_clicked(|banner| {
+            banner.set_revealed(false);
+            glib::MainContext::default().spawn_local(async {
+                let _ = gio::spawn_blocking(|| {
+                    let path = hint_marker();
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(path, "seen");
+                })
+                .await;
+            });
+        });
+        project_view.add_top_bar(&hint);
+        let hint_for_start = hint.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let seen = gio::spawn_blocking(|| hint_marker().exists()).await.unwrap_or(true);
+            hint_for_start.set_revealed(!seen);
+        });
         project_view.add_bottom_bar(&page_bar);
 
         // ---- Loading -----------------------------------------------------------
@@ -177,6 +203,7 @@ impl MainWindow {
             edit,
             export,
             proxies: Proxies::new(&state_for_proxies),
+            _waveforms: Waveforms::new(&state_for_proxies),
             manager: Default::default(),
             project_name,
             edited,
@@ -392,7 +419,7 @@ impl MainWindow {
                         w.state.set_dirty(true);
                     }
                     if missing > 0 {
-                        w.state.message(format!("{missing} media file(s) could not be found and are offline."));
+                        dialogs::relink_missing(&w.window, &w.state);
                     }
                 }
                 Ok(Err(e)) => {
@@ -543,6 +570,12 @@ impl MainWindow {
         }
     }
 
+    /// Playback figures for automated checks.
+    pub fn stats(&self) -> String {
+        let p = &self.state.player;
+        format!("position_us={} dropped_frames={} playing={}", p.position_us(), p.dropped_frames(), p.is_playing())
+    }
+
     fn in_project(&self) -> bool {
         self.root.visible_child_name().as_deref() == Some("project")
     }
@@ -688,6 +721,11 @@ impl MainWindow {
             "win.edit-overwrite" => actions::place_current(state, Place::Overwrite),
             "win.edit-place-on-top" => actions::place_current(state, Place::OnTop),
             "win.edit-append" => actions::place_current(state, Place::Append),
+            "win.clip-enable-toggle" => actions::toggle_enabled(state),
+            "win.copy" => actions::copy_selected(state, false),
+            "win.cut" => actions::copy_selected(state, true),
+            "win.paste" => actions::paste(state),
+            "win.edit-replace" => actions::replace_selected(state),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
             "win.delete" => actions::delete_selected(state, false),
@@ -734,6 +772,11 @@ impl MainWindow {
             self.state.emit(Change::Options);
         }
     }
+}
+
+/// A file whose presence means the first-use hint was dismissed.
+fn hint_marker() -> PathBuf {
+    glib::user_config_dir().join("tempo").join("first-use-hint-seen")
 }
 
 fn loading_view(status: &gtk::Label) -> gtk::Box {

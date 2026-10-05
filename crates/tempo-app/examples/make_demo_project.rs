@@ -1,5 +1,6 @@
 //! Builds a small project from the sample media in tests/media, for manual
 //! checks and screenshots:  cargo run -p tempo-app --example make_demo_project -- out.tempo
+//! Extra arguments are media files to use instead of the samples; each is placed whole.
 
 use std::path::PathBuf;
 
@@ -22,12 +23,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut at = 0i64;
-    for (i, file) in ["sample_1080p_h264.mp4", "sample_10s_sync.mp4", "sample_720p_vp9.webm"].iter().enumerate() {
-        let mut source = MediaEngine::create_media_source(&media.join(file))?;
+    let own: Vec<PathBuf> = std::env::args().skip(2).map(PathBuf::from).collect();
+    let files: Vec<PathBuf> = if own.is_empty() {
+        ["sample_1080p_h264.mp4", "sample_10s_sync.mp4", "sample_720p_vp9.webm"].iter().map(|f| media.join(f)).collect()
+    } else {
+        own.clone()
+    };
+    for (i, path) in files.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let mut source = MediaEngine::create_media_source(path)?;
+        println!("probed {} in {:?}", path.display(), started.elapsed());
+        let file = &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         source.import_order = i as u32;
-        let len = source.duration_us.min(4_000_000);
+        let len = if own.is_empty() { source.duration_us.min(4_000_000) } else { source.duration_us };
         let add = |p: &mut Project, t, kind| -> Result<(), Box<dyn std::error::Error>> {
-            let clip = Clip::new(t, source.id, kind, *file, at, at + len, 0, len);
+            let clip = Clip::new(t, source.id, kind, file.clone(), at, at + len, 0, len);
             p.timeline.find_track_mut(t).ok_or("track")?.clips.push(clip);
             Ok(())
         };
@@ -35,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if source.audio_channels.is_some() {
             add(&mut project, a1, ClipType::Audio)?;
         }
-        if i == 1 {
+        if i == 1 && own.is_empty() {
             // A short overlay on V2.
             let clip = Clip::new(v2, source.id, ClipType::Video, "overlay", at + 500_000, at + 2_000_000, 0, 1_500_000);
             project.timeline.find_track_mut(v2).ok_or("track")?.clips.push(clip);

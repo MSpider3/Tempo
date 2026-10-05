@@ -44,23 +44,26 @@ pub fn generate_proxy(
     // half-written file that looks finished.
     let partial = output.with_extension("part.mp4");
 
-    let mut child = Command::new("nice")
+    let mut command = Command::new("nice");
+    command
         .args(["-n", "19", "ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i"])
         .arg(input)
+        // Picture only: sound is always read from the original file.
+        .args(["-map", "0:v:0", "-an", "-vf", &format!("scale=-2:{PROXY_HEIGHT}")])
+        .args(tempo_export::ffmpeg::h264_args(28, 960, PROXY_HEIGHT, true))
         .args([
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", &format!("scale=-2:{PROXY_HEIGHT}"),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuv420p",
             // A keyframe every half second keeps seeking cheap.
             "-g", "15", "-bf", "0",
             // Leave cores free for playback while the proxy is made.
             "-threads", "2",
-            "-c:a", "aac", "-b:a", "128k",
         ])
         .arg(&partial)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    tempo_export::ffmpeg::die_with_parent(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start ffmpeg: {e}"))?;
 

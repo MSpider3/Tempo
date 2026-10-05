@@ -475,7 +475,7 @@ impl Worker {
         let mut wanted: Vec<(Uuid, i64, &Clip)> = Vec::new();
         for clips in &snap.tracks {
             if let Some(clip) = clips.iter().find(|c| c.contains_point(pos)) {
-                if matches!(clip.clip_type, ClipType::Video | ClipType::Image) {
+                if clip.properties.enabled && matches!(clip.clip_type, ClipType::Video | ClipType::Image) {
                     let offset = clip.source_offset_at(pos);
                     wanted.push((clip.source_id, offset - offset % snap.frame_us, clip));
                 }
@@ -584,7 +584,7 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         mix.fill(0.0);
         for (clips, track_volume) in &snapshot.audio {
             let Some(clip) = clips.iter().find(|c| c.contains_point(*pos_us)) else { continue };
-            if clip.properties.muted {
+            if clip.properties.muted || !clip.properties.enabled {
                 continue;
             }
             let Some(path) = snapshot.audio_sources.get(&clip.source_id) else { continue };

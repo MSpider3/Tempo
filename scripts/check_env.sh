@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# scripts/check_env.sh
+# Checks that everything needed to build Tempo is installed.
 set -e
-echo "=== Tempo 2 Environment Check ==="
 
-# Rust toolchain
-rustc --version | grep -E "1\.(8[2-9]|9[0-9])" || { echo "ERROR: Rust >= 1.82 required"; exit 1; }
+need() { pkg-config --exists "$1" || { echo "MISSING: $1  ($2)"; missing=1; }; }
+missing=0
+
 cargo --version
+need gtk4            "Fedora: gtk4-devel            Ubuntu: libgtk-4-dev"
+need libadwaita-1    "Fedora: libadwaita-devel      Ubuntu: libadwaita-1-dev"
+need libpipewire-0.3 "Fedora: pipewire-devel        Ubuntu: libpipewire-0.3-dev"
+need libavcodec      "Fedora: ffmpeg-free-devel     Ubuntu: libavcodec-dev"
+need libavformat     "Fedora: ffmpeg-free-devel     Ubuntu: libavformat-dev"
+need libswscale      "Fedora: ffmpeg-free-devel     Ubuntu: libswscale-dev"
+need libswresample   "Fedora: ffmpeg-free-devel     Ubuntu: libswresample-dev"
 
-# Required system libraries (Ubuntu/Fedora/Arch)
-pkg-config --exists gtk4 || { echo "ERROR: GTK4 dev headers missing. Install: libgtk-4-dev (Ubuntu) or gtk4-devel (Fedora)"; exit 1; }
-pkg-config --exists libadwaita-1 || { echo "ERROR: libadwaita dev headers missing. Install: libadwaita-1-dev / libadwaita-devel"; exit 1; }
-pkg-config --exists libavcodec libavformat libavutil libswscale || { echo "ERROR: FFmpeg dev headers missing. Install: libavcodec-dev libavformat-dev libavutil-dev libswscale-dev / ffmpeg-devel"; exit 1; }
-pkg-config --exists libpipewire-0.3 || { echo "ERROR: PipeWire dev headers missing. Install: libpipewire-0.3-dev / pipewire-devel"; exit 1; }
+pkg-config --atleast-version=1.6 libadwaita-1 || { echo "libadwaita 1.6 or newer is required"; missing=1; }
+command -v glib-compile-resources >/dev/null || { echo "MISSING: glib-compile-resources (glib2-devel / libglib2.0-dev-bin)"; missing=1; }
+command -v ffmpeg >/dev/null || { echo "MISSING: ffmpeg program (needed at run time for export and proxies)"; missing=1; }
 
-# Vulkan (required for wgpu primary backend)
-vulkaninfo > /dev/null 2>&1 && echo "Vulkan: available" || echo "WARNING: Vulkan not available — wgpu will fall back to OpenGL. This is acceptable."
-
-# VAAPI check
-ls /dev/dri/renderD* > /dev/null 2>&1 && echo "VAAPI: render nodes found: $(ls /dev/dri/renderD*)" || echo "WARNING: No DRI render nodes — VAAPI will be unavailable (software decode only)"
-
-# Optional: Python for compute server
-python3 --version > /dev/null 2>&1 && echo "Python: available" || echo "INFO: Python not found — compute plugins will be unavailable (not required for core)"
-
-echo ""
-echo "=== Environment check complete ==="
+[ "$missing" = 0 ] && echo "Environment OK" || exit 1

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 tempo-timeline = { path = "../tempo-timeline" }
+tempo-export = { path = "../tempo-export" }
 tracing = { workspace = true }
+libc = { workspace = true }

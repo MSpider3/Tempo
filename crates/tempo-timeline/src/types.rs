@@ -101,6 +101,13 @@ pub struct ClipProperties {
     pub gamma: [f32; 3],
     pub gain: [f32; 3],
     pub keyframes: Vec<Keyframe>,
+    /// A disabled clip stays on the timeline but is not shown, heard or exported.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Default for ClipProperties {
@@ -119,6 +126,7 @@ impl Default for ClipProperties {
             gamma: [1.0, 1.0, 1.0],
             gain: [1.0, 1.0, 1.0],
             keyframes: Vec::new(),
+            enabled: true,
         }
     }
 }
@@ -983,8 +991,7 @@ mod tests {
 
     #[test]
     fn test_keyframe_interpolation() {
-        let mut props = ClipProperties::default();
-        props.opacity = 0.8;
+        let mut props = ClipProperties { opacity: 0.8, ..Default::default() };
         assert_eq!(props.evaluate_property("opacity", 1_000_000), 0.8);
 
         // Add 2 keyframes: fade in from 0.0 at 1s to 1.0 at 3s

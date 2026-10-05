@@ -88,7 +88,9 @@ fn dev_hooks(app: &adw::Application, win: &std::rc::Rc<MainWindow>) {
     let delay = std::env::var("TEMPO_SCREENSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500u64);
     let app = app.clone();
     let window = window.clone();
+    let win = win.clone();
     glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+        tracing::info!("stats {}", win.stats());
         let (w, h) = (window.width(), window.height());
         let paintable = gtk::WidgetPaintable::new(Some(&window));
         let snapshot = gtk::Snapshot::new();

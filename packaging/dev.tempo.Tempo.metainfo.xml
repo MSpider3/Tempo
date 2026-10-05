@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.tempo.Tempo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Tempo</name>
+  <summary>A light video editor that works like DaVinci Resolve's Edit page</summary>
+  <description>
+    <p>
+      Tempo is a simple video editor for ordinary laptops. It uses the same layout and
+      keyboard shortcuts as DaVinci Resolve's Edit page, so what you learn here carries over
+      when you move on. It needs no graphics card and never converts your footage on import.
+    </p>
+    <ul>
+      <li>Cut, trim and arrange clips on up to four video and four audio tracks</li>
+      <li>Smooth preview on weak processors, with small proxies made in the background</li>
+      <li>Markers that become chapters in the exported file and in a copyable list</li>
+      <li>Export by frame shape: 16:9, 9:16, 1:1 and 4:5</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">dev.tempo.Tempo.desktop</launchable>
+  <url type="homepage">https://github.com/MSpider3/Tempo</url>
+  <url type="bugtracker">https://github.com/MSpider3/Tempo/issues</url>
+  <developer id="io.github.mspider3">
+    <name>MSpider3</name>
+  </developer>
+  <provides>
+    <binary>tempo</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">1024</display_length>
+  </requires>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-05">
+      <description>
+        <p>First release of the Rust rewrite.</p>
+      </description>
+    </release>
+  </releases>
+</component>

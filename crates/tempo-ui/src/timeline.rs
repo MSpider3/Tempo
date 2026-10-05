@@ -10,8 +10,8 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, graphene, gsk, pango};
 use tempo_timeline::{
-    ClipType, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimClipCommand,
-    TrimEdge,
+    ClipType, MarkerColor, MoveClipCommand, RippleTrimCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind,
+    TrimClipCommand, TrimEdge,
 };
 use uuid::Uuid;
 
@@ -161,7 +161,7 @@ impl TimelineCanvas {
                         c.update_adjustment();
                         c.queue_draw();
                     }
-                    Change::Selection | Change::Options => c.queue_draw(),
+                    Change::Selection | Change::Options | Change::Waveform => c.queue_draw(),
                     _ => {}
                 }
             }
@@ -310,7 +310,7 @@ impl TimelineCanvas {
         let threshold = (SNAP_PX / self.pps() * 1_000_000.0) as i64;
         let playhead = self.imp().playhead.get();
         let mut best = state.with_timeline(|t| t.find_snap_point(us, threshold, ignore)).flatten();
-        if (playhead - us).abs() <= threshold && best.map_or(true, |b| (b - us).abs() > (playhead - us).abs()) {
+        if (playhead - us).abs() <= threshold && best.is_none_or(|b| (b - us).abs() > (playhead - us).abs()) {
             best = Some(playhead);
         }
         match best {
@@ -503,8 +503,11 @@ impl TimelineCanvas {
                     state.execute(Box::new(MoveClipCommand::new(clip, from_track, to_track, orig_in, new_in)));
                 }
             }
-            Some(Drag::Trim { clip, edge, delta }) => {
-                if delta != 0 {
+            // Trim mode ripples: later clips follow. Selection mode leaves a gap.
+            Some(Drag::Trim { clip, edge, delta }) if delta != 0 => {
+                if state.tool.get() == Tool::Trim {
+                    state.execute(Box::new(RippleTrimCommand::new(clip, edge, delta)));
+                } else {
                     state.execute(Box::new(TrimClipCommand::new(clip, edge, delta)));
                 }
             }
@@ -532,6 +535,28 @@ impl TimelineCanvas {
         snapshot.translate(&graphene::Point::new(x, y));
         snapshot.append_layout(&layout, color);
         snapshot.restore();
+    }
+
+    /// Draw the loudness of a clip as vertical bars, one every two pixels, only
+    /// for the part of the clip that is on screen.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_waveform(&self, s: &gtk::Snapshot, peaks: &[u8], source_start_us: i64, x: f32, y: f32, width: f32, height: f32, view_w: f32) {
+        const PEAKS_PER_SECOND: f64 = 50.0;
+        let color = css_color(self, "tempo_clip_text");
+        let color = gdk::RGBA::new(color.red(), color.green(), color.blue(), 0.85);
+        let us_per_px = 1_000_000.0 / self.pps();
+        let mid = y + height / 2.0;
+        let mut px = (-x).max(0.0);
+        let end = width.min(view_w - x);
+        while px < end {
+            let t0 = source_start_us as f64 + px as f64 * us_per_px;
+            let a = (t0 / 1_000_000.0 * PEAKS_PER_SECOND) as usize;
+            let b = (((t0 + 2.0 * us_per_px) / 1_000_000.0 * PEAKS_PER_SECOND) as usize).max(a + 1);
+            let peak = peaks.get(a..b.min(peaks.len())).and_then(|p| p.iter().max()).copied().unwrap_or(0);
+            let half = (peak as f32 / 255.0 * (height / 2.0 - 2.0)).max(0.5);
+            s.append_color(&color, &graphene::Rect::new(x + px, mid - half, 1.0, half * 2.0));
+            px += 2.0;
+        }
     }
 
     fn draw(&self, s: &gtk::Snapshot) {
@@ -617,9 +642,14 @@ impl TimelineCanvas {
                 s.push_rounded_clip(&rounded);
                 s.append_color(&color(top), &body);
                 let bar_y = body.y() + body.height() - NAME_BAR_H;
+                if clip.clip_type == ClipType::Audio {
+                    if let Some(peaks) = state.waveforms.borrow().get(&clip.source_id) {
+                        self.draw_waveform(s, peaks, clip.source_in + (tin - clip.timeline_in), body.x(), body.y(), body.width(), bar_y - body.y(), w);
+                    }
+                }
                 s.append_color(&color(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
                 self.text(s, &clip.name, body.x() + 6.0, bar_y + 3.0, &white, true, body.width() - 10.0);
-                if !row.enabled {
+                if !row.enabled || !clip.properties.enabled {
                     s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.6), &body);
                 }
                 s.pop();
@@ -710,6 +740,7 @@ impl TimelineArea {
         let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).vexpand(true).build();
         root.append(&headers);
         root.append(&right);
+        root.append(&audio_meter(state));
 
         let s = state.clone();
         let rebuild = move || build_headers(&s, &header_rows);
@@ -800,4 +831,55 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
 
         container.append(&header);
     }
+}
+
+/// Two bars showing the output level, left and right. Redrawn only when the level changes.
+fn audio_meter(state: &Rc<AppState>) -> gtk::DrawingArea {
+    const FLOOR_DB: f32 = -48.0;
+    let meter = gtk::DrawingArea::builder().content_width(26).vexpand(true).tooltip_text("Output level").build();
+    meter.update_property(&[gtk::accessible::Property::Label("Output level")]);
+    let shown = Rc::new(Cell::new((0.0f32, 0.0f32)));
+
+    let levels = shown.clone();
+    meter.set_draw_func(move |area, cr, w, h| {
+        let paint = |name: &str| {
+            let c = css_color(area, name);
+            cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+        };
+        paint("tempo_bg_panel");
+        let _ = cr.paint();
+        let (w, h) = (w as f64, h as f64);
+        let bar_w = (w - 10.0) / 2.0;
+        let (l, r) = levels.get();
+        for (i, level) in [l, r].into_iter().enumerate() {
+            let x = 4.0 + i as f64 * (bar_w + 2.0);
+            paint("tempo_bg_deep");
+            cr.rectangle(x, 4.0, bar_w, h - 8.0);
+            let _ = cr.fill();
+            // Height on a decibel scale; colour by how close to clipping.
+            let db = 20.0 * level.max(1e-6).log10();
+            let fraction = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) as f64;
+            if fraction > 0.0 {
+                paint(if db > -6.0 { "tempo_error" } else if db > -12.0 { "tempo_warn" } else { "tempo_ok" });
+                let bar_h = (h - 8.0) * fraction;
+                cr.rectangle(x, h - 4.0 - bar_h, bar_w, bar_h);
+                let _ = cr.fill();
+            }
+        }
+    });
+
+    let s = state.clone();
+    meter.add_tick_callback(move |area, _| {
+        let now = s.player.levels();
+        let old = shown.get();
+        // Fall back smoothly so short sounds stay visible for a moment.
+        let next = (now.0.max(old.0 * 0.92), now.1.max(old.1 * 0.92));
+        let next = (if next.0 < 0.004 { 0.0 } else { next.0 }, if next.1 < 0.004 { 0.0 } else { next.1 });
+        if next != old {
+            shown.set(next);
+            area.queue_draw();
+        }
+        glib::ControlFlow::Continue
+    });
+    meter
 }

@@ -1316,6 +1316,7 @@ dependencies = [
 name = "tempo-export"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempo-project",
  "tempo-timeline",
  "thiserror",
@@ -1353,6 +1354,8 @@ dependencies = [
 name = "tempo-proxy"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "tempo-export",
  "tempo-timeline",
  "tracing",
 ]

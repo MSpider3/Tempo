@@ -211,12 +211,12 @@ impl MediaEngine {
         let _ = ictx.seek(500_000, ..);
 
         for (stream, packet) in ictx.packets() {
-            if stream.index() == stream_index {
-                if decoder.send_packet(&packet).is_ok() {
-                    if decoder.receive_frame(&mut decoded_frame).is_ok() {
-                        if scaler.run(&decoded_frame, &mut thumb_frame).is_ok() {
+            if stream.index() == stream_index
+                && decoder.send_packet(&packet).is_ok()
+                    && decoder.receive_frame(&mut decoded_frame).is_ok()
+                        && scaler.run(&decoded_frame, &mut thumb_frame).is_ok() {
                             let data = thumb_frame.data(0);
-                            let linesize = thumb_frame.stride(0) as usize;
+                            let linesize = thumb_frame.stride(0);
                             let row_bytes = 160 * 4;
                             let mut rgba = Vec::with_capacity(160 * 90 * 4);
 
@@ -232,14 +232,11 @@ impl MediaEngine {
                                 return Some(rgba);
                             }
                         }
-                    }
-                }
-            }
         }
 
         // Fallback: create solid dark thumbnail with 160x90 RGBA
         let mut fallback = vec![0u8; 160 * 90 * 4];
-        for pixel in fallback.chunks_exact_mut(4) {
+        for pixel in fallback.as_chunks_mut::<4>().0 {
             pixel[0] = 30;
             pixel[1] = 30;
             pixel[2] = 45;

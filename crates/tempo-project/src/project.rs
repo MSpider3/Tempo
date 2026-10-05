@@ -162,7 +162,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
             let title_data_json = clip
                 .title_data
                 .as_ref()
-                .map(|t| serde_json::to_string(t))
+                .map(serde_json::to_string)
                 .transpose()?;
 
             tx.execute(

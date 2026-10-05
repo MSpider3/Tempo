@@ -324,6 +324,16 @@
   },
   {
    "group": "Editing",
+   "action": "win.edit-replace",
+   "keys": [
+    "F11"
+   ],
+   "alt": [],
+   "label": "Replace",
+   "resolve": "editInsertOverwriteActionReplace"
+  },
+  {
+   "group": "Editing",
    "action": "win.edit-place-on-top",
    "keys": [
     "F12"
@@ -382,6 +392,46 @@
    "alt": [],
    "label": "Ripple Delete (close gap)",
    "resolve": "editDelete"
+  },
+  {
+   "group": "Editing",
+   "action": "win.clip-enable-toggle",
+   "keys": [
+    "d"
+   ],
+   "alt": [],
+   "label": "Enable / Disable Clip",
+   "resolve": "editClipEnabled"
+  },
+  {
+   "group": "Editing",
+   "action": "win.cut",
+   "keys": [
+    "<Primary>x"
+   ],
+   "alt": [],
+   "label": "Cut",
+   "resolve": null
+  },
+  {
+   "group": "Editing",
+   "action": "win.copy",
+   "keys": [
+    "<Primary>c"
+   ],
+   "alt": [],
+   "label": "Copy",
+   "resolve": null
+  },
+  {
+   "group": "Editing",
+   "action": "win.paste",
+   "keys": [
+    "<Primary>v"
+   ],
+   "alt": [],
+   "label": "Paste",
+   "resolve": null
   },
   {
    "group": "Editing",

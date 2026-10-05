@@ -3,6 +3,7 @@
 pub mod chapters;
 pub mod edl;
 pub mod error;
+pub mod ffmpeg;
 pub mod timeline_export;
 
 pub use chapters::{chapters_from_markers, ffmetadata, format_chapter_list, youtube_problems, Chapter};

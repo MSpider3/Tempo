@@ -39,7 +39,7 @@ pub fn load_list() -> Vec<Entry> {
         }
     }
     // Most recently changed first.
-    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.modified));
     entries
 }
 

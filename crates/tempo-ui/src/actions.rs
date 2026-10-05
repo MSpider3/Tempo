@@ -5,8 +5,9 @@ use std::rc::Rc;
 
 use tempo_timeline::{
     AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
-    InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
-    RippleDeleteCommand, SplitClipCommand, TrackKind, TrimClipCommand, TrimEdge,
+    InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand, PropertyChange,
+    ReplaceClipCommand, RippleDeleteCommand, SetClipPropertyCommand, SplitClipCommand, TrackKind, TrimClipCommand,
+    TrimEdge,
 };
 use uuid::Uuid;
 
@@ -172,6 +173,63 @@ pub fn delete_selected(state: &Rc<AppState>, ripple: bool) {
         Box::new(DeleteClipCommand::new(track, clip.id))
     };
     state.execute(cmd);
+}
+
+/// Turn the selected clip off or on (Resolve's `D`).
+pub fn toggle_enabled(state: &Rc<AppState>) {
+    if let Some((_, clip)) = selected(state) {
+        state.execute(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Enabled(!clip.properties.enabled))));
+    }
+}
+
+/// Copy the selected clip. With `cut` it is also removed, leaving a gap.
+pub fn copy_selected(state: &Rc<AppState>, cut: bool) {
+    let Some((track, clip)) = selected(state) else { return };
+    *state.clipboard.borrow_mut() = Some(clip.clone());
+    if cut {
+        state.execute(Box::new(DeleteClipCommand::new(track, clip.id)));
+    }
+}
+
+/// Paste the copied clip at the playhead, on the destination track of its kind.
+pub fn paste(state: &Rc<AppState>) {
+    let Some(mut clip) = state.clipboard.borrow().clone() else { return };
+    let kind = if clip.clip_type == ClipType::Audio { TrackKind::Audio } else { TrackKind::Video };
+    let Some(track) = state.dest_track(kind) else { return };
+    let pos = state.player.position_us();
+    let at = pos - pos % state.frame_us();
+    let len = clip.duration_us();
+    clip.id = Uuid::new_v4();
+    clip.track_id = track;
+    clip.timeline_in = at;
+    clip.timeline_out = at + len;
+    let id = clip.id;
+    if state.execute(Box::new(OverwriteClipCommand::new(clip))) {
+        state.select(Some(id));
+        state.player.seek(at + len, true);
+    }
+}
+
+/// Replace the selected timeline clip with the current Media Pool clip, keeping its place and length.
+pub fn replace_selected(state: &Rc<AppState>) {
+    let (Some((track, clip)), Some(source)) = (selected(state), current_source(state)) else {
+        state.message("Select a clip on the timeline and a clip in the Media Pool first.");
+        return;
+    };
+    let Some((name, duration)) = state
+        .with_project(|p| {
+            p.sources.get(&source).map(|s| (s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), s.duration_us))
+        })
+        .flatten()
+    else {
+        return;
+    };
+    let src_in = if state.source_clip.get() == Some(source) { state.src_in.get().unwrap_or(0) } else { 0 };
+    if duration - src_in < clip.duration_us() {
+        state.message("The new clip is too short to replace this one.");
+        return;
+    }
+    state.execute(Box::new(ReplaceClipCommand::new(track, clip.id, source, src_in, name)));
 }
 
 /// Cut every unlocked clip under the playhead (Resolve's Razor).

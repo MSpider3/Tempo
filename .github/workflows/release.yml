@@ -1,0 +1,124 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build the packages and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rpm:
+    name: RPM (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            git gcc clang-devel pkgconf-pkg-config rust cargo \
+            gtk4-devel libadwaita-devel glib2-devel pipewire-devel \
+            ffmpeg-free ffmpeg-free-devel
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked -p tempo-app
+      - name: Package
+        run: |
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm -p crates/tempo-app
+          mkdir -p dist
+          cp target/generate-rpm/*.rpm dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/*.rpm
+
+  deb-appimage:
+    name: DEB and AppImage (Ubuntu)
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git file build-essential clang libclang-dev pkg-config \
+            libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin libpipewire-0.3-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev ffmpeg \
+            librsvg2-common gsettings-desktop-schemas shared-mime-info desktop-file-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked -p tempo-app
+
+      - name: Package DEB
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p tempo-app --no-build
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+
+      - name: Package AppImage
+        env:
+          # linuxdeploy is itself an AppImage; containers have no FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          DEPLOY_GTK_VERSION: "4"
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          export LINUXDEPLOY_OUTPUT_VERSION="$VERSION"
+          curl -fsSLo linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSLo linuxdeploy-plugin-gtk.sh https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
+
+          # Tempo calls the ffmpeg program for export and proxies, so it travels inside the AppImage.
+          ./linuxdeploy --appdir AppDir \
+            --executable target/release/tempo \
+            --executable "$(command -v ffmpeg)" \
+            --desktop-file packaging/dev.tempo.Tempo.desktop \
+            --icon-file assets/icons/dev.tempo.Tempo.svg \
+            --plugin gtk \
+            --output appimage
+          mv Tempo-*.AppImage "dist/Tempo-${VERSION}-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-appimage
+          path: dist/*
+
+  publish:
+    name: Publish release
+    needs: [rpm, deb-appimage]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes from the changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The section of CHANGELOG.md for this version, without its heading.
+          awk -v v="$VERSION" '
+            /^## / { if (found) exit; found = index($0, "[" v "]") > 0; next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || echo "See CHANGELOG.md." > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: notes.md

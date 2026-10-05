@@ -15,7 +15,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["Mehul <MSpider3>"]
-license = "GPL-3.0"
+license = "MIT"
 repository = "https://github.com/MSpider3/Tempo"
 
 [workspace.dependencies]
@@ -35,6 +35,7 @@ rusqlite      = { version = "0.32", features = ["bundled", "serde_json"] }
 
 # Concurrency
 crossbeam     = { version = "0.8"  }
+libc          = { version = "0.2"  }
 parking_lot   = { version = "0.12" }
 
 # Serialization
@@ -48,6 +49,14 @@ chrono        = { version = "0.4",  features = ["serde"] }
 tempfile      = { version = "3"    }
 tracing       = { version = "0.1"  }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Style lints that do not fit this code: GTK callbacks need long closure types,
+# and a clip really is described by eight values.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+# `as_chunks` needs a newer compiler than some distributions ship.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.dev]
 opt-level = 1          # Faster builds than 0, still debuggable
