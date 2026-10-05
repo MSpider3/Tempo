@@ -33,8 +33,8 @@ editor for cutting a video and posting it.
 ## Install
 
 Packages for each release are on the
-[Releases page](https://github.com/MSpider3/Tempo/releases): an AppImage, an `.rpm` and a
-`.deb`, with a `SHA256SUMS` file to verify the download:
+[Releases page](https://github.com/MSpider3/Tempo/releases): an AppImage, a Flatpak bundle,
+an `.rpm` and a `.deb`, with a `SHA256SUMS` file to verify the download:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS

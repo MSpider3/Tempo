@@ -48,7 +48,8 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
   exported from Resolve.
 - Autosave every two minutes, and an offer to restore unsaved work after a crash.
 - Its own icon set, so the interface looks the same under any system icon theme.
-- AppImage, `.rpm` and `.deb` packages with SHA-256 checksums.
+- AppImage, Flatpak, `.rpm` and `.deb` packages with SHA-256 checksums. The release workflow
+  installs each one and starts Tempo from it before publishing.
 
 ### Changed
 
