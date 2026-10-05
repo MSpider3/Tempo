@@ -117,6 +117,9 @@ pub struct ClipProperties {
     /// moved and deleted together while linked selection is on.
     #[serde(default)]
     pub link: Option<Uuid>,
+    /// Filters on this clip, applied in order.
+    #[serde(default)]
+    pub effects: Vec<crate::effects::ClipEffect>,
 }
 
 fn enabled_by_default() -> bool {
@@ -144,6 +147,7 @@ impl Default for ClipProperties {
             fade_out_us: 0,
             dissolve_in_us: 0,
             link: None,
+            effects: Vec::new(),
         }
     }
 }

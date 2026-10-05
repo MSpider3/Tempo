@@ -521,7 +521,7 @@ All errors are logged to `~/.local/share/tempo/tempo.log` (ring buffer, max 10 M
 | Layer | Approach |
 |---|---|
 | `tempo-timeline` | Unit tests (100% coverage target) — pure Rust, no mocks needed |
-| `tempo-media` | Integration tests with real sample media files (committed to `tests/media/`) |
+| `tempo-media` | Tests with small sample clips made by `scripts/make_test_media.sh` in `target/test-media/` |
 | `tempo-render` | Visual regression tests — render known timeline, compare PNG output |
 | `tempo-audio` | Unit tests for mix math; integration test with PipeWire mock |
 | `tempo-project` | Round-trip tests — write project, read back, compare |

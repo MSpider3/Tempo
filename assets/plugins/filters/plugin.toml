@@ -1,0 +1,65 @@
+# A data-only plugin: no script, just filter recipes.
+[plugin]
+id = "dev.tempo.filters"
+name = "Basic Filters"
+version = "1.0.0"
+description = "Black and white, saturation, brightness, contrast, blur and a warm look."
+
+[[filter]]
+id = "black-and-white"
+name = "Black and White"
+ops = [{ saturation = 0.0 }]
+
+[[filter]]
+id = "saturation"
+name = "Saturation"
+ops = [{ saturation = "$amount" }]
+
+  [[filter.param]]
+  id = "amount"
+  name = "Amount"
+  min = 0.0
+  max = 2.0
+  default = 1.4
+
+[[filter]]
+id = "brightness"
+name = "Brightness"
+ops = [{ brightness = "$amount" }]
+
+  [[filter.param]]
+  id = "amount"
+  name = "Amount"
+  min = -0.5
+  max = 0.5
+  default = 0.1
+
+[[filter]]
+id = "contrast"
+name = "Contrast"
+ops = [{ contrast = "$amount" }]
+
+  [[filter.param]]
+  id = "amount"
+  name = "Amount"
+  min = 0.5
+  max = 2.0
+  default = 1.2
+
+[[filter]]
+id = "blur"
+name = "Blur"
+ops = [{ blur = "$radius" }]
+
+  [[filter.param]]
+  id = "radius"
+  name = "Radius"
+  min = 0.0
+  max = 40.0
+  default = 8.0
+
+[[filter]]
+id = "warm"
+name = "Warm"
+# Rows give the new red, green, blue and alpha from: r g b a offset.
+ops = [{ matrix = [1.08, 0.0, 0.0, 0.0, 0.02,  0.0, 1.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.9, 0.0, -0.02,  0.0, 0.0, 0.0, 1.0, 0.0] }]

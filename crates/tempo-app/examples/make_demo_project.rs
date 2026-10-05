@@ -1,4 +1,4 @@
-//! Builds a small project from the sample media in tests/media, for manual
+//! Builds a small project from the sample media in target/test-media (made by scripts/make_test_media.sh), for manual
 //! checks and screenshots:  cargo run -p tempo-app --example make_demo_project -- out.tempo
 //! Extra arguments are media files to use instead of the samples; each is placed whole.
 
@@ -9,7 +9,7 @@ use tempo_timeline::{Clip, ClipType, Marker, MarkerColor, Project, RationalFps, 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(std::env::args().nth(1).ok_or("usage: make_demo_project <out.tempo>")?);
-    let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media");
+    let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media");
     tempo_media::ensure_ffmpeg_init();
 
     // `TEMPO_DEMO_VERTICAL=1` makes a 9:16 project, to check the vertical layout.

@@ -13,6 +13,7 @@
 
 ```bash
 cargo check --workspace
+./scripts/make_test_media.sh                 # sample clips for the media tests
 cargo test --workspace
 cargo test -p tempo-timeline -- --nocapture
 ./scripts/run_all_tests.sh

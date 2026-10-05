@@ -260,6 +260,39 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
     item("Text", "A title in the middle of the picture", "document-edit-symbolic", Box::new(|s| actions::add_title(s, false)));
     item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", Box::new(|s| actions::add_title(s, true)));
 
+    heading("Filters", "Click to apply to the selected clip");
+    // Filters come from plugins, so this part is rebuilt when plugins change.
+    let filters = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    list.append(&filters);
+    let fill = {
+        let state = state.clone();
+        let filters = filters.clone();
+        move || {
+            while let Some(child) = filters.first_child() {
+                filters.remove(&child);
+            }
+            for filter in state.filters.borrow().iter().cloned() {
+                let text = label(&filter.name, &[]);
+                text.set_xalign(0.0);
+                let button = gtk::Button::builder().child(&text).tooltip_text(format!("Apply {} to the selected clip", filter.name)).css_classes(["effect-row"]).build();
+                let s = state.clone();
+                button.connect_clicked(move |_| actions::add_filter(&s, &filter));
+                filters.append(&button);
+            }
+            if filters.first_child().is_none() {
+                let none = label("No filter plugins are switched on", &["tempo-small", "tempo-dim"]);
+                none.set_xalign(0.0);
+                filters.append(&none);
+            }
+        }
+    };
+    fill();
+    state.connect(move |change| {
+        if matches!(change, Change::Plugins) {
+            fill();
+        }
+    });
+
     panel.append(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
     panel
 }

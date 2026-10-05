@@ -342,7 +342,7 @@ mod tests {
     use super::*;
 
     fn sample(name: &str) -> Option<PathBuf> {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media").join(name);
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media").join(name);
         p.exists().then_some(p)
     }
 

@@ -72,6 +72,34 @@ fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Pi
     out
 }
 
+/// FFmpeg filters for the clip's own filters (colour and blur), to follow `format=rgba`.
+fn effect_filters(props: &ClipProperties, sy: f32) -> String {
+    let fx = tempo_timeline::resolve_effects(&props.effects);
+    let mut out = String::new();
+    if !fx.color.is_identity() {
+        let m = &fx.color.matrix;
+        out.push_str(&format!(
+            ",colorchannelmixer=rr={:.5}:rg={:.5}:rb={:.5}:ra={:.5}:gr={:.5}:gg={:.5}:gb={:.5}:ga={:.5}:br={:.5}:bg={:.5}:bb={:.5}:ba={:.5}",
+            m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1], m[2][2], m[2][3]
+        ));
+        let o = &fx.color.offset;
+        if o[..3].iter().any(|v| v.abs() > 1e-5) {
+            // The mixer has no constant term, so add the offsets with a lookup table.
+            out.push_str(&format!(
+                ",lutrgb=r='clip(val+{:.2},0,255)':g='clip(val+{:.2},0,255)':b='clip(val+{:.2},0,255)'",
+                o[0] * 255.0,
+                o[1] * 255.0,
+                o[2] * 255.0
+            ));
+        }
+    }
+    if fx.blur > 0.05 {
+        // The radius is given for a 1080-line project; `sy` scales it to the output.
+        out.push_str(&format!(",gblur=sigma={:.2}", (fx.blur * sy * 0.5).max(0.1)));
+    }
+    out
+}
+
 /// Fade filters for a piece. A fade is applied only where the piece still has
 /// that end of its clip (an export range may have cut it off).
 fn fade_filters(p: &Piece, r0: i64, audio: bool) -> String {
@@ -221,7 +249,9 @@ pub fn build_ffmpeg_args(
                 Fit::Fill => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
             };
             let label = format!("vc{ti}_{}", segs.len());
-            let head = format!("[{idx}:v]fps={fps},{fit},setsar=1,format=rgba,trim=duration={},setpts=PTS-STARTPTS", secs(len));
+            // Blur radii are in pixels of a 1080-line picture.
+            let effects = effect_filters(props, h as f32 / 1080.0);
+            let head = format!("[{idx}:v]fps={fps},{fit},setsar=1,format=rgba{effects},trim=duration={},setpts=PTS-STARTPTS", secs(len));
             if is_default_transform(props) {
                 graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0{fades}[{label}]"));
             } else {
@@ -461,7 +491,7 @@ mod tests {
     use tempo_timeline::{MediaSource, RationalFps};
 
     fn sample() -> Option<PathBuf> {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/sample_1080p_h264.mp4");
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media/sample_1080p_h264.mp4");
         p.exists().then_some(p)
     }
 
@@ -584,6 +614,31 @@ mod tests {
         assert!(graph.contains("[vt1]") && graph.contains("fade=t=in:st=0:d=0.400000:alpha=1"), "{graph}");
         // Sound: the outgoing clip fades out and the lead-in fades in, then both are mixed.
         assert!(graph.contains("afade=t=out") && graph.contains("afade=t=in") && graph.contains("amix=inputs=2"), "{graph}");
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+            assert!(out.exists());
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    #[test]
+    fn clip_filters_reach_the_filter_graph_and_export() {
+        use tempo_timeline::{Amount, ClipEffect, EffectOp};
+        let Some(path) = sample() else { return };
+        let mut project = project_with_clip(path);
+        let v = project.timeline.tracks.iter_mut().find(|t| t.kind == TrackKind::Video).unwrap();
+        v.clips[0].properties.effects = vec![ClipEffect {
+            id: "t/look".into(),
+            name: "Look".into(),
+            params: Vec::new(),
+            ops: vec![EffectOp::Saturation(Amount::Value(0.0)), EffectOp::Brightness(Amount::Value(0.1)), EffectOp::Blur(Amount::Value(6.0))],
+        }];
+        let out = std::env::temp_dir().join(format!("tempo-export-fx-{}.mp4", std::process::id()));
+        let (args, _, _) = build_ffmpeg_args(&project, &settings(out.clone()), None).unwrap();
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("colorchannelmixer=rr=0.21260") && graph.contains("lutrgb=") && graph.contains("gblur="), "{graph}");
+        // Only the first clip has the filter.
+        assert_eq!(graph.matches("colorchannelmixer").count(), 1);
         if Command::new("ffmpeg").arg("-version").output().is_ok() {
             export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
             assert!(out.exists());

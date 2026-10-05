@@ -5,6 +5,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ./scripts/check_env.sh
 cargo build --workspace --all-targets
+./scripts/make_test_media.sh
 cargo test --workspace
 cargo run --bin tempo -- --smoke-test
 echo "All checks passed"

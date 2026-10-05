@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use tempo_timeline::{
     AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
-    EditClipCommand, InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
+    ClipEffect, EditClipCommand, InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
     PropertyChange, ReplaceClipCommand, RippleDeleteCommand, SetClipPropertyCommand, SplitClipCommand, TitleData,
     TitleType, TrackKind, TrimClipCommand, TrimEdge,
 };
@@ -224,6 +224,21 @@ pub fn set_fade(state: &Rc<AppState>, fade_in: bool, seconds: f64) {
     });
     if !done && state.selection.get().is_none() {
         state.message("Select a clip on the timeline first.");
+    }
+}
+
+/// Put a filter on the selected picture clips. A clip holds each filter once.
+pub fn add_filter(state: &Rc<AppState>, filter: &ClipEffect) {
+    let done = for_selected(state, "Add Filter", |_, clip| {
+        if matches!(clip.clip_type, ClipType::Audio | ClipType::Title) || clip.properties.effects.iter().any(|e| e.id == filter.id) {
+            return None;
+        }
+        let mut edited = clip.clone();
+        edited.properties.effects.push(filter.clone());
+        Some(Box::new(EditClipCommand::new("Add Filter", edited)) as Box<dyn Command>)
+    });
+    if !done {
+        state.message("Select a video clip that does not have this filter yet.");
     }
 }
 
