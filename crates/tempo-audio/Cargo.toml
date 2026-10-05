@@ -1,0 +1,17 @@
+[package]
+name = "tempo-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+tempo-media = { path = "../tempo-media" }
+parking_lot = { workspace = true }
+pipewire = { workspace = true }
+rubato = { workspace = true }
+crossbeam = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }

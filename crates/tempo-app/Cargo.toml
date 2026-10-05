@@ -1,0 +1,36 @@
+[package]
+name = "tempo-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tempo"
+path = "src/main.rs"
+
+# The editor itself needs only the interface crate. Keeping the list short keeps
+# the binary small and start-up fast.
+[dependencies]
+tempo-ui = { path = "../tempo-ui" }
+glib = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Used only by the programs in examples/.
+[dev-dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+tempo-media = { path = "../tempo-media" }
+tempo-render = { path = "../tempo-render" }
+tempo-audio = { path = "../tempo-audio" }
+tempo-proxy = { path = "../tempo-proxy" }
+tempo-export = { path = "../tempo-export" }
+tempo-plugin = { path = "../tempo-plugin" }
+tempo-project = { path = "../tempo-project" }
+tempo-compute = { path = "../tempo-compute" }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+gio = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+wat = "1.258.0"

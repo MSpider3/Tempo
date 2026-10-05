@@ -1,0 +1,39 @@
+app-id: dev.tempo.Tempo
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: tempo
+
+finish-args:
+  # Wayland native display access
+  - --socket=wayland
+  - --socket=fallback-x11
+  # Audio playback and recording via PipeWire
+  - --socket=pulseaudio
+  # GPU acceleration for WGPU
+  - --device=dri
+  # File access to user media files
+  - --filesystem=host:ro
+  - --filesystem=xdg-videos
+  - --filesystem=xdg-download
+  # D-Bus desktop portals
+  - --talk-name=org.freedesktop.portal.Desktop
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/tempo/cargo
+
+modules:
+  - name: tempo
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --bin tempo
+      - install -Dm755 target/release/tempo /app/bin/tempo
+      - install -Dm644 packaging/dev.tempo.Tempo.desktop /app/share/applications/dev.tempo.Tempo.desktop
+      - install -Dm644 packaging/dev.tempo.Tempo.appdata.xml /app/share/metainfo/dev.tempo.Tempo.appdata.xml
+    sources:
+      - type: dir
+        path: ..

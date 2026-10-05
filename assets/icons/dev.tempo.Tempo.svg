@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="8" y="8" width="112" height="112" rx="26" ry="26" fill="#212126" stroke="#2c2d33" stroke-width="2"/>
+  <!-- Play triangle in tempo_accent (#e05a47) -->
+  <path d="M 38 41 C 36 39.8 34 40.8 34 43.2 V 84.8 C 34 87.2 36 88.2 38 87 L 74 65.5 C 75.8 64.4 75.8 63.6 74 62.5 Z" fill="#e05a47"/>
+  <!-- Two short vertical bars in tempo_accent (#e05a47) -->
+  <rect x="81" y="45" width="8.5" height="38" rx="4.25" fill="#e05a47"/>
+  <rect x="94.5" y="51" width="8.5" height="26" rx="4.25" fill="#e05a47"/>
+</svg>

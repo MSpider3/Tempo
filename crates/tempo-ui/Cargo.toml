@@ -1,0 +1,24 @@
+[package]
+name = "tempo-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tempo-timeline = { path = "../tempo-timeline" }
+tempo-media = { path = "../tempo-media" }
+tempo-project = { path = "../tempo-project" }
+tempo-export = { path = "../tempo-export" }
+tempo-proxy = { path = "../tempo-proxy" }
+parking_lot = { workspace = true }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+glib = { workspace = true }
+gio = { workspace = true }
+gdk4 = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+crossbeam = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

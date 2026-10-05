@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.tempo.Tempo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Tempo</name>
+  <summary>Fast, modern video editor for Linux</summary>
+  <description>
+    <p>
+      Tempo is a lightweight, responsive video editor designed for Linux. Built with Rust,
+      GTK4, Libadwaita, and WGPU, Tempo brings DaVinci Resolve-inspired speed and workflow
+      to modern desktop environments.
+    </p>
+    <p>Key features include:</p>
+    <ul>
+      <li>High-performance timeline with ripple, roll, slip, and fast keyboard edits</li>
+      <li>Multi-track video and audio compositing with GPU acceleration</li>
+      <li>Proxy workflow for fluid playback on modest hardware</li>
+      <li>DaVinci Resolve Cut page keyboard shortcuts parity</li>
+      <li>WASM plugin architecture with safe memory sandboxing</li>
+      <li>CMX 3600 EDL and H.264 export workflows</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">dev.tempo.Tempo.desktop</launchable>
+  <url type="homepage">https://github.com/tempo-editor/tempo</url>
+  <url type="bugtracker">https://github.com/tempo-editor/tempo/issues</url>
+  <developer id="dev.tempo">
+    <name>Tempo Developers</name>
+  </developer>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Tempo Video Editor main editing timeline</caption>
+      <image>https://raw.githubusercontent.com/tempo-editor/tempo/main/assets/screenshot-main.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="1.0.0" date="2026-09-03">
+      <description>
+        <p>Initial release of Tempo 2 Video Editor for Linux.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>

@@ -1,0 +1,248 @@
+/* Tempo — design tokens and widget styles. See docs/VISUAL_DESIGN.md.
+ * Colours marked "sampled" come from DaVinci Resolve 20 screenshots in EX/DVR_UI. */
+
+/* ---- Tokens ---------------------------------------------------------- */
+@define-color tempo_bg_bar       #17181a;
+@define-color tempo_bg_deep      #1b1b1f;
+@define-color tempo_bg_panel     #212126;
+@define-color tempo_bg_surface   #28282e;
+@define-color tempo_bg_card      #2f3136;
+@define-color tempo_bg_inset     #131316;
+@define-color tempo_bg_field     #1f1f1f;
+@define-color tempo_bg_active    #000000;
+@define-color tempo_bg_hover     #34353b;
+
+@define-color tempo_line         #0e0e10;
+@define-color tempo_line_soft    #3a3a3a;
+@define-color tempo_line_button  #43474d;
+
+@define-color tempo_text_bright  #ffffff;
+@define-color tempo_text         #d0d0d0;
+@define-color tempo_text_dim     #929292;
+@define-color tempo_text_off     #5c5c62;
+
+@define-color tempo_accent       #e64b3d;
+@define-color tempo_ok           #2c9418;
+@define-color tempo_warn         #e0a030;
+@define-color tempo_error        #e64b3d;
+
+@define-color tempo_clip_video       #4376a1;
+@define-color tempo_clip_video_top   #3b688e;
+@define-color tempo_clip_audio       #448f64;
+@define-color tempo_clip_audio_wave  #397955;
+@define-color tempo_clip_title       #8a6fb0;
+@define-color tempo_track_edge_video #345b7b;
+@define-color tempo_track_edge_audio #356d4d;
+@define-color tempo_clip_text        #ffffff;
+
+@define-color tempo_marker_blue   #4f8fd6;
+@define-color tempo_marker_green  #4caf7a;
+@define-color tempo_marker_yellow #d8b93a;
+@define-color tempo_marker_red    #d6504a;
+@define-color tempo_marker_orange #e0893a;
+@define-color tempo_marker_purple #9a72d0;
+
+/* Map libadwaita's own names onto the tokens so stock widgets follow. */
+@define-color window_bg_color     @tempo_bg_panel;
+@define-color window_fg_color     @tempo_text;
+@define-color view_bg_color       @tempo_bg_surface;
+@define-color view_fg_color       @tempo_text;
+@define-color headerbar_bg_color  @tempo_bg_bar;
+@define-color headerbar_fg_color  @tempo_text;
+@define-color headerbar_backdrop_color @tempo_bg_bar;
+@define-color headerbar_border_color   @tempo_line;
+@define-color headerbar_shade_color    @tempo_line;
+@define-color card_bg_color       @tempo_bg_card;
+@define-color card_fg_color       @tempo_text;
+@define-color popover_bg_color    @tempo_bg_panel;
+@define-color popover_fg_color    @tempo_text;
+@define-color dialog_bg_color     @tempo_bg_panel;
+@define-color dialog_fg_color     @tempo_text;
+@define-color accent_bg_color     @tempo_accent;
+@define-color accent_fg_color     #ffffff;
+@define-color accent_color        @tempo_accent;
+
+/* ---- Base ------------------------------------------------------------ */
+window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
+
+.tempo-title       { font-size: 2.2em; font-weight: 700; color: @tempo_text_bright; }
+.tempo-heading     { font-weight: 600; }
+.tempo-small       { font-size: 0.85em; }
+.tempo-dim         { color: @tempo_text_dim; }
+.tempo-bright      { color: @tempo_text_bright; }
+.tempo-timecode    { font-size: 0.95em; font-weight: 600; font-feature-settings: "tnum"; }
+.tempo-timecode-big{ font-size: 1.7em;  font-weight: 500; font-feature-settings: "tnum";
+                     color: @tempo_text_bright; }
+
+.tempo-bar     { background-color: @tempo_bg_bar; }
+.tempo-deep    { background-color: @tempo_bg_deep; }
+.tempo-panel   { background-color: @tempo_bg_panel; }
+.tempo-surface { background-color: @tempo_bg_surface; }
+
+.tempo-sep-right  { border-right: 1px solid @tempo_line; }
+.tempo-sep-left   { border-left: 1px solid @tempo_line; }
+.tempo-sep-bottom { border-bottom: 1px solid @tempo_line; }
+.tempo-sep-top    { border-top: 1px solid @tempo_line; }
+
+/* ---- Buttons --------------------------------------------------------- */
+/* Pill: every text button. */
+.tempo button.pill-outline {
+  border-radius: 9999px;
+  background: none;
+  box-shadow: none;
+  border: 1px solid @tempo_line_button;
+  color: @tempo_text;
+  min-height: 26px;
+  padding: 0 16px;
+  font-weight: 400;
+}
+.tempo button.pill-outline:hover   { background-color: @tempo_bg_hover; color: @tempo_text_bright; }
+.tempo button.pill-outline:disabled{ color: @tempo_text_off; border-color: @tempo_line_soft; }
+.tempo button.pill-outline.default { color: @tempo_text_bright; border-color: @tempo_text_dim; }
+.tempo button.pill-outline.danger  { color: @tempo_error; }
+
+/* Icon and bar buttons: no outline, dim until hovered or switched on. */
+.tempo button.tool {
+  background: none; box-shadow: none; border: none;
+  border-radius: 4px;
+  color: @tempo_text_dim;
+  min-width: 30px; min-height: 30px; padding: 0 6px;
+  font-weight: 400;
+}
+.tempo button.tool:hover   { color: @tempo_text_bright; background-color: @tempo_bg_hover; }
+.tempo button.tool:checked { color: @tempo_text_bright; background: none; }
+.tempo button.tool.accent:checked { color: @tempo_accent; }
+.tempo button.tool:disabled { color: @tempo_text_off; }
+.tempo button.tool.text { padding: 0 10px; }
+
+.tempo .bar-divider { background-color: @tempo_line_soft; min-width: 1px; margin: 10px 6px; }
+
+/* ---- Top bar --------------------------------------------------------- */
+.tempo headerbar { min-height: 44px; border-bottom: 1px solid @tempo_line; box-shadow: none; }
+.tempo .project-name { font-weight: 600; color: @tempo_text_bright; }
+
+/* ---- Page bar -------------------------------------------------------- */
+.page-bar { background-color: @tempo_bg_bar; min-height: 40px; border-top: 1px solid @tempo_line; }
+.tempo .page-bar button.page {
+  background: none; box-shadow: none; border-radius: 0;
+  border: none; border-bottom: 2px solid transparent;
+  min-width: 150px; min-height: 38px; padding: 0;
+  color: @tempo_text_dim;
+}
+.tempo .page-bar button.page:hover   { color: @tempo_text_bright; }
+.tempo .page-bar button.page:checked {
+  background-color: @tempo_bg_active; color: @tempo_text_bright;
+  border-bottom-color: @tempo_accent;
+}
+
+/* ---- Loading --------------------------------------------------------- */
+.loading { background-color: @tempo_bg_deep; }
+.tempo .loading progressbar trough   { min-height: 2px; background-color: @tempo_bg_card; }
+.tempo .loading progressbar progress { min-height: 2px; background-color: @tempo_accent; }
+
+/* ---- Project manager ------------------------------------------------- */
+.tempo gridview.projects { background: none; }
+.tempo gridview.projects > child { background: none; padding: 10px; border-radius: 6px; }
+.project-thumb {
+  background-color: @tempo_bg_card; border-radius: 6px;
+  border: 2px solid transparent; color: @tempo_text_off;
+}
+.tempo gridview.projects > child:hover .project-thumb { border-color: @tempo_line_button; }
+.tempo gridview.projects > child:selected .project-thumb { border-color: @tempo_accent; }
+.tempo gridview.projects > child:selected .project-name-label { color: @tempo_accent; }
+.project-name-label { font-weight: 600; color: @tempo_text_dim; }
+
+/* ---- Media pool / effects ------------------------------------------- */
+.tempo gridview.media { background-color: @tempo_bg_surface; }
+.tempo gridview.media > child { background: none; padding: 6px; border-radius: 4px; }
+.media-thumb { background-color: @tempo_bg_inset; border-radius: 3px; border: 2px solid transparent;
+               color: @tempo_text_off; }
+.tempo gridview.media > child:selected .media-thumb { border-color: @tempo_accent; }
+.drop-hint { border: 1px dashed @tempo_line_button; border-radius: 6px; color: @tempo_text_dim;
+             margin: 12px; padding: 16px; }
+
+.effect-row { background-color: @tempo_bg_inset; border: 1px solid @tempo_line_button;
+              border-radius: 3px; min-height: 36px; }
+.effect-row:hover { border-color: @tempo_text_dim; }
+.effect-row .effect-icon { min-width: 56px; border-right: 1px solid @tempo_line_button;
+                           color: @tempo_text_dim; }
+.tempo listbox.categories { background: none; }
+.tempo listbox.categories > row { padding: 4px 10px; color: @tempo_text_dim; }
+.tempo listbox.categories > row:selected { background-color: @tempo_bg_bar; color: @tempo_text_bright; }
+
+/* ---- Viewer ---------------------------------------------------------- */
+.viewer-surround { background-color: @tempo_bg_deep; }
+.viewer-header   { background-color: @tempo_bg_panel; min-height: 30px; padding: 0 8px; }
+.viewer-transport{ background-color: @tempo_bg_panel; min-height: 40px; padding: 0 8px; }
+.badge { background-color: alpha(black, 0.7); border-radius: 9999px; padding: 1px 8px;
+         font-size: 0.8em; font-weight: 600; margin: 8px; }
+.badge.warn { color: @tempo_warn; }
+
+/* ---- Inspector ------------------------------------------------------- */
+.inspector        { background-color: @tempo_bg_deep; }
+.inspector-title  { background-color: @tempo_bg_panel; min-height: 34px; padding: 0 12px;
+                    font-weight: 600; color: @tempo_text_bright; }
+.inspector-section{ background-color: @tempo_bg_surface; min-height: 34px; padding: 0 12px;
+                    border-top: 1px solid @tempo_line; border-bottom: 1px solid @tempo_line; }
+
+/* ---- Fields ---------------------------------------------------------- */
+.tempo entry, .tempo spinbutton, .tempo dropdown > button {
+  background-color: @tempo_bg_field; color: @tempo_text;
+  border: 1px solid @tempo_line; border-radius: 3px; box-shadow: none;
+  min-height: 26px; outline: none;
+}
+.tempo entry:focus-within, .tempo spinbutton:focus-within { border-color: @tempo_accent; }
+.tempo spinbutton > button { min-width: 18px; min-height: 0; padding: 0 2px; border: none;
+                             background: none; box-shadow: none; color: @tempo_text_dim; }
+.tempo scale trough    { min-height: 2px; background-color: @tempo_line_soft; }
+.tempo scale highlight { min-height: 2px; background-image: none; background-color: @tempo_text_dim; }
+.tempo scale slider    { min-width: 10px; min-height: 10px; margin: -5px; border-radius: 9999px;
+                         background-color: @tempo_text; box-shadow: none; border: none; }
+.tempo checkbutton check { background-color: @tempo_bg_field; border: 1px solid @tempo_line_button;
+                           border-radius: 2px; color: @tempo_text_bright; min-width: 14px; min-height: 14px; }
+.tempo checkbutton check:checked { -gtk-icon-source: -gtk-icontheme("object-select-symbolic");
+                                   border-color: @tempo_text_dim; }
+.tempo checkbutton radio { background-color: @tempo_bg_field; border: 1px solid @tempo_line_button; color: @tempo_text_bright; }
+.tempo checkbutton radio:checked { border-color: @tempo_text_dim; }
+
+/* ---- Timeline -------------------------------------------------------- */
+.timeline-toolbar { background-color: @tempo_bg_panel; min-height: 44px; padding: 0 8px;
+                    border-top: 1px solid @tempo_line; border-bottom: 1px solid @tempo_line; }
+.timecode-box   { background-color: @tempo_bg_deep; min-height: 48px; }
+.track-headers  { background-color: @tempo_bg_panel; border-right: 1px solid @tempo_line; }
+.track-header   { border-bottom: 1px solid @tempo_line; padding-right: 6px; }
+.track-header.video { border-left: 3px solid @tempo_track_edge_video; }
+.track-header.audio { border-left: 3px solid @tempo_track_edge_audio; }
+.track-name     { font-weight: 600; color: @tempo_text; min-width: 30px; min-height: 22px;
+                  border: 1px solid transparent; border-radius: 2px; margin-left: 8px; }
+.track-name.destination { border-color: @tempo_accent; color: @tempo_text_bright; }
+.track-divider  { background-color: @tempo_line_soft; min-height: 2px; }
+
+/* ---- Export page ----------------------------------------------------- */
+.panel-title { background-color: @tempo_bg_deep; min-height: 30px; padding: 0 12px;
+               font-weight: 600; color: @tempo_text_bright; border-bottom: 1px solid @tempo_line; }
+.tempo button.format {
+  background: none; box-shadow: none; border-radius: 4px;
+  border: none; border-bottom: 2px solid transparent;
+  color: @tempo_text_dim; padding: 6px 10px; font-weight: 400;
+}
+.tempo button.format:hover   { color: @tempo_text; }
+.tempo button.format:checked { color: @tempo_text_bright; border-bottom-color: @tempo_accent; }
+.job-card { background-color: @tempo_bg_card; border: 1px solid @tempo_line; border-radius: 3px; }
+.job-card .job-header { border-bottom: 1px solid @tempo_line; padding: 4px 8px; }
+.tempo .job-card progressbar trough   { min-height: 3px; background-color: @tempo_bg_inset; }
+.tempo .job-card progressbar progress { min-height: 3px; background-color: @tempo_accent; }
+.tempo button.link-text { background: none; box-shadow: none; border: none; padding: 0 6px;
+                          min-height: 22px; color: @tempo_text_dim; font-weight: 400; }
+.tempo button.link-text:hover { color: @tempo_text_bright; }
+.tempo menubutton.link-text > button { background: none; box-shadow: none; border: none; padding: 0 6px;
+                                       min-height: 22px; color: @tempo_text_dim; font-weight: 400; }
+.tempo menubutton.link-text > button:hover { color: @tempo_text_bright; }
+.error-text { color: @tempo_error; }
+.warn-text  { color: @tempo_warn; }
+
+/* ---- Misc ------------------------------------------------------------ */
+.tempo paned > separator { background-color: @tempo_line; min-width: 1px; min-height: 1px; }
+.tempo scrollbar { background: none; }
+.tempo scrollbar slider { background-color: @tempo_line_button; min-width: 6px; min-height: 6px; }
+.empty-hint { color: @tempo_text_dim; }
