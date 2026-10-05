@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         range,
         chapters: Vec::new(),
         output: PathBuf::from(output),
+        hardware: false,
     };
     let started = std::time::Instant::now();
     export_timeline(&project, &settings, &AtomicBool::new(false), |_| {})?;

@@ -333,6 +333,14 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         tempo_media::set_hardware_decode(row.is_active());
     });
     playback.add(&hardware);
+    let encode = adw::SwitchRow::builder()
+        .title("Hardware encoding for export (experimental)")
+        .subtitle("Try the graphics chip first; if it cannot be used, export continues the normal way")
+        .active(current.hardware_encode)
+        .build();
+    let c = change.clone();
+    encode.connect_active_notify(move |row| c(&|s| s.hardware_encode = row.is_active()));
+    playback.add(&encode);
 
     let storage = adw::PreferencesGroup::builder().title("Storage").build();
     let cache = adw::ActionRow::builder().title("Cache").subtitle("Waveforms and proxies. Tempo makes them again when needed.").build();
@@ -378,4 +386,59 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let dialog = adw::PreferencesDialog::builder().title("Preferences").build();
     dialog.add(&page);
     dialog.present(Some(parent));
+}
+
+/// The Plugins dialog: what is installed, what each may do, and its on/off switch.
+pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plugins>) {
+    let group = adw::PreferencesGroup::builder()
+        .title("Installed")
+        .description("A plugin can only do what is listed under its name. Plugins run in a sandbox: they cannot read your files or use the network.")
+        .build();
+    for plugin in plugins.list.borrow().iter() {
+        let access = match plugin.timeline {
+            tempo_plugin::TimelineAccess::Write => "May change the timeline",
+            tempo_plugin::TimelineAccess::Read => "May read the timeline",
+            tempo_plugin::TimelineAccess::None => "No access to the timeline",
+        };
+        let origin = if plugin.built_in { "Comes with Tempo" } else { "Installed by you" };
+        let row = adw::SwitchRow::builder()
+            .title(format!("{} {}", plugin.name, plugin.version))
+            .subtitle(format!("{}\n{access} · {origin}", plugin.description))
+            .active(plugins.is_enabled(&plugin.id))
+            .build();
+        let p = plugins.clone();
+        let id = plugin.id.clone();
+        row.connect_active_notify(move |r| p.set_enabled(&id, r.is_active()));
+        group.add(&row);
+    }
+
+    let install_group = adw::PreferencesGroup::builder()
+        .title("Add a plugin")
+        .description("Pick the folder that holds the plugin's plugin.toml and main.lua.")
+        .build();
+    let install_row = adw::ActionRow::builder().title("Install from Folder…").activatable(true).build();
+    install_group.add(&install_row);
+
+    let page = adw::PreferencesPage::new();
+    page.add(&group);
+    page.add(&install_group);
+    let dialog = adw::PreferencesDialog::builder().title("Plugins").build();
+    dialog.add(&page);
+
+    let p = plugins.clone();
+    let window: gtk::Window = parent.as_ref().clone();
+    let d = dialog.clone();
+    install_row.connect_activated(move |_| {
+        let p = p.clone();
+        let d = d.clone();
+        let chooser = gtk::FileDialog::builder().title("Plugin Folder").modal(true).build();
+        chooser.select_folder(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
+            if let Some(folder) = result.ok().and_then(|f| f.path()) {
+                p.install(folder);
+                // The list has changed; the dialog is reopened from the menu to show it.
+                d.close();
+            }
+        });
+    });
+    dialog.present(Some(parent.as_ref()));
 }

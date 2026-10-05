@@ -1,39 +1,55 @@
+# Flatpak manifest for Tempo.
+#
+#   flatpak-builder --user --install --force-clean build-dir packaging/dev.tempo.Tempo.yml
+#
+# Status: written but not yet built or tested. Cargo downloads its crates during
+# the build, which needs network access (allowed below). Flathub does not allow
+# that; a Flathub submission needs the crates listed as sources instead
+# (flatpak-cargo-generator makes that list from Cargo.lock).
 app-id: dev.tempo.Tempo
 runtime: org.gnome.Platform
-runtime-version: '46'
+runtime-version: "49"
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+add-extensions:
+  # Full FFmpeg (libraries and the ffmpeg program) with the common codecs.
+  org.freedesktop.Platform.ffmpeg-full:
+    directory: lib/ffmpeg
+    version: "25.08"
+    add-ld-path: .
 command: tempo
 
 finish-args:
-  # Wayland native display access
   - --socket=wayland
   - --socket=fallback-x11
-  # Audio playback and recording via PipeWire
-  - --socket=pulseaudio
-  # GPU acceleration for WGPU
+  - --share=ipc
   - --device=dri
-  # File access to user media files
-  - --filesystem=host:ro
-  - --filesystem=xdg-videos
-  - --filesystem=xdg-download
-  # D-Bus desktop portals
-  - --talk-name=org.freedesktop.portal.Desktop
+  # Sound through PipeWire.
+  - --filesystem=xdg-run/pipewire-0
+  # Media can live anywhere; projects and exports go to Videos by default.
+  - --filesystem=host
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm20/lib
+  build-args:
+    - --share=network
   env:
     CARGO_HOME: /run/build/tempo/cargo
+
+cleanup-commands:
+  - mkdir -p /app/lib/ffmpeg
 
 modules:
   - name: tempo
     buildsystem: simple
     build-commands:
-      - cargo build --release --bin tempo
+      - cargo build --release --locked -p tempo-app
       - install -Dm755 target/release/tempo /app/bin/tempo
       - install -Dm644 packaging/dev.tempo.Tempo.desktop /app/share/applications/dev.tempo.Tempo.desktop
-      - install -Dm644 packaging/dev.tempo.Tempo.appdata.xml /app/share/metainfo/dev.tempo.Tempo.appdata.xml
+      - install -Dm644 packaging/dev.tempo.Tempo.metainfo.xml /app/share/metainfo/dev.tempo.Tempo.metainfo.xml
       - install -Dm644 assets/icons/dev.tempo.Tempo.svg /app/share/icons/hicolor/scalable/apps/dev.tempo.Tempo.svg
       - install -Dm644 assets/icons/dev.tempo.Tempo-symbolic.svg /app/share/icons/hicolor/symbolic/apps/dev.tempo.Tempo-symbolic.svg
     sources:

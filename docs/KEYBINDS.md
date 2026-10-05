@@ -133,6 +133,10 @@ Markers with a name become chapter timestamps on export (`UI_SPEC.md §7.4`).
 
 Note that **`Ctrl+Y` is a selection command in Resolve, not redo.**
 
+**Roll trim.** In Trim mode, hold `Shift` while dragging a cut to roll it (move the cut
+without changing the total length). Resolve does this by clicking exactly on the cut; Tempo
+uses `Shift` because the line is hard to hit on a small screen.
+
 Resolve also binds the backtick key `` ` `` to undo. Tempo leaves that out, because it is
 easy to press by accident.
 

@@ -33,6 +33,9 @@ pub struct TimelineExport {
     pub range: Option<(i64, i64)>,
     pub chapters: Vec<Chapter>,
     pub output: PathBuf,
+    /// Try the graphics chip's H.264 encoder (VA-API) first. If it cannot be
+    /// used, the export is done again with the software encoder.
+    pub hardware: bool,
 }
 
 fn secs(us: i64) -> String {
@@ -253,7 +256,11 @@ pub fn build_ffmpeg_args(
         graph.push(format!("[{base}][{label}]overlay=eof_action=pass:format=auto[{next}]"));
         base = next;
     }
-    graph.push(format!("[{base}]format=yuv420p[vout]"));
+    if e.hardware {
+        graph.push(format!("[{base}]format=nv12,hwupload[vout]"));
+    } else {
+        graph.push(format!("[{base}]format=yuv420p[vout]"));
+    }
 
     // ---- Audio: one strip per track, then mixed.
     let mut audio_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled).collect();
@@ -307,6 +314,9 @@ pub fn build_ffmpeg_args(
 
     // ---- Command line.
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-nostats".into(), "-progress".into(), "pipe:1".into()];
+    if e.hardware {
+        args.extend(["-vaapi_device".into(), "/dev/dri/renderD128".into()]);
+    }
     args.extend(inputs);
     if let Some(meta) = metadata_file {
         args.extend(["-i".into(), meta.to_string_lossy().into_owned(), "-map_metadata".into(), n_inputs.to_string()]);
@@ -315,7 +325,12 @@ pub fn build_ffmpeg_args(
     if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
-    args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
+    if e.hardware {
+        // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
+        args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]);
+    } else {
+        args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
+    }
     args.extend([
         "-movflags".into(),
         "+faststart".into(),
@@ -329,6 +344,21 @@ pub fn build_ffmpeg_args(
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
 /// and removes the partial file. Blocking: call from a worker thread.
 pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<()> {
+    if e.hardware {
+        match run_ffmpeg(project, e, cancel, &mut progress) {
+            Ok(()) => return Ok(()),
+            Err(_) if cancel.load(Ordering::Relaxed) => return Err(ExportError::Ffmpeg("Cancelled".into())),
+            Err(err) => {
+                tracing::warn!("hardware encoder could not be used ({err}); exporting with the software encoder");
+                let software = TimelineExport { hardware: false, ..e.clone() };
+                return run_ffmpeg(project, &software, cancel, &mut progress);
+            }
+        }
+    }
+    run_ffmpeg(project, e, cancel, &mut progress)
+}
+
+fn run_ffmpeg(project: &Project, e: &TimelineExport, cancel: &AtomicBool, progress: &mut dyn FnMut(f32)) -> Result<()> {
     if let Some(dir) = e.output.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -428,7 +458,7 @@ mod tests {
     }
 
     fn settings(output: PathBuf) -> TimelineExport {
-        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output }
+        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false }
     }
 
     #[test]
@@ -505,6 +535,22 @@ mod tests {
         assert_eq!(files.len(), 1);
         // Awkward characters in the title must not break the filter graph.
         export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(out.exists());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn hardware_export_falls_back_to_software_when_it_cannot_run() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let project = project_with_clip(path);
+        let out = std::env::temp_dir().join(format!("tempo-export-hw-{}.mp4", std::process::id()));
+        let mut e = settings(out.clone());
+        e.hardware = true;
+        // Whether or not this machine has a working VA-API encoder, a file must come out.
+        export_timeline(&project, &e, &AtomicBool::new(false), |_| {}).unwrap();
         assert!(out.exists());
         let _ = std::fs::remove_file(&out);
     }

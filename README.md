@@ -95,10 +95,11 @@ The full list is in [docs/KEYBINDS.md](docs/KEYBINDS.md).
 
 ## What is not done yet
 
-- Hardware (VA-API) video decoding. Decoding is done on the processor.
-- Transitions and titles.
-- Plugins.
-- A Preferences window.
+- Hardware (VA-API) decoding and encoding exist but are switched off by default: they
+  have not yet been tried on a machine with a working driver.
+- Cross dissolve between two clips (fades and titles are done).
+- Plugins can add timeline commands; they cannot yet add effects or upload targets.
+- Keyframe animation.
 
 The complete, current list is at the top of [docs/ROADMAP.md](docs/ROADMAP.md).
 

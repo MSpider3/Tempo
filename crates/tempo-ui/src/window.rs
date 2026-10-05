@@ -17,6 +17,7 @@ use crate::dialogs;
 use crate::edit_page::EditPage;
 use crate::export_page::ExportPage;
 use crate::keybinds;
+use crate::plugins::Plugins;
 use crate::project_manager::{self, ProjectManager};
 use crate::proxies::Proxies;
 use crate::state::{AppState, Change, Tool};
@@ -40,6 +41,9 @@ pub struct MainWindow {
     edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
+    plugins: Rc<Plugins>,
+    /// The part of the main menu that lists plugin commands.
+    plugin_menu: gio::Menu,
     _waveforms: Rc<Waveforms>,
     manager: std::cell::RefCell<Option<Rc<ProjectManager>>>,
     project_name: gtk::Label,
@@ -88,7 +92,11 @@ impl MainWindow {
         edit_menu.append(Some("Redo"), Some("win.redo"));
         edit_menu.append(Some("Copy Chapter List"), Some("win.copy-chapters"));
         menu.append_section(None, &edit_menu);
+        // Filled with the commands of enabled plugins; see `refresh_plugin_menu`.
+        let plugin_menu = gio::Menu::new();
+        menu.append_section(Some("Plugins"), &plugin_menu);
         let help = gio::Menu::new();
+        help.append(Some("Plugins…"), Some("win.plugins"));
         help.append(Some("Preferences"), Some("win.preferences"));
         help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("About Tempo"), Some("win.about"));
@@ -208,6 +216,8 @@ impl MainWindow {
             edit,
             export,
             proxies: Proxies::new(&state_for_proxies),
+            plugins: Plugins::new(&state_for_proxies),
+            plugin_menu,
             _waveforms: Waveforms::new(&state_for_proxies),
             manager: Default::default(),
             project_name,
@@ -321,7 +331,22 @@ impl MainWindow {
 
     /// Menu items are window actions that forward to `run_action`.
     fn install_actions(self: &Rc<Self>) {
-        for name in ["import-media", "save", "undo", "redo", "copy-chapters", "preferences", "show-shortcuts", "about", "quit"] {
+        // Plugin commands carry "plugin-id::command-id" as the action's parameter.
+        let run_plugin = gio::SimpleAction::new("run-plugin", Some(glib::VariantTy::STRING));
+        let w = self.clone();
+        run_plugin.connect_activate(move |_, target| {
+            if let Some(target) = target.and_then(|t| t.str()) {
+                if w.in_project() {
+                    w.plugins.run(target);
+                }
+            }
+        });
+        self.window.add_action(&run_plugin);
+        let w = self.clone();
+        self.plugins.connect_changed(move || w.refresh_plugin_menu());
+        self.refresh_plugin_menu();
+
+        for name in ["import-media", "save", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
@@ -357,6 +382,7 @@ impl MainWindow {
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
             *w.state.settings.borrow_mut() = settings;
+            w.plugins.reload();
             w.loading_status.set_text("OPENING PROJECTS");
             match std::env::var_os("TEMPO_OPEN").map(PathBuf::from) {
                 Some(path) => w.open_project(path),
@@ -587,6 +613,15 @@ impl MainWindow {
         self.panel_buttons[1].set_visible(is_edit);
     }
 
+    fn refresh_plugin_menu(&self) {
+        self.plugin_menu.remove_all();
+        for (label, target) in self.plugins.commands() {
+            let item = gio::MenuItem::new(Some(&label), None);
+            item.set_action_and_target_value(Some("win.run-plugin"), Some(&target.to_variant()));
+            self.plugin_menu.append_item(&item);
+        }
+    }
+
     /// Dual viewer: the source clip gets its own viewer and playback beside the timeline viewer.
     fn set_dual_viewer(self: &Rc<Self>, on: bool) {
         if on == self.state.dual_viewer.get() {
@@ -701,6 +736,7 @@ impl MainWindow {
                 }
             }
             "dual" => self.set_dual_viewer(parts.first() == Some(&"on")),
+            "plugin" => self.plugins.run(args),
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
             "panel" => match parts.first().copied() {
@@ -738,6 +774,10 @@ impl MainWindow {
             }
             "app.preferences" => {
                 dialogs::preferences(&self.window, &self.state);
+                return;
+            }
+            "win.plugins" => {
+                dialogs::plugins(&self.window, &self.plugins);
                 return;
             }
             "win.about" => {

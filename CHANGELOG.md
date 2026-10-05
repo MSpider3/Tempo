@@ -21,6 +21,16 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
   turning a clip off and on.
 - Waveforms on audio clips, worked out in the background and kept on disk.
 - An output level meter beside the timeline.
+- Titles (Text and Lower Third) and fade in / fade out, in the viewer and in export, with
+  an Effects panel to add them and Inspector sections to edit them.
+- Selecting several clips (Ctrl+click, Select All); a clip and its sound are linked and
+  move, trim and delete together; rolling a cut with Shift in Trim mode.
+- Dual viewer, and a layout for vertical projects with the viewer in a tall column.
+- Preferences: autosave interval, playback quality, automatic proxies, cache.
+- Lua plugins: sandboxed scripts that add commands to the menu and change the timeline as
+  one undo step. A Remove Silence plugin is built in.
+- Optional hardware (VA-API) decoding and encoding, off by default, falling back to the
+  processor when the graphics driver cannot be used.
 - A dialog to find media files that have moved.
 - A one-time hint for first-time users.
 - Undo and redo for every edit, marker and track change.

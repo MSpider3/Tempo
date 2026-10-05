@@ -1,9 +1,12 @@
 name: Release
 
 # Push a tag such as v0.1.0 to build the packages and publish a GitHub release.
+# Pushing a branch named release-test/... builds and start-tests the packages
+# without publishing anything, to try packaging changes.
 on:
   push:
     tags: ["v*"]
+    branches: ["release-test/**"]
   workflow_dispatch:
 
 permissions:
@@ -33,6 +36,11 @@ jobs:
           cargo generate-rpm -p crates/tempo-app
           mkdir -p dist
           cp target/generate-rpm/*.rpm dist/
+      - name: Install the package and check that Tempo starts
+        run: |
+          dnf install -y --setopt=install_weak_deps=False ./dist/*.rpm \
+            xorg-x11-server-Xvfb dbus-daemon mesa-dri-drivers adwaita-icon-theme
+          GSK_RENDERER=cairo dbus-run-session -- xvfb-run -a tempo --smoke-test
       - uses: actions/upload-artifact@v4
         with:
           name: rpm
@@ -67,13 +75,18 @@ jobs:
           mkdir -p dist
           cp target/debian/*.deb dist/
 
+      - name: Install the DEB and check that Tempo starts
+        run: |
+          apt-get install -y --no-install-recommends ./dist/*.deb xvfb xauth dbus-daemon libgl1-mesa-dri adwaita-icon-theme
+          GSK_RENDERER=cairo dbus-run-session -- xvfb-run -a tempo --smoke-test
+
       - name: Package AppImage
         env:
           # linuxdeploy is itself an AppImage; containers have no FUSE.
           APPIMAGE_EXTRACT_AND_RUN: "1"
           DEPLOY_GTK_VERSION: "4"
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)"
           export LINUXDEPLOY_OUTPUT_VERSION="$VERSION"
           curl -fsSLo linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSLo linuxdeploy-plugin-gtk.sh https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
@@ -88,6 +101,19 @@ jobs:
             --plugin gtk \
             --output appimage
           mv Tempo-*.AppImage "dist/Tempo-${VERSION}-x86_64.AppImage"
+
+      - name: Check that the AppImage starts
+        # Runs the packed program with nothing but what is inside the AppImage
+        # (plus a virtual display), which is where AppImages usually fail.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          chmod +x dist/*.AppImage
+          GSK_RENDERER=cairo dbus-run-session -- xvfb-run -a dist/*.AppImage --smoke-test
+          # FFmpeg must be reachable from inside it too.
+          dist/*.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/ffmpeg
+          rm -rf squashfs-root
       - uses: actions/upload-artifact@v4
         with:
           name: deb-appimage

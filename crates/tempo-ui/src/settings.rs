@@ -16,11 +16,15 @@ pub struct Settings {
     /// Use the graphics chip to decode video when it can. Off by default until
     /// it has been tried on more machines.
     pub hardware_decode: bool,
+    /// Try the graphics chip's encoder for export first.
+    pub hardware_encode: bool,
+    /// Ids of plugins that are switched off.
+    pub plugins_off: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { autosave_seconds: 120, playback_height: 540, auto_proxies: true, hardware_decode: false }
+        Self { autosave_seconds: 120, playback_height: 540, auto_proxies: true, hardware_decode: false, hardware_encode: false, plugins_off: Vec::new() }
     }
 }
 

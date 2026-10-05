@@ -5,6 +5,18 @@
 **Runtime:** Lua 5.4 (via `mlua`)
 **Replaces:** version 1.0 (WASM plugins on wasmtime, HTML panels, Python compute server).
 
+> **What is built (2026-10-05).** Script plugins (§7) work: a folder with `plugin.toml`
+> and `main.lua`, commands in the main menu, the sandbox and limits of §7.2, and these parts
+> of the API: `tempo.log`, `tempo.notify`, `tempo.playhead`, `tempo.selection`,
+> `tempo.timeline.tracks/clips/clip/split/delete/move/set`, `tempo.markers.list/add/remove`,
+> `tempo.media.loudness`. A script runs against a copy of the timeline and its changes are
+> applied as one undo step.
+>
+> Not built yet: data plugins (§5, §6), `tempo.ui`, `tempo.files`, `tempo.http`,
+> `tempo.secrets`, upload targets, and the `.tempo-plugin` archive (plugins are installed
+> from a folder). `tempo.timeline.move` takes `(clip, start)`; `tempo.media.loudness`
+> returns decibel values from the cached waveform.
+
 ---
 
 ## 1. Why this design

@@ -119,7 +119,9 @@ impl AppState {
     }
 
     pub fn message(&self, text: impl Into<String>) {
-        self.emit(Change::Message(text.into()));
+        let text = text.into();
+        tracing::info!("message: {text}");
+        self.emit(Change::Message(text));
     }
 
     /// Run `f` with the timeline, if a project is open.

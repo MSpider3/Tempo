@@ -320,6 +320,7 @@ impl ExportPage {
             range,
             chapters,
             output,
+            hardware: self.state.settings.borrow().hardware_encode,
         };
         self.jobs.borrow_mut().push(Job {
             name,

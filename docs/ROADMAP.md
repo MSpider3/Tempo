@@ -34,21 +34,27 @@ recording:
 This is a newer i3 than the i3-6100 reference machine, and it has more memory, so the
 reference machine still needs its own run.
 
+**Checked without a person at the keyboard.** The editing gestures were run through the
+real mouse handlers by scripted steps (click, Ctrl+click, drag, trim, ripple, roll, blade,
+insert, overwrite, append, place on top, copy and paste, delete, undo) and the resulting
+timeline compared with what was expected. Three bugs were found and fixed that way. A person
+has still not sat down and used it.
+
 **Main gaps**
 
 | Gap | Note |
 |---|---|
-| Hardware (VA-API) decode | Not built. It could not be tested on the development machine, whose VA-API driver fails to start |
-| Transitions and titles | Not rendered; the Effects panel is empty |
-| Lua plugins | Not started |
-| Multi-select, linked clips, roll trim, duplicate | Not built |
-| Dual viewer, vertical layout | Not built |
-| Preferences and Project Settings windows | Not built |
-| Inspector | Transform, Composite and Audio only; values change in steps |
+| Hardware decode and encode | Built with automatic fallback, but off by default: the development machine's VA-API driver does not start, so only the fallback could be tested |
+| Cross dissolve | Not built. Fade in and fade out are |
+| Plugins | Lua commands work (timeline, markers, loudness). Not built: shader effects, title and export-preset packs, file and network access, upload targets, the `.tempo-plugin` archive (plugins install from a folder) |
+| Inspector | Values change in steps, one undo step each; no live drag |
 | Project Manager | No rename, duplicate or move to trash |
-| Export | Uses the `ffmpeg` program, not the libraries; no hardware encode |
+| Project Settings window, duplicate clip, track add/remove | Not built |
+| Export | Uses the `ffmpeg` program, not the libraries. This is deliberate: it is robust and keeps Tempo small |
 | Proxies | Made for all heavy footage on import, not only when playback drops frames |
+| Flatpak | A manifest exists in `packaging/` but has not been built |
 | A/V sync | Picture follows the audio clock; the 40 ms target has not been measured |
+| Roll trim | Uses Shift in Trim mode, not Resolve's click-on-the-cut |
 
 ---
 
@@ -59,7 +65,7 @@ reference machine still needs its own run.
 - [x] Playback worker thread owns decoding. The UI only receives finished frames.
 - [x] No decoding when the playhead has not moved.
 - [x] Frame-threaded software decode. Separate demuxers for audio and video.
-- [ ] Real VA-API decode with automatic fallback to software.
+- [x] Real VA-API decode with automatic fallback to software.
 - [ ] Viewer shows frames without a round trip through CPU memory: `GdkDmabufTexture` in
       `GtkGraphicsOffload` when hardware decode is active, YUV upload otherwise.
 - [x] Real PipeWire output. Audio is the clock; video follows it.
@@ -90,9 +96,9 @@ reference machine still needs its own run.
 **Timeline**
 - [x] `TimelineWidget`: one custom-drawn, scrollable widget. Ruler, tracks, clips, playhead.
 - [x] Remove the button-based timeline and all sample clips.
-- [ ] Selection, Trim and Blade modes; move, trim, ripple, roll, split.
+- [x] Selection, Trim and Blade modes; move, trim, ripple, roll, split.
 - [x] Insert, Overwrite, Replace, Place on Top, Append.
-- [ ] Snapping; linked clips and linked selection.
+- [x] Snapping; linked clips and linked selection.
 - [ ] Copy, cut, paste, duplicate, enable/disable clip, lock track.
 - [x] **Every change goes through `CommandLog`.** Undo and redo.
 - [ ] Zoom and scroll with Resolve's mouse gestures.
@@ -132,8 +138,8 @@ reference machine still needs its own run.
 - [ ] Inspector: Transform, Composite, Audio, Title, Transition, Marker sections.
 - [ ] Live preview while dragging a value; one undo step per drag.
 - [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades.
-- [ ] Title clips: Text and Lower Third.
-- [ ] Vertical-project layout.
+- [x] Title clips: Text and Lower Third.
+- [x] Vertical-project layout.
 - [ ] Automatic small proxies, made only when playback drops frames, paused during playback.
 - [x] Export page: presets, settings, viewer with range, render queue.
 - [ ] Export engine in-process (no `ffmpeg` program): timeline video and mixed audio,
@@ -170,10 +176,10 @@ reference machine still needs its own run.
 - [ ] Built-in packs: transitions, filters, titles.
 
 **Tier 2 — Lua**
-- [ ] Sandboxed Lua states with memory and run-time limits.
+- [x] Sandboxed Lua states with memory and run-time limits.
 - [ ] `tempo` API: project, timeline read and write, markers, media, ui.
-- [ ] Commands in context menus; one undo step per run.
-- [ ] Built-in example: Remove Silence.
+- [x] Commands in context menus; one undo step per run.
+- [x] Built-in example: Remove Silence.
 - [x] Remove `wasmtime` and `tempo-compute` from the build.
 
 **Done when**
