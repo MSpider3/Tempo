@@ -738,6 +738,7 @@ impl MainWindow {
             "dual" => self.set_dual_viewer(parts.first() == Some(&"on")),
             "plugin" => self.plugins.run(args),
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
+            "dissolve" => actions::cross_dissolve(&self.state, num(0).unwrap_or(0.5)),
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
             "panel" => match parts.first().copied() {
                 Some("effects") => self.panel_buttons[1].set_active(true),
@@ -919,6 +920,7 @@ impl MainWindow {
                 state.linked_selection.set(!state.linked_selection.get());
                 state.emit(Change::Options);
             }
+            "win.transition-add" => actions::cross_dissolve(state, 0.5),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
             "win.delete" => actions::delete_selected(state, false),

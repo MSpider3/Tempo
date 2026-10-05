@@ -227,6 +227,42 @@ pub fn set_fade(state: &Rc<AppState>, fade_in: bool, seconds: f64) {
     }
 }
 
+/// Cross dissolve from the previous clip into each selected clip. The incoming
+/// clip needs footage before its In point to dissolve from.
+pub fn cross_dissolve(state: &Rc<AppState>, seconds: f64) {
+    let wanted = (seconds.max(0.0) * 1_000_000.0) as i64;
+    let frame = state.frame_us();
+    let mut reason: Option<&str> = None;
+    let mut commands: Vec<Box<dyn Command>> = Vec::new();
+    for (track, clip) in all_selected(state) {
+        // Length of the clip this one touches, if any.
+        let previous = state
+            .with_timeline(|t| t.find_track(track).and_then(|tr| tr.clips.iter().find(|c| c.timeline_out == clip.timeline_in).map(|c| c.duration_us())))
+            .flatten();
+        let Some(previous) = previous else {
+            reason = Some("A cross dissolve needs a clip touching the start of the selected one.");
+            continue;
+        };
+        let length = if wanted == 0 { 0 } else { wanted.min(clip.source_in).min(previous / 2) };
+        if wanted > 0 && length < frame {
+            reason = Some("This clip starts at the very beginning of its footage, so there is nothing to dissolve from. Trim its start a little first.");
+            continue;
+        }
+        let mut edited = clip.clone();
+        edited.properties.dissolve_in_us = length;
+        if edited != clip {
+            commands.push(Box::new(EditClipCommand::new("Cross Dissolve", edited)));
+        }
+    }
+    if !commands.is_empty() {
+        state.execute(Box::new(CompositeCommand::new("Cross Dissolve", commands)));
+    } else if let Some(reason) = reason {
+        state.message(reason);
+    } else if state.selection.get().is_none() {
+        state.message("Select the clip that should dissolve in.");
+    }
+}
+
 /// Link or unlink the selected clips (Resolve's Ctrl+Alt+L).
 pub fn toggle_link(state: &Rc<AppState>) {
     let clips = all_selected(state);

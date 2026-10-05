@@ -728,6 +728,13 @@ impl TimelineCanvas {
                     s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.6), &body);
                 }
                 s.pop();
+                // A cross dissolve is marked by a box reaching back over the previous clip.
+                if clip.properties.dissolve_in_us > 0 {
+                    let lead = (clip.properties.dissolve_in_us.min(clip.source_in) as f64 / 1_000_000.0 * self.pps()) as f32;
+                    let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
+                    s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
+                    s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);
+                }
                 if state.is_selected(clip.id) {
                     s.append_border(&rounded, &[2.0; 4], &[accent; 4]);
                 } else {

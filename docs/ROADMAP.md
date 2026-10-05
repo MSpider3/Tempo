@@ -45,7 +45,6 @@ has still not sat down and used it.
 | Gap | Note |
 |---|---|
 | Hardware decode and encode | Built with automatic fallback, but off by default: the development machine's VA-API driver does not start, so only the fallback could be tested |
-| Cross dissolve | Not built. Fade in and fade out are |
 | Plugins | Lua commands work (timeline, markers, loudness). Not built: shader effects, title and export-preset packs, file and network access, upload targets, the `.tempo-plugin` archive (plugins install from a folder) |
 | Inspector | Values change in steps, one undo step each; no live drag |
 | Project Manager | No rename, duplicate or move to trash |
@@ -137,7 +136,7 @@ has still not sat down and used it.
 
 - [ ] Inspector: Transform, Composite, Audio, Title, Transition, Marker sections.
 - [ ] Live preview while dragging a value; one undo step per drag.
-- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades.
+- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades. *(Cross dissolve, fades and audio fades are built; fades are set in the Inspector and Effects panel, not by handles.)*
 - [x] Title clips: Text and Lower Third.
 - [x] Vertical-project layout.
 - [ ] Automatic small proxies, made only when playback drops frames, paused during playback.

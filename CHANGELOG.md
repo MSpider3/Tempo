@@ -21,6 +21,7 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
   turning a clip off and on.
 - Waveforms on audio clips, worked out in the background and kept on disk.
 - An output level meter beside the timeline.
+- Cross dissolve between two clips (`Ctrl+T`), for picture and sound.
 - Titles (Text and Lower Third) and fade in / fade out, in the viewer and in export, with
   an Effects panel to add them and Inspector sections to edit them.
 - Selecting several clips (Ctrl+click, Select All); a clip and its sound are linked and
