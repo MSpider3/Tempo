@@ -188,6 +188,12 @@ impl FfmpegDecoder {
 
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut last_before: Option<(ffmpeg_next::frame::Video, i64)> = None;
+        // Some decoders (OpenH264, which Fedora's FFmpeg uses for H.264) still hand
+        // out a frame from before the seek after being flushed. Once we know the
+        // seek landed at or before the target, frames later than the target are
+        // such leftovers until the first frame at or before it has come out.
+        let mut stale_possible = false;
+        let mut first_packet = need_seek;
 
         // Read packets one at a time so `self` stays free for scaling.
         loop {
@@ -197,11 +203,25 @@ impl FfmpegDecoder {
                 Err(ffmpeg_next::Error::Eof) => break,
                 Err(_) => continue,
             }
-            if packet.stream() != self.stream_index || self.decoder.send_packet(&packet).is_err() {
+            if packet.stream() != self.stream_index {
+                continue;
+            }
+            if first_packet {
+                first_packet = false;
+                let packet_us = packet.pts().or(packet.dts()).map(|t| to_us(t, self.time_base) - self.start_us);
+                stale_possible = packet_us.is_some_and(|t| t <= target_pts_us);
+            }
+            if self.decoder.send_packet(&packet).is_err() {
                 continue;
             }
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts_us = to_us(decoded.pts().unwrap_or(0), self.time_base) - self.start_us;
+                if stale_possible {
+                    if pts_us > target_pts_us {
+                        continue;
+                    }
+                    stale_possible = false;
+                }
                 self.last_decoded_pts_us = pts_us;
                 if keyframe_only || pts_us >= target_pts_us {
                     return self.scale_frame(&decoded, pts_us);
