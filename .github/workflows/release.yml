@@ -91,6 +91,9 @@ jobs:
           curl -fsSLo linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSLo linuxdeploy-plugin-gtk.sh https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
           chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
+          # The GTK plugin copies this folder of optional GTK modules and stops if
+          # it is missing, which it is on a minimal system.
+          mkdir -p "/usr/lib/$(uname -m)-linux-gnu/gtk-4.0"
 
           # Tempo calls the ffmpeg program for export and proxies, so it travels inside the AppImage.
           ./linuxdeploy --appdir AppDir \
