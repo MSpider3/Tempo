@@ -6,7 +6,7 @@
 //! edited copy back and applies it as a single undo step. A script therefore
 //! cannot freeze the editor, touch files, or leave the timeline half changed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -16,10 +16,13 @@ use std::time::{Duration, Instant};
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Table, Value, VmState};
 use serde::Deserialize;
 use tempo_timeline::{
-    AddMarkerCommand, Clip, ClipType, Command, DeleteClipCommand, DeleteMarkerCommand, Marker, MarkerColor, MoveClipCommand,
-    RippleDeleteCommand, SplitClipCommand, Timeline, TrackKind,
+    AddMarkerCommand, Clip, ClipEffect, ClipType, Command, DeleteClipCommand, DeleteMarkerCommand, EffectOp, EffectParam, Marker,
+    MarkerColor, MoveClipCommand, RippleDeleteCommand, SplitClipCommand, Timeline, TrackKind,
 };
 use uuid::Uuid;
+
+mod upload;
+pub use upload::{run_upload, UploadInput, UploadOutput};
 
 /// A script may use this much memory and run for this long.
 pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -60,6 +63,29 @@ struct ManifestFile {
     permissions: Permissions,
     #[serde(default, rename = "command")]
     commands: Vec<CommandDef>,
+    #[serde(default, rename = "filter")]
+    filters: Vec<FilterDef>,
+    #[serde(default, rename = "uploader")]
+    uploaders: Vec<CommandDef>,
+}
+
+/// A filter recipe in a manifest. See `tempo_timeline::effects`.
+#[derive(Debug, Deserialize)]
+struct FilterDef {
+    id: String,
+    name: String,
+    ops: Vec<EffectOp>,
+    #[serde(default, rename = "param")]
+    params: Vec<ParamDef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ParamDef {
+    id: String,
+    name: String,
+    min: f32,
+    max: f32,
+    default: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +102,9 @@ struct ManifestHead {
 struct Permissions {
     #[serde(default)]
     timeline: TimelineAccess,
+    /// Hosts an uploader may contact.
+    #[serde(default)]
+    network: Vec<String>,
 }
 
 /// A plugin that has been read and checked, ready to run.
@@ -87,7 +116,13 @@ pub struct Plugin {
     pub description: String,
     pub timeline: TimelineAccess,
     pub commands: Vec<CommandDef>,
-    /// The Lua source.
+    /// Upload targets: each names a Lua function that sends a finished export.
+    pub uploaders: Vec<CommandDef>,
+    /// Hosts the uploaders may contact, and no others.
+    pub network: Vec<String>,
+    /// Filters this plugin offers, ready to be put on a clip.
+    pub filters: Vec<ClipEffect>,
+    /// The Lua source. Empty for a plugin that only supplies data.
     pub script: Arc<str>,
     /// True for plugins that ship inside the program.
     pub built_in: bool,
@@ -100,13 +135,30 @@ impl Plugin {
         if m.plugin.id.trim().is_empty() || m.plugin.name.trim().is_empty() {
             return Err(PluginError::Manifest("the plugin needs an id and a name".into()));
         }
+        let filters = m
+            .filters
+            .into_iter()
+            .map(|f| ClipEffect {
+                id: format!("{}/{}", m.plugin.id, f.id),
+                name: f.name,
+                params: f
+                    .params
+                    .into_iter()
+                    .map(|p| EffectParam { id: p.id, name: p.name, min: p.min, max: p.max.max(p.min), value: p.default.clamp(p.min, p.max.max(p.min)), default: p.default })
+                    .collect(),
+                ops: f.ops,
+            })
+            .collect();
         Ok(Self {
+            filters,
             id: m.plugin.id,
             name: m.plugin.name,
             version: m.plugin.version,
             description: m.plugin.description,
             timeline: m.permissions.timeline,
+            network: m.permissions.network,
             commands: m.commands,
+            uploaders: m.uploaders,
             script: script.into(),
             built_in,
         })
@@ -118,16 +170,21 @@ impl Plugin {
             let path = dir.join(name);
             std::fs::read_to_string(&path).map_err(|e| PluginError::Io(path, e))
         };
-        Self::from_sources(&read("plugin.toml")?, &read("main.lua")?, false)
+        // A plugin that only supplies filters has no script.
+        let script = if dir.join("main.lua").exists() { read("main.lua")? } else { String::new() };
+        Self::from_sources(&read("plugin.toml")?, &script, false)
     }
 }
 
 /// The plugins that ship with Tempo.
 pub fn built_in() -> Vec<Plugin> {
-    let sources = [(
-        include_str!("../../../assets/plugins/remove-silence/plugin.toml"),
-        include_str!("../../../assets/plugins/remove-silence/main.lua"),
-    )];
+    let sources = [
+        (
+            include_str!("../../../assets/plugins/remove-silence/plugin.toml"),
+            include_str!("../../../assets/plugins/remove-silence/main.lua"),
+        ),
+        (include_str!("../../../assets/plugins/filters/plugin.toml"), ""),
+    ];
     sources
         .iter()
         .filter_map(|(manifest, script)| match Plugin::from_sources(manifest, script, true) {
@@ -231,21 +288,8 @@ pub fn run_command(plugin: &Plugin, function: &str, input: RunInput) -> Result<R
         messages: Vec::new(),
     }));
 
-    // Only the pure libraries: no files, no processes, no loading of other code.
-    let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8, LuaOptions::default()).map_err(fail)?;
-    lua.set_memory_limit(MEMORY_LIMIT).map_err(fail)?;
-    let deadline = Instant::now() + TIME_LIMIT;
-    lua.set_hook(HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
-        if Instant::now() > deadline {
-            Err(script_error("the script ran for too long and was stopped"))
-        } else {
-            Ok(VmState::Continue)
-        }
-    });
+    let (lua, _) = sandbox().map_err(fail)?;
     let globals = lua.globals();
-    for name in ["dofile", "loadfile", "load", "loadstring", "require", "collectgarbage"] {
-        globals.set(name, Value::Nil).map_err(fail)?;
-    }
 
     install_api(&lua, &session, input.playhead_us, &input.selection, input.loudness).map_err(fail)?;
 
@@ -258,6 +302,29 @@ pub fn run_command(plugin: &Plugin, function: &str, input: RunInput) -> Result<R
 
     let session = Rc::try_unwrap(session).map_err(|_| PluginError::Script("the script kept a reference to the timeline".into()))?.into_inner();
     Ok(RunOutput { changed: session.timeline != before, timeline: session.timeline, messages: session.messages })
+}
+
+/// A fresh Lua state with the memory and time limits set. The cell holds the
+/// moment the script is stopped, so time spent waiting on the network can be
+/// given back.
+fn sandbox() -> mlua::Result<(Lua, Rc<Cell<Instant>>)> {
+    // Only the pure libraries: no files, no processes, no loading of other code.
+    let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8, LuaOptions::default())?;
+    lua.set_memory_limit(MEMORY_LIMIT)?;
+    let deadline = Rc::new(Cell::new(Instant::now() + TIME_LIMIT));
+    let d = deadline.clone();
+    lua.set_hook(HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
+        if Instant::now() > d.get() {
+            Err(script_error("the script ran for too long and was stopped"))
+        } else {
+            Ok(VmState::Continue)
+        }
+    });
+    let globals = lua.globals();
+    for name in ["dofile", "loadfile", "load", "loadstring", "require", "collectgarbage"] {
+        globals.set(name, Value::Nil)?;
+    }
+    Ok((lua, deadline))
 }
 
 fn first_line(text: &str) -> String {
@@ -488,7 +555,13 @@ mod tests {
         let p = plugin("write", "function go() end");
         assert_eq!((p.id.as_str(), p.timeline, p.commands.len()), ("test.plugin", TimelineAccess::Write, 1));
         assert!(Plugin::from_sources("not toml at all [", "", false).is_err());
-        assert_eq!(built_in().len(), 1);
+        let built = built_in();
+        assert_eq!(built.len(), 2);
+        // The filter pack is data only: six recipes, no commands, no script.
+        let filters = &built[1];
+        assert_eq!((filters.filters.len(), filters.commands.len(), filters.script.is_empty()), (6, 0, true));
+        assert_eq!(filters.filters[1].id, "dev.tempo.filters/saturation");
+        assert_eq!(filters.filters[1].params[0].value, 1.4);
     }
 
     #[test]
@@ -503,6 +576,115 @@ mod tests {
     fn the_sandbox_has_no_file_or_process_access() {
         let script = "function go() assert(io == nil and os == nil and require == nil and load == nil and dofile == nil) end";
         assert!(run_command(&plugin("write", script), "go", input(Timeline::new_default())).is_ok());
+    }
+
+    /// Answers one HTTP request with `reply` and hands back what was received.
+    fn one_shot_server(reply: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).into_owned();
+                // Done when the body announced by Content-Length has arrived.
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length: usize = text.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                    if got.len() >= head_end + 4 + length || n == 0 {
+                        break;
+                    }
+                }
+            }
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+            String::from_utf8_lossy(&got).into_owned()
+        });
+        (port, handle)
+    }
+
+    const UPLOADER: &str = r#"
+        [plugin]
+        id = "test.upload"
+        name = "Test Upload"
+        [permissions]
+        network = ["127.0.0.1"]
+        [[uploader]]
+        id = "send"
+        name = "Test Site"
+        function = "send"
+    "#;
+
+    #[test]
+    fn an_uploader_sends_the_file_and_returns_the_address() {
+        if std::process::Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+        let (port, server) = one_shot_server(r#"{"link":"https://example.test/v/1"}"#);
+        let file = std::env::temp_dir().join(format!("tempo-upload-{}.bin", std::process::id()));
+        std::fs::write(&file, b"VIDEO-BYTES").unwrap();
+        // The test passes the port in the title; a real uploader has a fixed address.
+        let script = r#"
+            function send(video)
+                local r = tempo.http.upload{
+                    url = "http://127.0.0.1:" .. video.title .. "/videos",
+                    method = "PUT",
+                    headers = { Authorization = "Bearer " .. video.token, ["X-Name"] = video.file_name },
+                }
+                if r.status ~= 200 then error("refused") end
+                tempo.notify("sent " .. video.size)
+                return tempo.json.decode(r.body).link
+            end
+        "#;
+        let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
+        assert_eq!((plugin.uploaders.len(), plugin.network.as_slice()), (1, &["127.0.0.1".to_string()][..]));
+        let input = UploadInput { file: file.clone(), title: port.to_string(), description: String::new(), token: "secret".into() };
+        let out = run_upload(&plugin, "send", input).unwrap();
+        let request = server.join().unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(out.url.as_deref(), Some("https://example.test/v/1"));
+        assert_eq!(out.messages, vec!["sent 11".to_string()]);
+        assert!(request.starts_with("PUT /videos "), "{request}");
+        assert!(request.contains("Authorization: Bearer secret") && request.ends_with("VIDEO-BYTES"), "{request}");
+    }
+
+    #[test]
+    fn an_uploader_cannot_leave_its_hosts_or_read_files() {
+        let file = std::env::temp_dir().join(format!("tempo-upload-deny-{}.bin", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let run = |body: &str| {
+            let script = format!("function send(video) {body} end");
+            let plugin = Plugin::from_sources(UPLOADER, &script, false).unwrap();
+            let input = UploadInput { file: file.clone(), title: String::new(), description: String::new(), token: String::new() };
+            run_upload(&plugin, "send", input).map(|o| o.url).unwrap_err().to_string()
+        };
+        // A host that is not listed, plain HTTP to another machine, and tricks in the address.
+        assert!(run(r#"tempo.http.request{ url = "https://example.com/" }"#).contains("no permission"));
+        assert!(run(r#"tempo.http.request{ url = "https://127.0.0.1@example.com/" }"#).contains("plain host"));
+        assert!(run(r#"tempo.http.request{ url = "file:///etc/passwd" }"#).contains("no permission"));
+        assert!(run(r#"tempo.http.request{ url = "ftp://127.0.0.1/" }"#).contains("only https"));
+        // curl would read a header that starts with @ from a file.
+        assert!(run(r#"tempo.http.request{ url = "http://127.0.0.1/", headers = { ["@/etc/passwd"] = "x" } }"#).contains("not a valid header"));
+        // The timeline is not part of an upload.
+        assert!(run("return tempo.timeline.tracks()").contains("nil"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn json_round_trips() {
+        let file = std::env::temp_dir().join(format!("tempo-upload-json-{}.bin", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let script = r#"function send(v)
+            local t = tempo.json.decode(tempo.json.encode{ name = "a", tags = { "x", "y" }, n = 2 })
+            if tempo.json.decode("not json") ~= nil then error("bad") end
+            return t.name .. t.tags[2] .. math.floor(t.n)
+        end"#;
+        let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
+        let input = UploadInput { file: file.clone(), title: String::new(), description: String::new(), token: String::new() };
+        assert_eq!(run_upload(&plugin, "send", input).unwrap().url.as_deref(), Some("ay2"));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

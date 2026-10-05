@@ -1415,6 +1415,7 @@ version = "0.1.0"
 dependencies = [
  "mlua",
  "serde",
+ "serde_json",
  "tempo-timeline",
  "thiserror",
  "toml 0.8.23",

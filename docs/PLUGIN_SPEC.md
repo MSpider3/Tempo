@@ -12,9 +12,25 @@
 > `tempo.media.loudness`. A script runs against a copy of the timeline and its changes are
 > applied as one undo step.
 >
-> Not built yet: data plugins (§5, §6), `tempo.ui`, `tempo.files`, `tempo.http`,
-> `tempo.secrets`, upload targets, and the `.tempo-plugin` archive (plugins are installed
-> from a folder). `tempo.timeline.move` takes `(clip, start)`; `tempo.media.loudness`
+> **Filters** work as data: a `[[filter]]` entry lists `ops` (`saturation`, `brightness`,
+> `contrast`, `blur`, or a 4 × 5 colour `matrix`), each a number or `"$param"` naming one of
+> its `[[filter.param]]` entries (`id`, `name`, `min`, `max`, `default`). Tempo draws them on
+> the graphics card in the viewer and with FFmpeg filters in export. A plugin with only
+> filters needs no `main.lua`. See `assets/plugins/filters/plugin.toml`.
+>
+> **Upload targets** work: an `[[uploader]]` entry (`id`, `name`, `function`) appears in
+> **Share…** on a finished export. Its function gets
+> `{ title, description, token, file_name, size }` and may return the video's address. It can
+> call `tempo.http.request{ url, method, headers, body }`,
+> `tempo.http.upload{ url, method, headers, field, form }` (sends the exported file, as the
+> body or as form field `field`), `tempo.json.encode/decode` and `tempo.notify`. Requests go
+> only over HTTPS and only to the hosts in `[permissions] network = [...]`; redirects are
+> not followed. The token the user types is kept in the system keyring. No uploader for a
+> real site ships with Tempo.
+>
+> Not built yet: shader effects (§5), title and preset packs (§6), `tempo.ui`,
+> `tempo.files`, `tempo.secrets` for scripts, and the `.tempo-plugin` archive (plugins are
+> installed from a folder). `tempo.timeline.move` takes `(clip, start)`; `tempo.media.loudness`
 > returns decibel values from the cached waveform.
 
 ---

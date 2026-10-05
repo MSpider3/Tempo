@@ -97,7 +97,8 @@ The full list is in [docs/KEYBINDS.md](docs/KEYBINDS.md).
 
 - Hardware (VA-API) decoding and encoding exist but are switched off by default: they
   have not yet been tried on a machine with a working driver.
-- Plugins can add timeline commands; they cannot yet add effects or upload targets.
+- No upload plugin for a real site ships yet. The plugin point works (see
+  [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md)), but each site needs its own developer keys.
 - Keyframe animation.
 
 The complete, current list is at the top of [docs/ROADMAP.md](docs/ROADMAP.md).

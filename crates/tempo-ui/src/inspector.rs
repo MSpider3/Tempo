@@ -92,6 +92,9 @@ impl Inspector {
                 self.composite_section(&clip);
             }
         }
+        if !matches!(clip.clip_type, ClipType::Audio | ClipType::Title) {
+            self.filter_sections(&clip);
+        }
         self.fade_section(&clip);
     }
 
@@ -132,16 +135,23 @@ impl Inspector {
         grid
     }
 
-    fn row_label(grid: &gtk::Grid, row: i32, name: &str) {
+    fn row_label(grid: &gtk::Grid, row: i32, name: &str) -> gtk::Label {
         let name_label = label(name, &["tempo-dim"]);
         name_label.set_xalign(1.0);
         name_label.set_width_chars(10);
         grid.attach(&name_label, 0, row, 1, 1);
+        name_label
     }
 
-    /// One number row. Each change of the field is one undo step.
+    /// One number row. Typing or stepping the field is one undo step. Dragging
+    /// left or right on the row's name changes the value live, and the whole
+    /// drag is one undo step.
     fn number_row(&self, grid: &gtk::Grid, row: i32, name: &str, value: f64, (min, max, step, digits): (f64, f64, f64, u32), clip: &Clip, make: MakeCommand) {
-        Self::row_label(grid, row, name);
+        let name_label = Self::row_label(grid, row, name);
+        name_label.set_cursor_from_name(Some("ew-resize"));
+        name_label.set_tooltip_text(Some("Drag left or right to change"));
+        let make = Rc::new(make);
+        let dragging = Rc::new(Cell::new(false));
         let spin = gtk::SpinButton::builder()
             .adjustment(&gtk::Adjustment::new(value, min, max, step, step * 10.0, 0.0))
             .digits(digits)
@@ -152,8 +162,47 @@ impl Inspector {
         let state = self.state.clone();
         let busy = self.busy.clone();
         let id = clip.id;
-        spin.connect_value_changed(move |s| Self::apply(&state, &busy, id, |current| make(s.value(), current)));
+        let (m, d) = (make.clone(), dragging.clone());
+        spin.connect_value_changed(move |s| {
+            // During a drag the value is previewed below, not recorded step by step.
+            if !d.get() {
+                Self::apply(&state, &busy, id, |current| m(s.value(), current));
+            }
+        });
         grid.attach(&spin, 1, row, 1, 1);
+
+        let drag = gtk::GestureDrag::new();
+        let start: Rc<RefCell<Option<(f64, Clip)>>> = Rc::new(RefCell::new(None));
+        let (state, busy, sp, st, dr) = (self.state.clone(), self.busy.clone(), spin.clone(), start.clone(), dragging.clone());
+        drag.connect_drag_begin(move |_, _, _| {
+            if let Some(original) = state.selected_clip().filter(|c| c.id == id) {
+                *st.borrow_mut() = Some((sp.value(), original));
+                dr.set(true);
+                busy.set(true);
+            }
+        });
+        let (state, sp, st, m) = (self.state.clone(), spin.clone(), start.clone(), make.clone());
+        drag.connect_drag_update(move |_, dx, _| {
+            let Some((from, _)) = st.borrow().as_ref().map(|(v, c)| (*v, c.id)) else { return };
+            // Four pixels per step: fine enough to aim, quick enough to travel.
+            let value = (from + (dx / 4.0).round() * step).clamp(min, max);
+            if (value - sp.value()).abs() < f64::EPSILON {
+                return;
+            }
+            sp.set_value(value);
+            if let Some(current) = state.selected_clip().filter(|c| c.id == id) {
+                state.apply_unlogged(m(value, &current));
+            }
+        });
+        let (state, busy, name) = (self.state.clone(), self.busy.clone(), name.to_string());
+        drag.connect_drag_end(move |_, _, _| {
+            if let Some((_, original)) = start.borrow_mut().take() {
+                state.commit_preview(&name, original);
+            }
+            dragging.set(false);
+            busy.set(false);
+        });
+        name_label.add_controller(drag);
     }
 
     fn transform_section(&self, clip: &Clip) {
@@ -182,6 +231,41 @@ impl Inspector {
         let grid = self.section("Audio", clip, vec![(100.0, volume()), (0.0, pan())]);
         self.number_row(&grid, 0, "Volume %", p.volume as f64 * 100.0, (0.0, 200.0, 5.0, 0), clip, volume());
         self.number_row(&grid, 1, "Pan", p.pan as f64 * 100.0, (-100.0, 100.0, 10.0, 0), clip, pan());
+    }
+
+    /// One section per filter on the clip: its settings and a button to take it off.
+    fn filter_sections(&self, clip: &Clip) {
+        for (index, effect) in clip.properties.effects.iter().enumerate() {
+            let reset = effect
+                .params
+                .iter()
+                .enumerate()
+                .map(|(p, param)| (param.default as f64, Self::filter_param(index, p)))
+                .collect();
+            let grid = self.section(&effect.name, clip, reset);
+            for (p, param) in effect.params.iter().enumerate() {
+                let range = (param.min as f64, param.max as f64, ((param.max - param.min) as f64 / 100.0).max(0.01), 2);
+                self.number_row(&grid, p as i32, &param.name, param.value as f64, range, clip, Self::filter_param(index, p));
+            }
+            let remove = gtk::Button::builder().label("Remove Filter").halign(gtk::Align::End).build();
+            let state = self.state.clone();
+            let id = clip.id;
+            let effect_id = effect.id.clone();
+            remove.connect_clicked(move |_| {
+                let Some(mut edited) = state.selected_clip().filter(|c| c.id == id) else { return };
+                edited.properties.effects.retain(|e| e.id != effect_id);
+                state.execute(Box::new(EditClipCommand::new("Remove Filter", edited)));
+            });
+            grid.attach(&remove, 0, effect.params.len() as i32, 2, 1);
+        }
+    }
+
+    fn filter_param(effect: usize, param: usize) -> MakeCommand {
+        edit("Filter", move |v, c| {
+            if let Some(p) = c.properties.effects.get_mut(effect).and_then(|e| e.params.get_mut(param)) {
+                p.value = (v as f32).clamp(p.min, p.max);
+            }
+        })
     }
 
     /// Fade lengths in seconds, at the start and end of the clip.

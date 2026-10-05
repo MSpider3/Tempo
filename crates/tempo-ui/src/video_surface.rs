@@ -72,7 +72,33 @@ mod imp {
                     if tw > 0.0 && th > 0.0 {
                         let fit = (fw / tw).min(fh / th);
                         let (dw, dh) = (tw * fit, th * fit);
+                        // The clip's filters: a blur and a colour transform, done by the GPU.
+                        let fx = tempo_timeline::resolve_effects(&props.effects);
+                        let blur = fx.blur * fh / 1080.0;
+                        if blur > 0.05 {
+                            snapshot.push_blur(blur as f64);
+                        }
+                        let tinted = !fx.color.is_identity();
+                        if tinted {
+                            // graphene multiplies a row vector by the matrix, so the rows
+                            // of our transform become its columns.
+                            let m = &fx.color.matrix;
+                            let mut flat = [0.0f32; 16];
+                            for r in 0..4 {
+                                for c in 0..4 {
+                                    flat[c * 4 + r] = m[r][c];
+                                }
+                            }
+                            let o = &fx.color.offset;
+                            snapshot.push_color_matrix(&graphene::Matrix::from_float(flat), &graphene::Vec4::new(o[0], o[1], o[2], o[3]));
+                        }
                         snapshot.append_texture(texture, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
+                        if tinted {
+                            snapshot.pop();
+                        }
+                        if blur > 0.05 {
+                            snapshot.pop();
+                        }
                     }
                 }
                 if let Some(title) = &layer.title {

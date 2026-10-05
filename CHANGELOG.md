@@ -27,6 +27,14 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
 - Selecting several clips (Ctrl+click, Select All); a clip and its sound are linked and
   move, trim and delete together; rolling a cut with Shift in Trim mode.
 - Dual viewer, and a layout for vertical projects with the viewer in a tall column.
+- Filters from plugins (Black and White, Saturation, Brightness, Contrast, Blur, Warm come
+  built in): added from the Effects panel, adjusted in the Inspector, shown in the viewer
+  and in export.
+- Upload targets from plugins, listed under Share on a finished export, limited to the
+  sites the plugin names.
+- Inspector: drag left or right on a setting's name to change it live; the drag is one undo
+  step.
+- Project Manager: rename, duplicate, show in Files, move to Trash.
 - Preferences: autosave interval, playback quality, automatic proxies, cache.
 - Lua plugins: sandboxed scripts that add commands to the menu and change the timeline as
   one undo step. A Remove Silence plugin is built in.

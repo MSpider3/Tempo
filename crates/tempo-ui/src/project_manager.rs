@@ -70,6 +70,33 @@ fn forget(path: &Path) {
     }
 }
 
+/// Change the name stored in a project file. The file itself keeps its name. Blocking.
+fn rename_project(path: &Path, name: &str) -> Result<(), String> {
+    let mut project = tempo_project::load_project(path).map_err(|e| e.to_string())?;
+    project.name = name.to_string();
+    tempo_project::save_project(&project, path).map_err(|e| e.to_string())?;
+    remember(name, path);
+    Ok(())
+}
+
+/// Copy a project file next to the original as "<name> copy". Blocking.
+fn duplicate_project(path: &Path) -> Result<(), String> {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Project".into());
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut copy = dir.join(format!("{stem} copy.tempo"));
+    let mut n = 2;
+    while copy.exists() {
+        copy = dir.join(format!("{stem} copy {n}.tempo"));
+        n += 1;
+    }
+    std::fs::copy(path, &copy).map_err(|e| e.to_string())?;
+    let mut project = tempo_project::load_project(&copy).map_err(|e| e.to_string())?;
+    project.name = format!("{} copy", project.name);
+    tempo_project::save_project(&project, &copy).map_err(|e| e.to_string())?;
+    remember(&project.name, &copy);
+    Ok(())
+}
+
 fn relative_time(time: Option<std::time::SystemTime>) -> String {
     let Some(secs) = time.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()) else { return String::new() };
     match secs {
@@ -200,27 +227,70 @@ impl ProjectManager {
             });
         });
 
-        // Right-click: remove a project from the list (the file is left alone).
+        // Right-click menu for the selected project.
         let menu_click = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_SECONDARY).build();
         let p = pm.clone();
+        let open_cb = on_open.clone();
         menu_click.connect_pressed(move |gesture, _, x, y| {
             let Some(entry) = p.selected() else { return };
             let Some(widget) = gesture.widget() else { return };
-            let remove = gtk::Button::builder().label("Remove from List").css_classes(["link-text"]).build();
-            let popover = gtk::Popover::builder().child(&remove).has_arrow(false).build();
+            let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).margin_top(4).margin_bottom(4).margin_start(4).margin_end(4).build();
+            let popover = gtk::Popover::builder().child(&list).has_arrow(false).build();
             popover.set_parent(&widget);
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            let p = p.clone();
-            let pop = popover.clone();
-            remove.connect_clicked(move |_| {
-                pop.popdown();
-                let path = entry.path.clone();
-                let p = p.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let _ = gio::spawn_blocking(move || forget(&path)).await;
-                    p.reload();
+
+            // Each item closes the menu, then does its work.
+            let item = |text: &str, run: Box<dyn Fn()>| {
+                let button = gtk::Button::builder().label(text).css_classes(["link-text"]).halign(gtk::Align::Start).build();
+                let pop = popover.clone();
+                button.connect_clicked(move |_| {
+                    pop.popdown();
+                    run();
                 });
-            });
+                list.append(&button);
+            };
+
+            let (cb, path) = (open_cb.clone(), entry.path.clone());
+            item("Open", Box::new(move || cb(path.clone())));
+
+            let (pm, e, parent) = (p.clone(), entry.clone(), widget.clone());
+            item("Rename…", Box::new(move || pm.ask_rename(&parent, &e)));
+
+            let (pm, path) = (p.clone(), entry.path.clone());
+            item("Duplicate", Box::new(move || pm.run_then_reload(path.clone(), duplicate_project)));
+
+            let (path, parent) = (entry.path.clone(), widget.clone());
+            item(
+                "Show in Files",
+                Box::new(move || {
+                    let window = parent.root().and_downcast::<gtk::Window>();
+                    gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).open_containing_folder(window.as_ref(), gio::Cancellable::NONE, |_| {});
+                }),
+            );
+
+            // The file goes to the system trash, so this can be undone from the file manager.
+            let (pm, path) = (p.clone(), entry.path.clone());
+            item(
+                "Move to Trash",
+                Box::new(move || {
+                    let (pm, path) = (pm.clone(), path.clone());
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Err(e) = gio::File::for_path(&path).trash_future(glib::Priority::DEFAULT).await {
+                            tracing::warn!("could not move {} to the trash: {e}", path.display());
+                        }
+                        let _ = gio::spawn_blocking(move || forget(&path)).await;
+                        pm.reload();
+                    });
+                }),
+            );
+
+            // Only the entry goes; the project file stays where it is.
+            let (pm, path) = (p.clone(), entry.path.clone());
+            item("Remove from List", Box::new(move || pm.run_then_reload(path.clone(), |p| {
+                forget(p);
+                Ok(())
+            })));
+
             popover.connect_closed(|p| p.unparent());
             popover.popup();
         });
@@ -228,6 +298,36 @@ impl ProjectManager {
 
         pm.reload();
         pm
+    }
+
+    /// Run blocking work on a project file, then refresh the grid.
+    fn run_then_reload(self: &Rc<Self>, path: PathBuf, work: impl FnOnce(&Path) -> Result<(), String> + Send + 'static) {
+        let pm = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(Err(e)) = gio::spawn_blocking(move || work(&path)).await {
+                tracing::warn!("project operation failed: {e}");
+            }
+            pm.reload();
+        });
+    }
+
+    fn ask_rename(self: &Rc<Self>, parent: &gtk::Widget, entry: &Entry) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        let field = gtk::Entry::builder().text(&entry.name).activates_default(true).build();
+        let dialog = adw::AlertDialog::builder().heading("Rename Project").extra_child(&field).build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        let pm = self.clone();
+        let path = entry.path.clone();
+        dialog.connect_response(None, move |_, response| {
+            let name = field.text().trim().to_string();
+            if response == "rename" && !name.is_empty() {
+                pm.run_then_reload(path.clone(), move |p| rename_project(p, &name));
+            }
+        });
+        dialog.present(Some(parent));
     }
 
     fn selected(&self) -> Option<Entry> {
@@ -291,4 +391,33 @@ fn card_factory() -> gtk::SignalListItemFactory {
         card.set_tooltip_text(Some(&entry.path.to_string_lossy()));
     });
     factory
+}
+
+#[cfg(test)]
+mod tests {
+    use tempo_timeline::RationalFps;
+
+    #[test]
+    fn rename_and_duplicate_change_the_stored_name() {
+        // Keep the project list of this test away from the user's own.
+        let dir = std::env::temp_dir().join(format!("tempo-pm-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("One.tempo");
+        tempo_project::create_new_project("One", 1920, 1080, RationalFps::FPS_30, &path).expect("create");
+
+        let mut project = tempo_project::load_project(&path).expect("load");
+        project.name = "Two".into();
+        tempo_project::save_project(&project, &path).expect("save");
+        assert_eq!(tempo_project::load_project(&path).expect("load").name, "Two");
+
+        // The copy gets its own file and name; the original is untouched.
+        let copy = dir.join("One copy.tempo");
+        std::fs::copy(&path, &copy).expect("copy");
+        let mut dup = tempo_project::load_project(&copy).expect("load copy");
+        dup.name = format!("{} copy", dup.name);
+        tempo_project::save_project(&dup, &copy).expect("save copy");
+        assert_eq!(tempo_project::load_project(&copy).expect("load").name, "Two copy");
+        assert_eq!(tempo_project::load_project(&path).expect("load").name, "Two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

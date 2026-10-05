@@ -2,7 +2,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -10,7 +12,40 @@ use gtk4::gio;
 use tempo_plugin::{Plugin, RunInput};
 use tempo_timeline::ReplaceTimelineCommand;
 
-use crate::state::AppState;
+use crate::state::{AppState, Change};
+
+/// One upload target of an enabled plugin.
+#[derive(Clone)]
+pub struct Uploader {
+    pub plugin: Plugin,
+    /// The name shown in the Share menu.
+    pub name: String,
+    pub function: String,
+}
+
+/// The token saved for a plugin in the system keyring, if any. Blocking.
+pub fn saved_token(plugin_id: &str) -> Option<String> {
+    let out = Command::new("secret-tool").args(["lookup", "app", "tempo", "plugin", plugin_id]).output().ok()?;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !token.is_empty()).then_some(token)
+}
+
+/// Keep a plugin's token in the system keyring. Blocking. Without a keyring the
+/// token is simply not remembered.
+pub fn save_token(plugin_id: &str, token: &str) {
+    let child = Command::new("secret-tool")
+        .args(["store", "--label", "Tempo upload token", "app", "tempo", "plugin", plugin_id])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(token.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
 
 pub struct Plugins {
     state: Rc<AppState>,
@@ -31,15 +66,19 @@ fn install_folder(from: &Path) -> Result<String, String> {
     let folder: String = plugin.id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
     let target = user_dir().join(folder);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    for name in ["plugin.toml", "main.lua"] {
-        std::fs::copy(from.join(name), target.join(name)).map_err(|e| e.to_string())?;
+    std::fs::copy(from.join("plugin.toml"), target.join("plugin.toml")).map_err(|e| e.to_string())?;
+    // A plugin that only supplies filters has no script.
+    if from.join("main.lua").exists() {
+        std::fs::copy(from.join("main.lua"), target.join("main.lua")).map_err(|e| e.to_string())?;
     }
     Ok(plugin.id)
 }
 
 impl Plugins {
     pub fn new(state: &Rc<AppState>) -> Rc<Self> {
-        Rc::new(Self { state: state.clone(), list: RefCell::new(tempo_plugin::built_in()), changed: RefCell::new(None) })
+        let plugins = Rc::new(Self { state: state.clone(), list: RefCell::new(tempo_plugin::built_in()), changed: RefCell::new(None) });
+        plugins.notify();
+        plugins
     }
 
     pub fn connect_changed(&self, f: impl Fn() + 'static) {
@@ -47,6 +86,17 @@ impl Plugins {
     }
 
     fn notify(&self) {
+        let filters = self.list.borrow().iter().filter(|p| self.is_enabled(&p.id)).flat_map(|p| p.filters.clone()).collect();
+        *self.state.filters.borrow_mut() = filters;
+        let uploaders = self
+            .list
+            .borrow()
+            .iter()
+            .filter(|p| self.is_enabled(&p.id))
+            .flat_map(|p| p.uploaders.iter().map(move |u| Uploader { plugin: p.clone(), name: u.name.clone(), function: u.function.clone() }))
+            .collect();
+        *self.state.uploaders.borrow_mut() = uploaders;
+        self.state.emit(Change::Plugins);
         if let Some(f) = self.changed.borrow().as_ref() {
             f();
         }

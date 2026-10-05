@@ -45,9 +45,7 @@ has still not sat down and used it.
 | Gap | Note |
 |---|---|
 | Hardware decode and encode | Built with automatic fallback, but off by default: the development machine's VA-API driver does not start, so only the fallback could be tested |
-| Plugins | Lua commands work (timeline, markers, loudness). Not built: shader effects, title and export-preset packs, file and network access, upload targets, the `.tempo-plugin` archive (plugins install from a folder) |
-| Inspector | Values change in steps, one undo step each; no live drag |
-| Project Manager | No rename, duplicate or move to trash |
+| Plugins | Lua commands, filters (colour and blur recipes) and upload targets work. Not built: shader effects and transitions, title and export-preset packs, file access, an uploader for a real site (each needs its own developer keys), the `.tempo-plugin` archive (plugins install from a folder) |
 | Project Settings window, duplicate clip, track add/remove | Not built |
 | Export | Uses the `ffmpeg` program, not the libraries. This is deliberate: it is robust and keeps Tempo small |
 | Proxies | Made for all heavy footage on import, not only when playback drops frames |
@@ -89,7 +87,7 @@ has still not sat down and used it.
 - [x] Root stack: Loading, Project Manager, project view. Page bar at the bottom.
 - [x] Design tokens in `tempo.css`; forced dark scheme.
 - [x] Loading screen driven by real start-up steps.
-- [ ] Project Manager: grid, search, new, open, import, rename, duplicate, trash.
+- [x] Project Manager: grid, search, new, open, import, rename, duplicate, trash.
 
 **Timeline**
 - [x] `TimelineWidget`: one custom-drawn, scrollable widget. Ruler, tracks, clips, playhead.

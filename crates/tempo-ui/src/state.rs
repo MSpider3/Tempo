@@ -26,6 +26,8 @@ pub enum Change {
     Dirty,
     /// Waveform data for a source became available.
     Waveform,
+    /// The set of enabled plugins changed.
+    Plugins,
     /// Something the user should be told.
     Message(String),
 }
@@ -68,6 +70,10 @@ pub struct AppState {
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
+    /// Filters offered by the enabled plugins, kept current by `Plugins`.
+    pub filters: RefCell<Vec<tempo_timeline::ClipEffect>>,
+    /// Upload targets offered by the enabled plugins, kept current by `Plugins`.
+    pub uploaders: RefCell<Vec<crate::plugins::Uploader>>,
     /// Opens a Media Pool clip in whichever viewer shows source clips.
     pub open_source: RefCell<Option<Rc<dyn Fn(Option<Uuid>)>>>,
     /// Loudness of each source, 50 values a second, for drawing waveforms.
@@ -99,6 +105,8 @@ impl AppState {
             clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
+            filters: RefCell::new(Vec::new()),
+            uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
             waveforms: RefCell::new(Default::default()),
             player: Player::new(),
@@ -223,6 +231,30 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// Apply a command without recording it, to preview a change while the user
+    /// is still dragging. Follow it with `commit_preview`.
+    pub fn apply_unlogged(&self, mut command: Box<dyn Command>) {
+        let applied = self.project.borrow_mut().as_mut().is_some_and(|p| command.execute(&mut p.timeline).is_ok());
+        if applied {
+            self.sync_player();
+            self.emit(Change::Timeline);
+        }
+    }
+
+    /// End a previewed drag: put the clip back as it was, then record the final
+    /// state as one undo step.
+    pub fn commit_preview(&self, name: &str, original: Clip) {
+        let id = original.id;
+        let Some(now) = self.with_timeline(|t| t.find_clip(id).map(|(_, c)| c.clone())).flatten() else { return };
+        if now == original {
+            return;
+        }
+        if let Some(clip) = self.project.borrow_mut().as_mut().and_then(|p| p.timeline.find_clip_mut(id)) {
+            *clip = original;
+        }
+        self.execute(Box::new(tempo_timeline::EditClipCommand::new(name, now)));
     }
 
     pub fn undo(&self) {

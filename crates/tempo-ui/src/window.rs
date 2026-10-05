@@ -737,6 +737,12 @@ impl MainWindow {
             }
             "dual" => self.set_dual_viewer(parts.first() == Some(&"on")),
             "plugin" => self.plugins.run(args),
+            "filter" => {
+                let found = self.state.filters.borrow().iter().find(|f| f.id.ends_with(args)).cloned();
+                if let Some(filter) = found {
+                    actions::add_filter(&self.state, &filter);
+                }
+            }
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
             "dissolve" => actions::cross_dissolve(&self.state, num(0).unwrap_or(0.5)),
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),

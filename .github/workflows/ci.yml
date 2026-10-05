@@ -40,6 +40,9 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
+      - name: Make the sample clips the media tests read
+        run: ./scripts/make_test_media.sh
+
       - name: Test
         run: cargo test --workspace --locked
 

@@ -121,7 +121,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn media(name: &str) -> Option<PathBuf> {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media").join(name);
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media").join(name);
         (p.exists() && Command::new("ffmpeg").arg("-version").output().is_ok()).then_some(p)
     }
 

@@ -228,8 +228,11 @@ impl ExportPage {
 
         let p = page.clone();
         state.connect(move |change| {
-            if matches!(change, Change::Project) {
-                p.load_defaults();
+            match change {
+                Change::Project => p.load_defaults(),
+                // The Share menus list the upload targets of enabled plugins.
+                Change::Plugins => p.rebuild_queue(),
+                _ => {}
             }
         });
         page.load_defaults();
@@ -574,6 +577,17 @@ impl ExportPage {
                 let window = b.root().and_downcast::<gtk::Window>();
                 gtk::UriLauncher::new(uri).launch(window.as_ref(), gio::Cancellable::NONE, |_| {});
                 reveal(b, &file);
+            });
+            list.append(&item);
+        }
+        // Upload targets from plugins send the file themselves.
+        for uploader in self.state.uploaders.borrow().iter().cloned() {
+            let item = gtk::Button::builder().label(format!("Upload to {}…", uploader.name)).css_classes(["link-text"]).halign(gtk::Align::Start).build();
+            let (state, file, name, popover_owner) = (self.state.clone(), output.clone(), job.name.clone(), share.clone());
+            let description = format_chapter_list(&job.settings.chapters);
+            item.connect_clicked(move |b| {
+                popover_owner.popdown();
+                crate::dialogs::upload(b, &state, uploader.clone(), file.clone(), &name, &description);
             });
             list.append(&item);
         }

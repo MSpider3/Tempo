@@ -133,6 +133,92 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
     dialog.present(Some(parent));
 }
 
+/// Ask for the details of an upload, then run the plugin's uploader on a worker.
+pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: crate::plugins::Uploader, file: std::path::PathBuf, title: &str, description: &str) {
+    let title_entry = gtk::Entry::builder().text(title).build();
+    let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
+    text.buffer().set_text(description);
+    let description_box = gtk::ScrolledWindow::builder().child(&text).min_content_height(110).min_content_width(320).css_classes(["card"]).build();
+    let token = gtk::PasswordEntry::builder().show_peek_icon(true).build();
+
+    let grid = form_grid();
+    form_row(&grid, 0, "Title", &title_entry);
+    form_row(&grid, 1, "Description", &description_box);
+    form_row(&grid, 2, "Access token", &token);
+    let hint = label(&format!("The token is kept in your keyring and given only to {}.", uploader.plugin.name), &["tempo-dim", "tempo-small"]);
+    hint.set_xalign(0.0);
+    grid.attach(&hint, 1, 3, 1, 1);
+
+    // Fill in the token saved last time.
+    let id = uploader.plugin.id.clone();
+    let field = token.clone();
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(Some(saved)) = gio::spawn_blocking(move || crate::plugins::saved_token(&id)).await {
+            if field.text().is_empty() {
+                field.set_text(&saved);
+            }
+        }
+    });
+
+    let dialog = adw::AlertDialog::builder().heading(format!("Upload to {}", uploader.name)).extra_child(&grid).build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("upload", "Upload")]);
+    dialog.set_response_appearance("upload", adw::ResponseAppearance::Suggested);
+    dialog.set_close_response("cancel");
+    let state = state.clone();
+    let parent_widget = parent.clone().upcast::<gtk::Widget>();
+    dialog.connect_response(Some("upload"), move |_, _| {
+        let buffer = text.buffer();
+        let input = tempo_plugin::UploadInput {
+            file: file.clone(),
+            title: title_entry.text().trim().to_string(),
+            description: buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string(),
+            token: token.text().to_string(),
+        };
+        let (state, uploader, parent) = (state.clone(), uploader.clone(), parent_widget.clone());
+        state.message(format!("Uploading to {}…", uploader.name));
+        glib::MainContext::default().spawn_local(async move {
+            let plugin = uploader.plugin.clone();
+            let function = uploader.function.clone();
+            let result = gio::spawn_blocking(move || {
+                if !input.token.is_empty() {
+                    crate::plugins::save_token(&plugin.id, &input.token);
+                }
+                tempo_plugin::run_upload(&plugin, &function, input)
+            })
+            .await;
+            match result {
+                Ok(Ok(output)) => {
+                    for message in output.messages.into_iter().take(3) {
+                        state.message(message);
+                    }
+                    match output.url {
+                        Some(url) => uploaded(&parent, &uploader.name, url),
+                        None => state.message(format!("Uploaded to {}", uploader.name)),
+                    }
+                }
+                Ok(Err(e)) => state.message(format!("Upload to {} failed: {e}", uploader.name)),
+                Err(_) => state.message(format!("Upload to {} stopped unexpectedly.", uploader.name)),
+            }
+        });
+    });
+    dialog.present(Some(parent));
+}
+
+/// Show where the upload ended up.
+fn uploaded(parent: &gtk::Widget, target: &str, url: String) {
+    let dialog = adw::AlertDialog::builder().heading(format!("Uploaded to {target}")).body(&url).build();
+    dialog.add_responses(&[("close", "Close"), ("copy", "Copy Link"), ("open", "Open")]);
+    dialog.set_default_response(Some("open"));
+    dialog.set_close_response("close");
+    let widget = parent.clone();
+    dialog.connect_response(None, move |_, response| match response {
+        "copy" => widget.clipboard().set_text(&url),
+        "open" => gtk::UriLauncher::new(&url).launch(widget.root().and_downcast::<gtk::Window>().as_ref(), gio::Cancellable::NONE, |_| {}),
+        _ => {}
+    });
+    dialog.present(Some(parent));
+}
+
 /// Ask a yes/no question. `on_yes` runs when the user confirms.
 pub fn confirm(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str, yes: &str, no: &str, on_answer: impl Fn(bool) + 'static) {
     let dialog = adw::AlertDialog::builder().heading(heading).body(body).build();
@@ -392,7 +478,7 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
 pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plugins>) {
     let group = adw::PreferencesGroup::builder()
         .title("Installed")
-        .description("A plugin can only do what is listed under its name. Plugins run in a sandbox: they cannot read your files or use the network.")
+        .description("A plugin can only do what is listed under its name. Plugins run in a sandbox: they cannot read your files, and reach only the sites listed.")
         .build();
     for plugin in plugins.list.borrow().iter() {
         let access = match plugin.timeline {
@@ -400,6 +486,7 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
             tempo_plugin::TimelineAccess::Read => "May read the timeline",
             tempo_plugin::TimelineAccess::None => "No access to the timeline",
         };
+        let access = if plugin.network.is_empty() { access.to_string() } else { format!("{access} · May contact {}", plugin.network.join(", ")) };
         let origin = if plugin.built_in { "Comes with Tempo" } else { "Installed by you" };
         let row = adw::SwitchRow::builder()
             .title(format!("{} {}", plugin.name, plugin.version))
