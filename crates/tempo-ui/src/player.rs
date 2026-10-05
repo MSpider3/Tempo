@@ -66,11 +66,35 @@ impl Snapshot {
             .tracks
             .iter()
             .filter(|t| t.kind == TrackKind::Audio && t.enabled)
-            .map(|t| (t.clips.clone(), t.volume))
+            .flat_map(|t| {
+                // For sound, the outgoing clip fades out while the incoming one fades in.
+                let leads = t.dissolve_leads();
+                let mut clips = t.clips.clone();
+                for lead in &leads {
+                    if let Some(out) = clips.iter_mut().find(|c| c.timeline_out == lead.timeline_out) {
+                        out.properties.fade_out_us = out.properties.fade_out_us.max(lead.duration_us());
+                    }
+                }
+                let mut strips = vec![(clips, t.volume)];
+                if !leads.is_empty() {
+                    strips.push((leads, t.volume));
+                }
+                strips
+            })
             .collect();
         let audio_sources = project.sources.iter().filter(|(_, s)| !s.is_missing).map(|(id, s)| (*id, s.path.clone())).collect();
+        // A cross dissolve is drawn as one more layer right above its track,
+        // holding the lead-ins of the clips that dissolve in.
+        let mut tracks = Vec::new();
+        for t in &video {
+            tracks.push(t.clips.clone());
+            let leads = t.dissolve_leads();
+            if !leads.is_empty() {
+                tracks.push(leads);
+            }
+        }
         Self {
-            tracks: video.iter().map(|t| t.clips.clone()).collect(),
+            tracks,
             audio,
             audio_sources,
             sources,

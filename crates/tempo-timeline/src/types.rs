@@ -109,6 +109,10 @@ pub struct ClipProperties {
     pub fade_in_us: i64,
     #[serde(default)]
     pub fade_out_us: i64,
+    /// Cross dissolve: this clip starts appearing this long *before* its start,
+    /// over the end of the clip it touches, using footage from before its In point.
+    #[serde(default)]
+    pub dissolve_in_us: i64,
     /// Clips that share a link id (a video clip and its sound) are selected,
     /// moved and deleted together while linked selection is on.
     #[serde(default)]
@@ -138,6 +142,7 @@ impl Default for ClipProperties {
             enabled: true,
             fade_in_us: 0,
             fade_out_us: 0,
+            dissolve_in_us: 0,
             link: None,
         }
     }
@@ -319,6 +324,24 @@ impl Clip {
         self.source_in + (timeline_time_us - self.timeline_in)
     }
 
+    /// The part of this clip that plays before its start during a cross
+    /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
+    pub fn dissolve_lead(&self) -> Option<Clip> {
+        let d = self.properties.dissolve_in_us.min(self.source_in);
+        if d <= 0 {
+            return None;
+        }
+        let mut lead = self.clone();
+        lead.timeline_in = self.timeline_in - d;
+        lead.timeline_out = self.timeline_in;
+        lead.source_in = self.source_in - d;
+        lead.source_out = self.source_in;
+        lead.properties.fade_in_us = d;
+        lead.properties.fade_out_us = 0;
+        lead.properties.dissolve_in_us = 0;
+        Some(lead)
+    }
+
     /// How much of the clip shows through its fades at a timeline position:
     /// 0.0 at the very start of a fade in, 1.0 outside the fades.
     pub fn fade_factor(&self, timeline_time_us: i64) -> f32 {
@@ -473,6 +496,16 @@ impl Track {
 
     pub fn clip_at(&self, position_us: i64) -> Option<&Clip> {
         self.clips.iter().find(|c| c.contains_point(position_us))
+    }
+
+    /// The lead-in of a clip that is dissolving in at `position_us`, if any.
+    pub fn dissolve_lead_at(&self, position_us: i64) -> Option<Clip> {
+        self.clips.iter().filter_map(Clip::dissolve_lead).find(|lead| lead.contains_point(position_us))
+    }
+
+    /// Every dissolve lead-in on this track, as clips.
+    pub fn dissolve_leads(&self) -> Vec<Clip> {
+        self.clips.iter().filter_map(Clip::dissolve_lead).collect()
     }
 
     pub fn has_collision(&self, start_us: i64, end_us: i64, ignore_clip_id: Option<Uuid>) -> bool {
@@ -1048,5 +1081,21 @@ mod tests {
 
         // Another property remains untouched
         assert_eq!(props.evaluate_property("scale_x", 2_000_000), 1.0);
+    }
+
+    #[test]
+    fn test_dissolve_lead() {
+        let track = Uuid::new_v4();
+        let mut b = Clip::new(track, Uuid::new_v4(), ClipType::Video, "b", 4_000_000, 8_000_000, 2_000_000, 6_000_000);
+        assert!(b.dissolve_lead().is_none());
+        b.properties.dissolve_in_us = 500_000;
+        let lead = b.dissolve_lead().unwrap();
+        assert_eq!((lead.timeline_in, lead.timeline_out), (3_500_000, 4_000_000));
+        assert_eq!((lead.source_in, lead.source_out), (1_500_000, 2_000_000));
+        // Half way through the lead-in it is half visible.
+        assert_eq!(lead.fade_factor(3_750_000), 0.5);
+        // A dissolve cannot use footage that does not exist before the In point.
+        b.source_in = 200_000;
+        assert_eq!(b.dissolve_lead().unwrap().duration_us(), 200_000);
     }
 }

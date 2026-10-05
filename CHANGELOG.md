@@ -21,6 +21,7 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
   turning a clip off and on.
 - Waveforms on audio clips, worked out in the background and kept on disk.
 - An output level meter beside the timeline.
+- Cross dissolve between two clips (`Ctrl+T`), for picture and sound.
 - Titles (Text and Lower Third) and fade in / fade out, in the viewer and in export, with
   an Effects panel to add them and Inspector sections to edit them.
 - Selecting several clips (Ctrl+click, Select All); a clip and its sound are linked and
@@ -47,7 +48,8 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
   exported from Resolve.
 - Autosave every two minutes, and an offer to restore unsaved work after a crash.
 - Its own icon set, so the interface looks the same under any system icon theme.
-- AppImage, `.rpm` and `.deb` packages with SHA-256 checksums.
+- AppImage, Flatpak, `.rpm` and `.deb` packages with SHA-256 checksums. The release workflow
+  installs each one and starts Tempo from it before publishing.
 
 ### Changed
 

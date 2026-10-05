@@ -2,10 +2,13 @@
 #
 #   flatpak-builder --user --install --force-clean build-dir packaging/dev.tempo.Tempo.yml
 #
-# Status: written but not yet built or tested. Cargo downloads its crates during
+# Built and checked by the release workflow. Cargo downloads its crates during
 # the build, which needs network access (allowed below). Flathub does not allow
 # that; a Flathub submission needs the crates listed as sources instead
 # (flatpak-cargo-generator makes that list from Cargo.lock).
+#
+# FFmpeg (libraries and program) comes from the runtime and its codecs-extra
+# extension, which Flatpak installs automatically.
 app-id: dev.tempo.Tempo
 runtime: org.gnome.Platform
 runtime-version: "49"
@@ -13,12 +16,6 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm20
-add-extensions:
-  # Full FFmpeg (libraries and the ffmpeg program) with the common codecs.
-  org.freedesktop.Platform.ffmpeg-full:
-    directory: lib/ffmpeg
-    version: "25.08"
-    add-ld-path: .
 command: tempo
 
 finish-args:
@@ -38,9 +35,6 @@ build-options:
     - --share=network
   env:
     CARGO_HOME: /run/build/tempo/cargo
-
-cleanup-commands:
-  - mkdir -p /app/lib/ffmpeg
 
 modules:
   - name: tempo

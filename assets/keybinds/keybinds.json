@@ -494,6 +494,16 @@
    "resolve": "editLink"
   },
   {
+   "group": "Editing",
+   "action": "win.transition-add",
+   "keys": [
+    "<Primary>t"
+   ],
+   "alt": [],
+   "label": "Cross Dissolve into the Selected Clip",
+   "resolve": "editAddTransition"
+  },
+  {
    "group": "Trimming",
    "action": "win.trim-start",
    "keys": [

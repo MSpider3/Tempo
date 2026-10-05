@@ -239,6 +239,12 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
     };
 
     heading("Transitions", "Click to apply to the selected clip");
+    item(
+        "Cross Dissolve",
+        "Dissolve from the previous clip into the selected clip (Ctrl+T)",
+        "media-seek-backward-symbolic",
+        Box::new(|s| actions::cross_dissolve(s, 0.5)),
+    );
     item("Fade In", "Fade the selected clip in over half a second", "go-first-symbolic", Box::new(|s| actions::set_fade(s, true, 0.5)));
     item("Fade Out", "Fade the selected clip out over half a second", "go-last-symbolic", Box::new(|s| actions::set_fade(s, false, 0.5)));
     item(

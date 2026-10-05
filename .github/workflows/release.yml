@@ -122,9 +122,35 @@ jobs:
           name: deb-appimage
           path: dist/*
 
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: Tempo.flatpak
+          manifest-path: packaging/dev.tempo.Tempo.yml
+          cache-key: flatpak-${{ hashFiles('Cargo.lock') }}
+          upload-artifact: false
+      - name: Check the Flatpak has FFmpeg and starts
+        run: |
+          flatpak install --user -y --noninteractive Tempo.flatpak
+          flatpak run --command=sh dev.tempo.Tempo -c 'command -v ffmpeg && ffmpeg -hide_banner -encoders | grep -E "libx264|libopenh264"'
+          dnf install -y xorg-x11-server-Xvfb || apt-get install -y xvfb || true
+          GSK_RENDERER=cairo xvfb-run -a flatpak run dev.tempo.Tempo --smoke-test
+      - run: mkdir -p dist && mv Tempo.flatpak "dist/Tempo-$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)-x86_64.flatpak"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: dist/*
+
   publish:
     name: Publish release
-    needs: [rpm, deb-appimage]
+    needs: [rpm, deb-appimage, flatpak]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

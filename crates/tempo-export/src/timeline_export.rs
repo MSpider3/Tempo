@@ -162,9 +162,19 @@ pub fn build_ffmpeg_args(
     // ---- Video: one concatenated strip per track, then stacked bottom to top.
     let mut video_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Video && t.enabled).collect();
     video_tracks.sort_by_key(|t| t.kind_index);
+    // A cross dissolve is one more strip right above its track, holding the
+    // lead-ins of the clips that dissolve in.
+    let mut video_strips: Vec<Vec<Clip>> = Vec::new();
+    for track in &video_tracks {
+        video_strips.push(track.clips.clone());
+        let leads = track.dissolve_leads();
+        if !leads.is_empty() {
+            video_strips.push(leads);
+        }
+    }
     let mut track_labels = Vec::new();
-    for (ti, track) in video_tracks.iter().enumerate() {
-        let parts = pieces(&track.clips, r0, r1, &[ClipType::Video, ClipType::Image, ClipType::Title]);
+    for (ti, strip) in video_strips.iter().enumerate() {
+        let parts = pieces(strip, r0, r1, &[ClipType::Video, ClipType::Image, ClipType::Title]);
         if parts.is_empty() {
             continue;
         }
@@ -265,9 +275,24 @@ pub fn build_ffmpeg_args(
     // ---- Audio: one strip per track, then mixed.
     let mut audio_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled).collect();
     audio_tracks.sort_by_key(|t| t.kind_index);
+    // For sound, the outgoing clip fades out while the incoming one fades in.
+    let mut audio_strips: Vec<(Vec<Clip>, f32)> = Vec::new();
+    for track in &audio_tracks {
+        let leads = track.dissolve_leads();
+        let mut clips = track.clips.clone();
+        for lead in &leads {
+            if let Some(out) = clips.iter_mut().find(|c| c.timeline_out == lead.timeline_out) {
+                out.properties.fade_out_us = out.properties.fade_out_us.max(lead.duration_us());
+            }
+        }
+        audio_strips.push((clips, track.volume));
+        if !leads.is_empty() {
+            audio_strips.push((leads, track.volume));
+        }
+    }
     let mut audio_labels = Vec::new();
-    for (ti, track) in audio_tracks.iter().enumerate() {
-        let parts = pieces(&track.clips, r0, r1, &[ClipType::Audio]);
+    for (ti, (strip, track_volume)) in audio_strips.iter().enumerate() {
+        let parts = pieces(strip, r0, r1, &[ClipType::Audio]);
         if parts.is_empty() {
             continue;
         }
@@ -285,7 +310,7 @@ pub fn build_ffmpeg_args(
             let idx = n_inputs;
             n_inputs += 1;
             let props = &p.clip.properties;
-            let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track.volume.max(0.0) };
+            let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track_volume.max(0.0) };
             let (left, right) = (1.0 - props.pan.max(0.0), 1.0 + props.pan.min(0.0));
             let label = format!("ac{ti}_{}", segs.len());
             graph.push(format!(
@@ -537,6 +562,33 @@ mod tests {
         export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
         assert!(out.exists());
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn cross_dissolve_adds_a_lead_in_strip_and_crossfades_sound() {
+        let Some(path) = sample() else { return };
+        let mut project = project_with_clip(path);
+        // Make the two pieces touch at 1 s, then dissolve into the second.
+        for track in &mut project.timeline.tracks {
+            if let Some(second) = track.clips.get_mut(1) {
+                second.timeline_in = 1_000_000;
+                second.timeline_out = 2_000_000;
+                second.properties.dissolve_in_us = 400_000;
+            }
+        }
+        let out = std::env::temp_dir().join(format!("tempo-export-dissolve-{}.mp4", std::process::id()));
+        let (args, total, _) = build_ffmpeg_args(&project, &settings(out.clone()), None).unwrap();
+        assert_eq!(total, 2_000_000);
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        // Video: a second strip with the fading lead-in, overlaid on the first.
+        assert!(graph.contains("[vt1]") && graph.contains("fade=t=in:st=0:d=0.400000:alpha=1"), "{graph}");
+        // Sound: the outgoing clip fades out and the lead-in fades in, then both are mixed.
+        assert!(graph.contains("afade=t=out") && graph.contains("afade=t=in") && graph.contains("amix=inputs=2"), "{graph}");
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+            assert!(out.exists());
+            let _ = std::fs::remove_file(&out);
+        }
     }
 
     #[test]

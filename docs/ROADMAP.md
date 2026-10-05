@@ -45,14 +45,12 @@ has still not sat down and used it.
 | Gap | Note |
 |---|---|
 | Hardware decode and encode | Built with automatic fallback, but off by default: the development machine's VA-API driver does not start, so only the fallback could be tested |
-| Cross dissolve | Not built. Fade in and fade out are |
 | Plugins | Lua commands work (timeline, markers, loudness). Not built: shader effects, title and export-preset packs, file and network access, upload targets, the `.tempo-plugin` archive (plugins install from a folder) |
 | Inspector | Values change in steps, one undo step each; no live drag |
 | Project Manager | No rename, duplicate or move to trash |
 | Project Settings window, duplicate clip, track add/remove | Not built |
 | Export | Uses the `ffmpeg` program, not the libraries. This is deliberate: it is robust and keeps Tempo small |
 | Proxies | Made for all heavy footage on import, not only when playback drops frames |
-| Flatpak | A manifest exists in `packaging/` but has not been built |
 | A/V sync | Picture follows the audio clock; the 40 ms target has not been measured |
 | Roll trim | Uses Shift in Trim mode, not Resolve's click-on-the-cut |
 
@@ -137,7 +135,7 @@ has still not sat down and used it.
 
 - [ ] Inspector: Transform, Composite, Audio, Title, Transition, Marker sections.
 - [ ] Live preview while dragging a value; one undo step per drag.
-- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades.
+- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades. *(Cross dissolve, fades and audio fades are built; fades are set in the Inspector and Effects panel, not by handles.)*
 - [x] Title clips: Text and Lower Third.
 - [x] Vertical-project layout.
 - [ ] Automatic small proxies, made only when playback drops frames, paused during playback.
@@ -199,7 +197,7 @@ has still not sat down and used it.
 - [ ] Keyboard-only and screen-reader pass over every screen.
 - [ ] Side-by-side check of every screen against the Resolve 20 screenshots in `EX/DVR_UI/`.
 - [ ] Confirm by hand the three mouse gestures in `KEYBINDS.md §8` (not in the key file).
-- [ ] Flatpak, desktop file, AppStream data, icon.
+- [x] Flatpak, desktop file, AppStream data, icon.
 - [ ] User guide and plugin guide.
 
 **Done when**
