@@ -7,17 +7,24 @@ use glib::subclass::prelude::*;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
-use gtk4::{gdk, graphene};
-use tempo_timeline::ClipProperties;
+use gtk4::{gdk, graphene, pango};
+use tempo_timeline::{ClipProperties, TitleData, TitleType};
 
 use crate::player::Layer;
+
+/// What the surface keeps for each layer.
+struct Drawn {
+    texture: Option<gdk::Texture>,
+    title: Option<TitleData>,
+    props: ClipProperties,
+}
 
 mod imp {
     use super::*;
 
     #[derive(Default)]
     pub struct VideoSurface {
-        pub layers: RefCell<Vec<(gdk::Texture, ClipProperties)>>,
+        pub(super) layers: RefCell<Vec<Drawn>>,
         /// Project frame size; the picture is letterboxed to this shape.
         pub frame: Cell<(u32, u32)>,
     }
@@ -46,14 +53,10 @@ mod imp {
 
             snapshot.append_color(&gdk::RGBA::BLACK, &frame_rect);
             snapshot.push_clip(&frame_rect);
-            for (texture, props) in self.layers.borrow().iter() {
-                let (tw, th) = (texture.width() as f32, texture.height() as f32);
-                if tw <= 0.0 || th <= 0.0 {
-                    continue;
-                }
-                let fit = (fw / tw).min(fh / th);
-                let (dw, dh) = (tw * fit, th * fit);
+            for layer in self.layers.borrow().iter() {
+                let props = &layer.props;
                 snapshot.save();
+                // Everything is placed relative to the centre of the frame.
                 snapshot.translate(&graphene::Point::new(
                     x0 + fw / 2.0 + props.position_x * scale,
                     y0 + fh / 2.0 + props.position_y * scale,
@@ -64,7 +67,17 @@ mod imp {
                 if !opaque {
                     snapshot.push_opacity(props.opacity.clamp(0.0, 1.0) as f64);
                 }
-                snapshot.append_texture(texture, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
+                if let Some(texture) = &layer.texture {
+                    let (tw, th) = (texture.width() as f32, texture.height() as f32);
+                    if tw > 0.0 && th > 0.0 {
+                        let fit = (fw / tw).min(fh / th);
+                        let (dw, dh) = (tw * fit, th * fit);
+                        snapshot.append_texture(texture, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
+                    }
+                }
+                if let Some(title) = &layer.title {
+                    super::draw_title(&widget, snapshot, title, scale, fh);
+                }
                 if !opaque {
                     snapshot.pop();
                 }
@@ -73,6 +86,37 @@ mod imp {
             snapshot.pop();
         }
     }
+}
+
+/// Draw a title with its centre at the origin (or in the lower third).
+/// Sizes in `TitleData` are in project pixels; `scale` converts them to screen pixels.
+fn draw_title(widget: &VideoSurface, snapshot: &gtk::Snapshot, title: &TitleData, scale: f32, frame_h: f32) {
+    let layout = widget.create_pango_layout(Some(&title.text));
+    let mut font = pango::FontDescription::from_string(&title.font_family);
+    font.set_absolute_size((title.font_size * scale).max(1.0) as f64 * pango::SCALE as f64);
+    font.set_weight(if title.font_bold { pango::Weight::Bold } else { pango::Weight::Normal });
+    font.set_style(if title.font_italic { pango::Style::Italic } else { pango::Style::Normal });
+    layout.set_font_description(Some(&font));
+    layout.set_alignment(pango::Alignment::Center);
+    let (tw, th) = layout.pixel_size();
+    let (tw, th) = (tw as f32, th as f32);
+    // A lower third sits at 80 % of the frame height.
+    let y = match title.title_type {
+        TitleType::CenterTitle => -th / 2.0,
+        TitleType::LowerThird => frame_h * 0.30 - th / 2.0,
+    };
+    if let Some([r, g, b, a]) = title.background_color {
+        let pad = title.background_padding * scale;
+        snapshot.append_color(
+            &gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0),
+            &graphene::Rect::new(-tw / 2.0 - pad, y - pad, tw + 2.0 * pad, th + 2.0 * pad),
+        );
+    }
+    let [r, g, b, a] = title.color;
+    snapshot.save();
+    snapshot.translate(&graphene::Point::new(-tw / 2.0, y));
+    snapshot.append_layout(&layout, &gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0));
+    snapshot.restore();
 }
 
 glib::wrapper! {
@@ -102,22 +146,19 @@ impl VideoSurface {
     }
 
     pub fn set_layers(&self, layers: Vec<Layer>) {
-        let textures = layers
+        let drawn = layers
             .into_iter()
             .map(|l| {
-                let stride = l.frame.width as usize * 4;
-                let bytes = glib::Bytes::from_owned(l.frame.data);
-                let tex = gdk::MemoryTexture::new(
-                    l.frame.width as i32,
-                    l.frame.height as i32,
-                    gdk::MemoryFormat::R8g8b8a8,
-                    &bytes,
-                    stride,
-                );
-                (tex.upcast::<gdk::Texture>(), l.props)
+                let texture = l.frame.map(|frame| {
+                    let stride = frame.width as usize * 4;
+                    let (w, h) = (frame.width as i32, frame.height as i32);
+                    let bytes = glib::Bytes::from_owned(frame.data);
+                    gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::R8g8b8a8, &bytes, stride).upcast::<gdk::Texture>()
+                });
+                Drawn { texture, title: l.title, props: l.props }
             })
             .collect();
-        *self.imp().layers.borrow_mut() = textures;
+        *self.imp().layers.borrow_mut() = drawn;
         self.queue_draw();
     }
 }

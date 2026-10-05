@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tempo_timeline::{Clip, ClipProperties, ClipType, MediaType, Project, TrackKind};
+use tempo_timeline::{Clip, ClipProperties, ClipType, MediaType, Project, TitleData, TitleType, TrackKind};
 
 use crate::chapters::{ffmetadata, Chapter};
 use crate::error::{ExportError, Result};
@@ -69,9 +69,67 @@ fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Pi
     out
 }
 
+/// Fade filters for a piece. A fade is applied only where the piece still has
+/// that end of its clip (an export range may have cut it off).
+fn fade_filters(p: &Piece, r0: i64, audio: bool) -> String {
+    let props = &p.clip.properties;
+    let len = p.end - p.start;
+    let (name, alpha) = if audio { ("afade", "") } else { ("fade", ":alpha=1") };
+    let mut out = String::new();
+    if props.fade_in_us > 0 && p.start + r0 == p.clip.timeline_in {
+        out.push_str(&format!(",{name}=t=in:st=0:d={}{alpha}", secs(props.fade_in_us.min(len))));
+    }
+    if props.fade_out_us > 0 && p.end + r0 == p.clip.timeline_out {
+        let d = props.fade_out_us.min(len);
+        out.push_str(&format!(",{name}=t=out:st={}:d={}{alpha}", secs(len - d), secs(d)));
+    }
+    out
+}
+
+/// The `drawtext` filter for a title. The text itself goes in a file, which
+/// avoids every quoting problem in the filter graph.
+fn title_filter(title: &TitleData, props: &ClipProperties, text_file: &std::path::Path, sx: f32, sy: f32) -> String {
+    let [r, g, b, a] = title.color;
+    let alpha = a as f32 / 255.0 * props.opacity.clamp(0.0, 1.0);
+    let size = (title.font_size * sy * props.scale_y.max(0.01)).max(1.0);
+    let style = match (title.font_bold, title.font_italic) {
+        (true, true) => "\\:bold\\:italic",
+        (true, false) => "\\:bold",
+        (false, true) => "\\:italic",
+        (false, false) => "",
+    };
+    let y = match title.title_type {
+        TitleType::CenterTitle => "(h-text_h)/2",
+        TitleType::LowerThird => "h*0.8-text_h/2",
+    };
+    let mut f = format!(
+        "drawtext=textfile='{}':font='{}{style}':fontsize={size:.1}:fontcolor=0x{r:02x}{g:02x}{b:02x}@{alpha:.3}:x=(w-text_w)/2+{:.1}:y={y}+{:.1}",
+        text_file.display(),
+        title.font_family.replace(['\'', ':', '\\'], ""),
+        props.position_x * sx,
+        props.position_y * sy,
+    );
+    if let Some([r, g, b, a]) = title.background_color {
+        f.push_str(&format!(
+            ":box=1:boxcolor=0x{r:02x}{g:02x}{b:02x}@{:.3}:boxborderw={:.0}",
+            a as f32 / 255.0 * props.opacity.clamp(0.0, 1.0),
+            title.background_padding * sy
+        ));
+    }
+    f
+}
+
 /// Build the complete FFmpeg command line (without the program name).
-/// Returns the arguments and the duration of the output in microseconds.
-pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: Option<&PathBuf>) -> Result<(Vec<String>, i64)> {
+/// Returns the arguments, the duration of the output in microseconds, and the
+/// text files (path, contents) that must exist while FFmpeg runs.
+pub fn build_ffmpeg_args(
+    project: &Project,
+    e: &TimelineExport,
+    metadata_file: Option<&PathBuf>,
+) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
+    let mut text_files: Vec<(PathBuf, String)> = Vec::new();
+    let sx = ((e.width.max(16) + 1) & !1) as f32 / project.width.max(1) as f32;
+    let sy = ((e.height.max(16) + 1) & !1) as f32 / project.height.max(1) as f32;
     let timeline_end = project.timeline.tracks.iter().map(|t| t.duration_us()).max().unwrap_or(0);
     let (r0, r1) = e.range.unwrap_or((0, timeline_end));
     let (r0, r1) = (r0.max(0), r1.min(timeline_end));
@@ -103,7 +161,7 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
     video_tracks.sort_by_key(|t| t.kind_index);
     let mut track_labels = Vec::new();
     for (ti, track) in video_tracks.iter().enumerate() {
-        let parts = pieces(&track.clips, r0, r1, &[ClipType::Video, ClipType::Image]);
+        let parts = pieces(&track.clips, r0, r1, &[ClipType::Video, ClipType::Image, ClipType::Title]);
         if parts.is_empty() {
             continue;
         }
@@ -119,6 +177,21 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
                 gap(&mut graph, &mut segs, p.start - cursor);
             }
             let len = p.end - p.start;
+            let fades = fade_filters(p, r0, false);
+            if p.clip.clip_type == ClipType::Title {
+                let Some(title) = &p.clip.title_data else { continue };
+                let file = std::env::temp_dir().join(format!("tempo-title-{}-{}.txt", std::process::id(), text_files.len()));
+                let label = format!("vc{ti}_{}", segs.len());
+                graph.push(format!(
+                    "color=c=black@0.0:s={w}x{h}:r={fps}:d={},format=rgba,{}{fades}[{label}]",
+                    secs(len),
+                    title_filter(title, &p.clip.properties, &file, sx, sy)
+                ));
+                text_files.push((file, title.text.clone()));
+                segs.push(label);
+                cursor = p.end;
+                continue;
+            }
             let (path, media) = source_path(p.clip)?;
             if media == MediaType::Image {
                 inputs.extend(["-loop".into(), "1".into(), "-t".into(), secs(len)]);
@@ -137,7 +210,7 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
             let label = format!("vc{ti}_{}", segs.len());
             let head = format!("[{idx}:v]fps={fps},{fit},setsar=1,format=rgba,trim=duration={},setpts=PTS-STARTPTS", secs(len));
             if is_default_transform(props) {
-                graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0[{label}]"));
+                graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0{fades}[{label}]"));
             } else {
                 // Zoom, rotate and fade the clip, then place it on a transparent canvas.
                 let mut chain = head;
@@ -151,13 +224,11 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
                 if props.opacity < 0.999 {
                     chain.push_str(&format!(",colorchannelmixer=aa={:.4}", props.opacity.clamp(0.0, 1.0)));
                 }
-                // Inspector positions are in project pixels; scale them to the output size.
-                let sx = w as f32 / project.width.max(1) as f32;
-                let sy = h as f32 / project.height.max(1) as f32;
+                // Inspector positions are in project pixels; `sx`/`sy` scale them to the output size.
                 graph.push(format!("{chain}[{label}s]"));
                 graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps}:d={},format=rgba[{label}b]", secs(len)));
                 graph.push(format!(
-                    "[{label}b][{label}s]overlay=x=(W-w)/2+{:.2}:y=(H-h)/2+{:.2}:shortest=1,format=rgba[{label}]",
+                    "[{label}b][{label}s]overlay=x=(W-w)/2+{:.2}:y=(H-h)/2+{:.2}:shortest=1,format=rgba{fades}[{label}]",
                     props.position_x * sx,
                     props.position_y * sy
                 ));
@@ -212,8 +283,9 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
             let label = format!("ac{ti}_{}", segs.len());
             graph.push(format!(
                 "[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
-                 volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1[{label}]",
-                secs(len)
+                 volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}[{label}]",
+                secs(len),
+                fade_filters(p, r0, true)
             ));
             segs.push(label);
             cursor = p.end;
@@ -251,7 +323,7 @@ pub fn build_ffmpeg_args(project: &Project, e: &TimelineExport, metadata_file: O
         secs(total),
         e.output.to_string_lossy().into_owned(),
     ]);
-    Ok((args, total))
+    Ok((args, total, text_files))
 }
 
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
@@ -270,7 +342,10 @@ pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBoo
         std::fs::write(&path, ffmetadata(&e.chapters, range_len))?;
         Some(path)
     };
-    let (args, total) = build_ffmpeg_args(project, e, metadata_file.as_ref())?;
+    let (args, total, text_files) = build_ffmpeg_args(project, e, metadata_file.as_ref())?;
+    for (path, text) in &text_files {
+        std::fs::write(path, text)?;
+    }
 
     let mut command = Command::new("ffmpeg");
     command.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -306,6 +381,9 @@ pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBoo
     let stderr_text = errors.join().unwrap_or_default();
     if let Some(meta) = metadata_file {
         let _ = std::fs::remove_file(meta);
+    }
+    for (path, _) in &text_files {
+        let _ = std::fs::remove_file(path);
     }
 
     if cancelled || cancel.load(Ordering::Relaxed) {
@@ -363,7 +441,7 @@ mod tests {
     fn graph_covers_gaps_audio_and_range() {
         let Some(path) = sample() else { return };
         let project = project_with_clip(path);
-        let (args, total) = build_ffmpeg_args(&project, &settings("/tmp/x.mp4".into()), None).unwrap();
+        let (args, total, _) = build_ffmpeg_args(&project, &settings("/tmp/x.mp4".into()), None).unwrap();
         assert_eq!(total, 3_000_000);
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert!(graph.contains("concat=n=3:v=1:a=0"), "two clips and one gap on the video track");
@@ -372,7 +450,7 @@ mod tests {
 
         let mut ranged = settings("/tmp/x.mp4".into());
         ranged.range = Some((500_000, 2_500_000));
-        let (_, total) = build_ffmpeg_args(&project, &ranged, None).unwrap();
+        let (_, total, _) = build_ffmpeg_args(&project, &ranged, None).unwrap();
         assert_eq!(total, 2_000_000);
     }
 
@@ -401,6 +479,34 @@ mod tests {
         assert!(text.contains("title=Next"), "chapters are embedded: {text}");
         let duration: f64 = text.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse().ok()).unwrap_or(0.0);
         assert!((duration - 3.0).abs() < 0.2, "duration was {duration}");
+    }
+
+    #[test]
+    fn exports_titles_and_fades() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let mut project = project_with_clip(path);
+        let v2 = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video && t.kind_index == 2).map(|t| t.id).unwrap();
+        let mut title = Clip::new(v2, uuid::Uuid::nil(), ClipType::Title, "Title", 0, 2_000_000, 0, 2_000_000);
+        title.title_data = Some(TitleData { text: "It's 100%: a \"test\"".into(), ..Default::default() });
+        title.properties.fade_in_us = 500_000;
+        project.timeline.find_track_mut(v2).unwrap().clips.push(title);
+        for track in &mut project.timeline.tracks {
+            for clip in &mut track.clips {
+                clip.properties.fade_out_us = 300_000;
+            }
+        }
+        let out = std::env::temp_dir().join(format!("tempo-export-title-{}.mp4", std::process::id()));
+        let (args, _, files) = build_ffmpeg_args(&project, &settings(out.clone()), None).unwrap();
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("drawtext=textfile=") && graph.contains("fade=t=in") && graph.contains("afade=t=out"));
+        assert_eq!(files.len(), 1);
+        // Awkward characters in the title must not break the filter graph.
+        export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(out.exists());
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

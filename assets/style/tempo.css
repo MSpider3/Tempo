@@ -161,8 +161,10 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .drop-hint { border: 1px dashed @tempo_line_button; border-radius: 6px; color: @tempo_text_dim;
              margin: 12px; padding: 16px; }
 
-.effect-row { background-color: @tempo_bg_inset; border: 1px solid @tempo_line_button;
-              border-radius: 3px; min-height: 36px; }
+.tempo button.effect-row { background: none; background-color: @tempo_bg_inset; box-shadow: none;
+              border: 1px solid @tempo_line_button; border-radius: 3px; min-height: 36px; padding: 0;
+              color: @tempo_text; font-weight: 400; }
+.tempo button.effect-row:hover { border-color: @tempo_text_dim; color: @tempo_text_bright; }
 .effect-row:hover { border-color: @tempo_text_dim; }
 .effect-row .effect-icon { min-width: 56px; border-right: 1px solid @tempo_line_button;
                            color: @tempo_text_dim; }

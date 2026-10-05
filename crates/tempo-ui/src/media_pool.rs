@@ -127,6 +127,13 @@ impl MediaPool {
         self.window.set(Some(window.upcast_ref()));
     }
 
+    /// Select the nth item, as a click would. For scripted checks.
+    pub fn select_index(&self, index: u32) {
+        if let Some(obj) = self.store.item(index).and_downcast::<glib::BoxedAnyObject>() {
+            self.state.media_selection.set(Some(obj.borrow::<Item>().id));
+        }
+    }
+
     pub fn focus(&self) {
         self.search.grab_focus();
     }

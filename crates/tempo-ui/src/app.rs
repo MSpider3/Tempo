@@ -68,16 +68,20 @@ impl TempoApp {
 /// * `TEMPO_SMOKE_TEST=1` — start, then quit as soon as the window is up.
 /// * `TEMPO_SCREENSHOT=/path.png` — after `TEMPO_SCREENSHOT_DELAY_MS` (default 1500)
 ///   save a picture of the window and quit.
-/// * `TEMPO_ACTIONS=win.page-export,…` — run these actions one second after start.
+/// * `TEMPO_ACTIONS="step;step;…"` — one second after start, run these steps one
+///   after another, 150 ms apart. A step is an action name or a scripted pointer
+///   step (see `MainWindow::run_script_step`).
 fn dev_hooks(app: &adw::Application, win: &std::rc::Rc<MainWindow>) {
     let window = &win.window;
     if let Ok(list) = std::env::var("TEMPO_ACTIONS") {
         let win = win.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
-            for action in list.split(',') {
-                win.run_action(action.trim());
-            }
-        });
+        // Semicolons separate steps; a lone comma list of plain action names also works.
+        let separator = if list.contains(';') || list.contains(':') { ';' } else { ',' };
+        let steps: Vec<String> = list.split(separator).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        for (i, step) in steps.into_iter().enumerate() {
+            let win = win.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1000 + 150 * i as u64), move || win.run_script_step(&step));
+        }
     }
     if std::env::var_os("TEMPO_SMOKE_TEST").is_some() {
         let app = app.clone();

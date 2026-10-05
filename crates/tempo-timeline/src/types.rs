@@ -104,6 +104,15 @@ pub struct ClipProperties {
     /// A disabled clip stays on the timeline but is not shown, heard or exported.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// Length of the fade at the start and end of the clip, in microseconds.
+    #[serde(default)]
+    pub fade_in_us: i64,
+    #[serde(default)]
+    pub fade_out_us: i64,
+    /// Clips that share a link id (a video clip and its sound) are selected,
+    /// moved and deleted together while linked selection is on.
+    #[serde(default)]
+    pub link: Option<Uuid>,
 }
 
 fn enabled_by_default() -> bool {
@@ -127,6 +136,9 @@ impl Default for ClipProperties {
             gain: [1.0, 1.0, 1.0],
             keyframes: Vec::new(),
             enabled: true,
+            fade_in_us: 0,
+            fade_out_us: 0,
+            link: None,
         }
     }
 }
@@ -305,6 +317,22 @@ impl Clip {
 
     pub fn source_offset_at(&self, timeline_time_us: i64) -> i64 {
         self.source_in + (timeline_time_us - self.timeline_in)
+    }
+
+    /// How much of the clip shows through its fades at a timeline position:
+    /// 0.0 at the very start of a fade in, 1.0 outside the fades.
+    pub fn fade_factor(&self, timeline_time_us: i64) -> f32 {
+        let p = &self.properties;
+        let from_start = timeline_time_us - self.timeline_in;
+        let to_end = self.timeline_out - timeline_time_us;
+        let mut factor = 1.0f32;
+        if p.fade_in_us > 0 && from_start < p.fade_in_us {
+            factor = factor.min(from_start.max(0) as f32 / p.fade_in_us as f32);
+        }
+        if p.fade_out_us > 0 && to_end < p.fade_out_us {
+            factor = factor.min(to_end.max(0) as f32 / p.fade_out_us as f32);
+        }
+        factor
     }
 }
 

@@ -42,9 +42,14 @@ pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
     log: RefCell<CommandLog>,
+    /// The clip the Inspector shows: the one clicked last.
     pub selection: Cell<Option<Uuid>>,
+    /// Other clips selected with it (Ctrl+click, linked partners, Select All).
+    pub extra_selection: RefCell<Vec<Uuid>>,
     pub tool: Cell<Tool>,
     pub snapping: Cell<bool>,
+    /// When on, selecting a clip also selects the clips linked to it.
+    pub linked_selection: Cell<bool>,
     pub dirty: Cell<bool>,
     pub mark_in: Cell<Option<i64>>,
     pub mark_out: Cell<Option<i64>>,
@@ -73,8 +78,10 @@ impl AppState {
             path: RefCell::new(None),
             log: RefCell::new(CommandLog::new()),
             selection: Cell::new(None),
+            extra_selection: RefCell::new(Vec::new()),
             tool: Cell::new(Tool::Select),
             snapping: Cell::new(true),
+            linked_selection: Cell::new(true),
             dirty: Cell::new(false),
             mark_in: Cell::new(None),
             mark_out: Cell::new(None),
@@ -131,6 +138,7 @@ impl AppState {
         *self.path.borrow_mut() = path;
         self.log.borrow_mut().clear();
         self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
         self.source_clip.set(None);
         self.waveforms.borrow_mut().clear();
         self.media_selection.set(None);
@@ -155,11 +163,16 @@ impl AppState {
 
     fn after_edit(&self) {
         self.sync_player();
-        if let Some(id) = self.selection.get() {
-            if self.with_timeline(|t| t.find_clip(id).is_none()).unwrap_or(true) {
-                self.selection.set(None);
-                self.emit(Change::Selection);
-            }
+        // Forget selected clips that no longer exist.
+        let gone = |id: &Uuid| self.with_timeline(|t| t.find_clip(*id).is_none()).unwrap_or(true);
+        let before = self.selected_ids();
+        self.extra_selection.borrow_mut().retain(|id| !gone(id));
+        if self.selection.get().is_some_and(|id| gone(&id)) {
+            let next = self.extra_selection.borrow_mut().pop();
+            self.selection.set(next);
+        }
+        if before != self.selected_ids() {
+            self.emit(Change::Selection);
         }
         self.set_dirty(true);
         self.emit(Change::Timeline);
@@ -215,10 +228,62 @@ impl AppState {
         }
     }
 
+    /// Every selected clip, the primary one first.
+    pub fn selected_ids(&self) -> Vec<Uuid> {
+        self.selection.get().into_iter().chain(self.extra_selection.borrow().iter().copied()).collect()
+    }
+
+    pub fn is_selected(&self, id: Uuid) -> bool {
+        self.selection.get() == Some(id) || self.extra_selection.borrow().contains(&id)
+    }
+
+    /// Clips linked to `id` (its sound or its picture), if linked selection is on.
+    fn linked_to(&self, id: Uuid) -> Vec<Uuid> {
+        if !self.linked_selection.get() {
+            return Vec::new();
+        }
+        self.with_timeline(|t| {
+            let Some(link) = t.find_clip(id).and_then(|(_, c)| c.properties.link) else { return Vec::new() };
+            t.tracks.iter().flat_map(|tr| tr.clips.iter()).filter(|c| c.id != id && c.properties.link == Some(link)).map(|c| c.id).collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Select one clip (and what is linked to it), or nothing.
     pub fn select(&self, clip: Option<Uuid>) {
-        if self.selection.replace(clip) != clip {
+        let before = self.selected_ids();
+        self.selection.set(clip);
+        *self.extra_selection.borrow_mut() = clip.map(|id| self.linked_to(id)).unwrap_or_default();
+        if before != self.selected_ids() {
             self.emit(Change::Selection);
         }
+    }
+
+    /// Add a clip to the selection, or take it out (Ctrl+click).
+    pub fn toggle_select(&self, id: Uuid) {
+        let mut group = vec![id];
+        group.extend(self.linked_to(id));
+        if self.is_selected(id) {
+            let mut rest: Vec<Uuid> = self.selected_ids().into_iter().filter(|s| !group.contains(s)).collect();
+            self.selection.set(if rest.is_empty() { None } else { Some(rest.remove(0)) });
+            *self.extra_selection.borrow_mut() = rest;
+        } else {
+            let mut all = self.selected_ids();
+            all.retain(|s| !group.contains(s));
+            self.selection.set(Some(id));
+            all.extend(group.into_iter().skip(1));
+            *self.extra_selection.borrow_mut() = all;
+        }
+        self.emit(Change::Selection);
+    }
+
+    pub fn select_all(&self) {
+        let mut all: Vec<Uuid> = self
+            .with_timeline(|t| t.tracks.iter().filter(|tr| !tr.locked).flat_map(|tr| tr.clips.iter().map(|c| c.id)).collect())
+            .unwrap_or_default();
+        self.selection.set(if all.is_empty() { None } else { Some(all.remove(0)) });
+        *self.extra_selection.borrow_mut() = all;
+        self.emit(Change::Selection);
     }
 
     pub fn selected_clip(&self) -> Option<Clip> {

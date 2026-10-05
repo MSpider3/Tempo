@@ -1424,6 +1424,77 @@ impl Command for RippleTrimCommand {
     }
 }
 
+// ----------------------------------------------------------------------------
+// EditClipCommand — replace a clip's settings (fades, title text, link …)
+// ----------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct EditClipCommand {
+    after: Clip,
+    before: Option<Clip>,
+    description: String,
+}
+
+impl EditClipCommand {
+    /// `after` is the clip as it should become. Its id, track and timing must be
+    /// those of the existing clip; only its other fields may differ.
+    pub fn new(description: impl Into<String>, after: Clip) -> Self {
+        Self { after, before: None, description: description.into() }
+    }
+}
+
+impl Command for EditClipCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let clip = timeline.find_clip_mut(self.after.id).ok_or(TimelineError::ClipNotFound(self.after.id))?;
+        self.before = Some(std::mem::replace(clip, self.after.clone()));
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let before = self.before.take().ok_or_else(|| TimelineError::CommandFailed("nothing to restore".into()))?;
+        let clip = timeline.find_clip_mut(before.id).ok_or(TimelineError::ClipNotFound(before.id))?;
+        *clip = before;
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ReplaceTimelineCommand — swap in a whole edited timeline as one undo step
+// ----------------------------------------------------------------------------
+
+/// Used for work that makes many changes at once, such as a plugin script.
+#[derive(Debug)]
+pub struct ReplaceTimelineCommand {
+    other: Timeline,
+    description: String,
+}
+
+impl ReplaceTimelineCommand {
+    pub fn new(description: impl Into<String>, after: Timeline) -> Self {
+        Self { other: after, description: description.into() }
+    }
+}
+
+impl Command for ReplaceTimelineCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        std::mem::swap(timeline, &mut self.other);
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        std::mem::swap(timeline, &mut self.other);
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -2145,5 +2216,34 @@ mod tests {
         // Trimming before the start of the media is refused and changes nothing.
         assert!(log.execute(Box::new(RippleTrimCommand::new(a_id, TrimEdge::In, -2_000_000)), &mut timeline).is_err());
         assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn test_edit_clip_and_replace_timeline_undo() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let clip = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 0, 2_000_000);
+        timeline.tracks[0].clips.push(clip.clone());
+        let before = timeline.clone();
+        let mut log = CommandLog::new();
+
+        let mut edited = clip.clone();
+        edited.properties.fade_in_us = 500_000;
+        log.execute(Box::new(EditClipCommand::new("Fade", edited)), &mut timeline).unwrap();
+        let (_, c) = timeline.find_clip(clip.id).unwrap();
+        assert_eq!(c.fade_factor(0), 0.0);
+        assert_eq!(c.fade_factor(250_000), 0.5);
+        assert_eq!(c.fade_factor(1_000_000), 1.0);
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        let mut other = timeline.clone();
+        other.tracks[0].clips.clear();
+        log.execute(Box::new(ReplaceTimelineCommand::new("Script", other.clone())), &mut timeline).unwrap();
+        assert_eq!(timeline, other);
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+        log.redo(&mut timeline).unwrap();
+        assert_eq!(timeline, other);
     }
 }

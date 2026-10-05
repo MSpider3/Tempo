@@ -30,7 +30,8 @@ pub struct EditPage {
     media_open: Cell<bool>,
     effects_open: Cell<bool>,
     tools: [gtk::ToggleButton; 3],
-    snap: gtk::ToggleButton,
+    /// Snapping and linked-selection toggles.
+    options: [gtk::ToggleButton; 2],
 }
 
 impl EditPage {
@@ -46,7 +47,7 @@ impl EditPage {
         upper.append(&inspector.root);
 
         let timeline = TimelineArea::new(state, viewer);
-        let (toolbar, tools, snap) = toolbar(state, &timeline);
+        let (toolbar, tools, options) = toolbar(state, &timeline);
         let lower = gtk::Box::new(gtk::Orientation::Vertical, 0);
         lower.append(&toolbar);
         lower.append(&timeline.root);
@@ -70,7 +71,7 @@ impl EditPage {
         });
 
         // Effects, when open, sits under the Media Pool in a full-height column.
-        let effects = effects_panel();
+        let effects = effects_panel(state);
         let effects_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).visible(false).build();
 
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -91,7 +92,7 @@ impl EditPage {
             media_open: Cell::new(true),
             effects_open: Cell::new(false),
             tools,
-            snap,
+            options,
         });
         page.layout_left();
 
@@ -159,32 +160,71 @@ impl EditPage {
             Tool::Blade => 2,
         };
         self.tools[active].set_active(true);
-        self.snap.set_active(state.snapping.get());
+        self.options[0].set_active(state.snapping.get());
+        self.options[1].set_active(state.linked_selection.get());
     }
 }
 
-fn effects_panel() -> gtk::Box {
+/// Effects: fades and titles. One click applies an item to the selected clip
+/// or adds it at the playhead.
+fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .width_request(300)
+        .hexpand(false)
         .vexpand(true)
         .css_classes(["tempo-surface", "tempo-sep-right", "tempo-sep-top"])
         .build();
-    let title = label("Effects", &["tempo-heading", "tempo-bright"]);
-    title.set_xalign(0.0);
-    title.set_margin_top(8);
-    title.set_margin_start(10);
-    panel.append(&title);
-    let hint = label("No transitions, titles or filters are installed yet.", &["empty-hint"]);
-    hint.set_wrap(true);
-    hint.set_margin_top(24);
-    hint.set_margin_start(16);
-    hint.set_margin_end(16);
-    panel.append(&hint);
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(8).margin_bottom(8).margin_start(10).margin_end(10).build();
+
+    let heading = |text: &str, hint: &str| {
+        let h = label(text, &["tempo-heading", "tempo-bright"]);
+        h.set_xalign(0.0);
+        h.set_margin_top(6);
+        list.append(&h);
+        let sub = label(hint, &["tempo-small", "tempo-dim"]);
+        sub.set_xalign(0.0);
+        list.append(&sub);
+    };
+    let item = |name: &str, tip: &str, icon: &str, run: Box<dyn Fn(&Rc<AppState>)>| {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let cell = gtk::Box::builder().width_request(56).css_classes(["effect-icon"]).build();
+        let image = gtk::Image::from_icon_name(icon);
+        image.set_hexpand(true);
+        image.set_halign(gtk::Align::Center);
+        cell.append(&image);
+        content.append(&cell);
+        let text = label(name, &[]);
+        text.set_hexpand(true);
+        text.set_xalign(0.0);
+        content.append(&text);
+        let button = gtk::Button::builder().child(&content).tooltip_text(tip).css_classes(["effect-row"]).build();
+        let s = state.clone();
+        button.connect_clicked(move |_| run(&s));
+        list.append(&button);
+    };
+
+    heading("Transitions", "Click to apply to the selected clip");
+    item("Fade In", "Fade the selected clip in over half a second", "go-first-symbolic", Box::new(|s| actions::set_fade(s, true, 0.5)));
+    item("Fade Out", "Fade the selected clip out over half a second", "go-last-symbolic", Box::new(|s| actions::set_fade(s, false, 0.5)));
+    item(
+        "Fade In and Out",
+        "Fade the selected clip in and out",
+        "media-playback-start-symbolic",
+        Box::new(|s| {
+            actions::set_fade(s, true, 0.5);
+            actions::set_fade(s, false, 0.5);
+        }),
+    );
+    heading("Titles", "Click to add at the playhead");
+    item("Text", "A title in the middle of the picture", "document-edit-symbolic", Box::new(|s| actions::add_title(s, false)));
+    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", Box::new(|s| actions::add_title(s, true)));
+
+    panel.append(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
     panel
 }
 
-fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [gtk::ToggleButton; 3], gtk::ToggleButton) {
+fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [gtk::ToggleButton; 3], [gtk::ToggleButton; 2]) {
     // Edit modes: exactly one is active.
     let select = text_toggle("Select", "Selection mode (A): click, move and trim clips");
     let trim = text_toggle("Trim", "Trim mode (T): drag clip edges");
@@ -216,6 +256,15 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
     let s = state.clone();
     snap.connect_toggled(move |b| {
         if s.snapping.replace(b.is_active()) != b.is_active() {
+            s.emit(Change::Options);
+        }
+    });
+
+    let link = text_toggle("Link", "Linked selection (Ctrl+Shift+L): a clip and its sound are selected and moved together");
+    link.set_active(state.linked_selection.get());
+    let s = state.clone();
+    link.connect_toggled(move |b| {
+        if s.linked_selection.replace(b.is_active()) != b.is_active() {
             s.emit(Change::Options);
         }
     });
@@ -263,6 +312,7 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         overwrite.upcast_ref(),
         divider().upcast_ref(),
         snap.upcast_ref(),
+        link.upcast_ref(),
         divider().upcast_ref(),
         marker.upcast_ref(),
         divider().upcast_ref(),
@@ -276,5 +326,5 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
 
     let bar = gtk::CenterBox::builder().css_classes(["timeline-toolbar"]).build();
     bar.set_center_widget(Some(&centre));
-    (bar, [select, trim, blade], snap)
+    (bar, [select, trim, blade], [snap, link])
 }

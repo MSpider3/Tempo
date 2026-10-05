@@ -36,8 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         source.import_order = i as u32;
         let len = if own.is_empty() { source.duration_us.min(4_000_000) } else { source.duration_us };
+        // The picture and its sound are linked, as when a clip is dragged in by hand.
+        let link = source.audio_channels.is_some().then(uuid::Uuid::new_v4);
         let add = |p: &mut Project, t, kind| -> Result<(), Box<dyn std::error::Error>> {
-            let clip = Clip::new(t, source.id, kind, file.clone(), at, at + len, 0, len);
+            let mut clip = Clip::new(t, source.id, kind, file.clone(), at, at + len, 0, len);
+            clip.properties.link = link;
             p.timeline.find_track_mut(t).ok_or("track")?.clips.push(clip);
             Ok(())
         };

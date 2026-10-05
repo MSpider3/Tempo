@@ -303,6 +303,16 @@
    "resolve": "editSnapping"
   },
   {
+   "group": "Edit Modes",
+   "action": "win.linked-selection-toggle",
+   "keys": [
+    "<Primary><Shift>l"
+   ],
+   "alt": [],
+   "label": "Linked Selection",
+   "resolve": "editLinkedSelection"
+  },
+  {
    "group": "Editing",
    "action": "win.edit-insert",
    "keys": [
@@ -452,6 +462,36 @@
    "alt": [],
    "label": "Redo",
    "resolve": "editRedo"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-all",
+   "keys": [
+    "<Primary>a"
+   ],
+   "alt": [],
+   "label": "Select All",
+   "resolve": "editSelectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.deselect-all",
+   "keys": [
+    "<Primary><Shift>a"
+   ],
+   "alt": [],
+   "label": "Deselect All",
+   "resolve": "editDeselectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.link-toggle",
+   "keys": [
+    "<Primary><Alt>l"
+   ],
+   "alt": [],
+   "label": "Link / Unlink Clips",
+   "resolve": "editLink"
   },
   {
    "group": "Trimming",

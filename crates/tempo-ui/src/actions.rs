@@ -5,9 +5,9 @@ use std::rc::Rc;
 
 use tempo_timeline::{
     AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
-    InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand, PropertyChange,
-    ReplaceClipCommand, RippleDeleteCommand, SetClipPropertyCommand, SplitClipCommand, TrackKind, TrimClipCommand,
-    TrimEdge,
+    EditClipCommand, InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
+    PropertyChange, ReplaceClipCommand, RippleDeleteCommand, SetClipPropertyCommand, SplitClipCommand, TitleData,
+    TitleType, TrackKind, TrimClipCommand, TrimEdge,
 };
 use uuid::Uuid;
 
@@ -66,6 +66,13 @@ fn clips_for_source(
         }
         MediaType::Image => push(video_track, ClipType::Image),
         MediaType::Audio => push(audio_track, ClipType::Audio),
+    }
+    // The picture and its sound stay together until the user unlinks them.
+    if clips.len() > 1 {
+        let link = Some(Uuid::new_v4());
+        for c in &mut clips {
+            c.properties.link = link;
+        }
     }
     clips
 }
@@ -165,20 +172,111 @@ fn selected(state: &AppState) -> Option<(Uuid, Clip)> {
     state.with_timeline(|t| t.find_clip(id).map(|(tr, c)| (tr.id, c.clone()))).flatten()
 }
 
-pub fn delete_selected(state: &Rc<AppState>, ripple: bool) {
-    let Some((track, clip)) = selected(state) else { return };
-    let cmd: Box<dyn Command> = if ripple {
-        Box::new(RippleDeleteCommand::new(track, clip.id))
-    } else {
-        Box::new(DeleteClipCommand::new(track, clip.id))
-    };
-    state.execute(cmd);
+/// Every selected clip with its track, latest first. Working from the end of
+/// the timeline keeps earlier positions valid while clips are removed or moved.
+fn all_selected(state: &AppState) -> Vec<(Uuid, Clip)> {
+    let ids = state.selected_ids();
+    let mut clips: Vec<(Uuid, Clip)> = state
+        .with_timeline(|t| ids.iter().filter_map(|id| t.find_clip(*id).map(|(tr, c)| (tr.id, c.clone()))).collect())
+        .unwrap_or_default();
+    clips.sort_by_key(|(_, c)| std::cmp::Reverse(c.timeline_in));
+    clips
 }
 
-/// Turn the selected clip off or on (Resolve's `D`).
+/// Run one command per selected clip as a single undo step.
+fn for_selected(state: &Rc<AppState>, name: &str, make: impl Fn(Uuid, &Clip) -> Option<Box<dyn Command>>) -> bool {
+    let commands: Vec<Box<dyn Command>> = all_selected(state).iter().filter_map(|(track, clip)| make(*track, clip)).collect();
+    !commands.is_empty() && state.execute(Box::new(CompositeCommand::new(name, commands)))
+}
+
+pub fn delete_selected(state: &Rc<AppState>, ripple: bool) {
+    for_selected(state, if ripple { "Ripple Delete" } else { "Delete" }, |track, clip| {
+        Some(if ripple {
+            Box::new(RippleDeleteCommand::new(track, clip.id)) as Box<dyn Command>
+        } else {
+            Box::new(DeleteClipCommand::new(track, clip.id))
+        })
+    });
+}
+
+/// Turn the selected clips off or on (Resolve's `D`).
 pub fn toggle_enabled(state: &Rc<AppState>) {
-    if let Some((_, clip)) = selected(state) {
-        state.execute(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Enabled(!clip.properties.enabled))));
+    let Some((_, first)) = selected(state) else { return };
+    let enable = !first.properties.enabled;
+    for_selected(state, "Enable Clip", |_, clip| {
+        Some(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Enabled(enable))) as Box<dyn Command>)
+    });
+}
+
+/// Set the fade at the start (`fade_in`) or end of the selected clips, in seconds.
+pub fn set_fade(state: &Rc<AppState>, fade_in: bool, seconds: f64) {
+    let us = (seconds.max(0.0) * 1_000_000.0) as i64;
+    let done = for_selected(state, "Fade", |_, clip| {
+        let mut edited = clip.clone();
+        // A fade cannot be longer than half the clip.
+        let us = us.min(clip.duration_us() / 2);
+        if fade_in {
+            edited.properties.fade_in_us = us;
+        } else {
+            edited.properties.fade_out_us = us;
+        }
+        (edited != *clip).then(|| Box::new(EditClipCommand::new("Fade", edited)) as Box<dyn Command>)
+    });
+    if !done && state.selection.get().is_none() {
+        state.message("Select a clip on the timeline first.");
+    }
+}
+
+/// Link or unlink the selected clips (Resolve's Ctrl+Alt+L).
+pub fn toggle_link(state: &Rc<AppState>) {
+    let clips = all_selected(state);
+    if clips.is_empty() {
+        return;
+    }
+    // If every selected clip already shares one link, this unlinks them.
+    let first = clips[0].1.properties.link;
+    let link = if clips.len() > 1 && first.is_some() && clips.iter().all(|(_, c)| c.properties.link == first) { None } else { Some(Uuid::new_v4()) };
+    let link = if clips.len() == 1 { None } else { link };
+    for_selected(state, if link.is_some() { "Link Clips" } else { "Unlink Clips" }, |_, clip| {
+        let mut edited = clip.clone();
+        edited.properties.link = link;
+        (edited != *clip).then(|| Box::new(EditClipCommand::new("Link", edited)) as Box<dyn Command>)
+    });
+}
+
+/// Add a title clip at the playhead, on the lowest video track that is free there.
+pub fn add_title(state: &Rc<AppState>, lower_third: bool) {
+    const LENGTH_US: i64 = 5_000_000;
+    let pos = state.player.position_us();
+    let at = pos - pos % state.frame_us();
+    // Prefer the track above the main one, so the title sits over the picture.
+    // If a later clip is in the way, the title is shortened to fit (at least a second).
+    let free = state
+        .with_timeline(|t| {
+            let mut tracks: Vec<_> = t.tracks.iter().filter(|tr| tr.kind == TrackKind::Video && !tr.locked).collect();
+            tracks.sort_by_key(|tr| if tr.kind_index == 1 { u32::MAX } else { tr.kind_index });
+            tracks.into_iter().find_map(|tr| {
+                if tr.clip_at(at).is_some() {
+                    return None;
+                }
+                let room = tr.clips.iter().map(|c| c.timeline_in).filter(|start| *start > at).min().map_or(LENGTH_US, |next| next - at);
+                (room >= 1_000_000).then(|| (tr.id, room.min(LENGTH_US)))
+            })
+        })
+        .flatten();
+    let Some((track, length)) = free else {
+        state.message("No free video track at the playhead for a title.");
+        return;
+    };
+    let mut clip = Clip::new(track, Uuid::nil(), ClipType::Title, if lower_third { "Lower Third" } else { "Title" }, at, at + length, 0, length);
+    clip.title_data = Some(if lower_third {
+        TitleData { title_type: TitleType::LowerThird, text: "Name".into(), font_size: 48.0, background_color: Some([0, 0, 0, 170]), ..Default::default() }
+    } else {
+        TitleData::default()
+    });
+    let id = clip.id;
+    if state.execute(Box::new(InsertClipCommand::new(clip))) {
+        state.select(Some(id));
     }
 }
 
@@ -281,11 +379,94 @@ pub fn trim_to_playhead(state: &Rc<AppState>, edge: TrimEdge) {
 }
 
 pub fn nudge(state: &Rc<AppState>, frames: i64) {
-    let Some((track, clip)) = selected(state) else { return };
-    let new_in = (clip.timeline_in + frames * state.frame_us()).max(0);
-    if new_in != clip.timeline_in {
-        state.execute(Box::new(MoveClipCommand::new(clip.id, track, track, clip.timeline_in, new_in)));
+    move_selected_by(state, frames * state.frame_us());
+}
+
+/// Move every selected clip by the same amount of time, as one undo step.
+pub fn move_selected_by(state: &Rc<AppState>, delta_us: i64) -> bool {
+    let mut clips = all_selected(state);
+    if delta_us == 0 || clips.is_empty() {
+        return false;
     }
+    // Nothing may move before the start of the timeline.
+    let earliest = clips.iter().map(|(_, c)| c.timeline_in).min().unwrap_or(0);
+    let delta = delta_us.max(-earliest);
+    // Move the clips at the leading side first, so they never run into each other.
+    if delta < 0 {
+        clips.reverse();
+    }
+    let commands: Vec<Box<dyn Command>> = clips
+        .iter()
+        .map(|(track, c)| Box::new(MoveClipCommand::new(c.id, *track, *track, c.timeline_in, c.timeline_in + delta)) as Box<dyn Command>)
+        .collect();
+    delta != 0 && state.execute(Box::new(CompositeCommand::new("Move", commands)))
+}
+
+/// Trim one edge of a clip; with `ripple`, later clips follow. Clips linked to
+/// it are trimmed the same way while linked selection is on.
+pub fn trim_clip(state: &Rc<AppState>, clip_id: Uuid, edge: TrimEdge, delta_us: i64, ripple: bool) {
+    let mut ids = vec![clip_id];
+    if state.is_selected(clip_id) {
+        ids.extend(state.selected_ids().into_iter().filter(|id| *id != clip_id));
+    }
+    let link = state.with_timeline(|t| t.find_clip(clip_id).and_then(|(_, c)| c.properties.link)).flatten();
+    // Only clips linked to this one follow; other selected clips are left alone.
+    let partners: Vec<Uuid> = state
+        .with_timeline(|t| {
+            ids.iter()
+                .copied()
+                .filter(|id| *id == clip_id || (link.is_some() && t.find_clip(*id).is_some_and(|(_, c)| c.properties.link == link)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let commands: Vec<Box<dyn Command>> = partners
+        .into_iter()
+        .map(|id| -> Box<dyn Command> {
+            if ripple {
+                Box::new(tempo_timeline::RippleTrimCommand::new(id, edge, delta_us))
+            } else {
+                Box::new(TrimClipCommand::new(id, edge, delta_us))
+            }
+        })
+        .collect();
+    state.execute(Box::new(CompositeCommand::new(if ripple { "Ripple Trim" } else { "Trim" }, commands)));
+}
+
+/// Roll a cut: move the point where two touching clips meet, keeping the total
+/// length. Clips linked to the one being rolled roll with it, so picture and
+/// sound stay together.
+pub fn roll_cut(state: &Rc<AppState>, clip_id: Uuid, edge: TrimEdge, delta_us: i64) -> bool {
+    let other_edge = if edge == TrimEdge::Out { TrimEdge::In } else { TrimEdge::Out };
+    // (clip, neighbour) pairs: the dragged clip, then any linked clips that also have a neighbour.
+    let pairs: Vec<(Uuid, Uuid)> = state
+        .with_timeline(|t| {
+            let link = t.find_clip(clip_id).and_then(|(_, c)| c.properties.link).filter(|_| state.linked_selection.get());
+            t.tracks
+                .iter()
+                .flat_map(|track| track.clips.iter().map(move |c| (track, c)))
+                .filter(|(_, c)| c.id == clip_id || (link.is_some() && c.properties.link == link))
+                .filter_map(|(track, c)| {
+                    let touching = match edge {
+                        TrimEdge::Out => track.clips.iter().find(|n| n.timeline_in == c.timeline_out),
+                        TrimEdge::In => track.clips.iter().find(|n| n.timeline_out == c.timeline_in),
+                    };
+                    touching.map(|n| (c.id, n.id))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !pairs.iter().any(|(c, _)| *c == clip_id) {
+        return false;
+    }
+    let mut commands: Vec<Box<dyn Command>> = Vec::new();
+    for (clip, neighbour) in pairs {
+        // Shrink first, then grow into the freed space, so the two never overlap.
+        let clip_grows = (edge == TrimEdge::Out) == (delta_us > 0);
+        let (shrink, grow) = if clip_grows { ((neighbour, other_edge), (clip, edge)) } else { ((clip, edge), (neighbour, other_edge)) };
+        commands.push(Box::new(TrimClipCommand::new(shrink.0, shrink.1, delta_us)));
+        commands.push(Box::new(TrimClipCommand::new(grow.0, grow.1, delta_us)));
+    }
+    state.execute(Box::new(CompositeCommand::new("Roll", commands)))
 }
 
 /// Move the selected clip one track up (`+1`) or down (`-1`) within its kind.

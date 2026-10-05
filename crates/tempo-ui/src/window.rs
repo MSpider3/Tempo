@@ -570,6 +570,95 @@ impl MainWindow {
         }
     }
 
+    /// One step of a scripted check (see `TEMPO_ACTIONS` in app.rs). Steps with a
+    /// colon drive the interface the way a pointer would; anything else is an
+    /// ordinary action name.
+    ///
+    /// `seek:SECONDS` · `media:INDEX` · `tool:select|trim|blade` ·
+    /// `click:SECONDS,TRACK[,ctrl]` · `drag:SECONDS,TRACK,TO_SECONDS[,TO_TRACK]` ·
+    /// `trim:EDGE_SECONDS,TRACK,DELTA_SECONDS[,shift]` · `title:center|lower` ·
+    /// `fade:in|out,SECONDS` · `panel:effects|inspector` · `dump`
+    pub fn run_script_step(self: &Rc<Self>, step: &str) {
+        use gtk::gdk::ModifierType;
+        let canvas = &self.edit.timeline.canvas;
+        if step == "dump" {
+            let text = self
+                .state
+                .with_timeline(|t| {
+                    let mut lines = Vec::new();
+                    for row in crate::timeline::rows(t) {
+                        let Some(track) = t.find_track(row.track_id) else { continue };
+                        let clips: Vec<String> = track
+                            .clips
+                            .iter()
+                            .map(|c| {
+                                let sel = if self.state.is_selected(c.id) { "*" } else { "" };
+                                let off = if c.properties.enabled { "" } else { "(off)" };
+                                format!("{sel}{}{off}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
+                            })
+                            .collect();
+                        let kind = if row.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" };
+                        lines.push(format!("{kind}{}: {}", row.index, clips.join(" ")));
+                    }
+                    lines.push(format!("markers: {}", t.markers.iter().map(|m| format!("{:.2}", m.position_us as f64 / 1e6)).collect::<Vec<_>>().join(" ")));
+                    lines.join(" | ")
+                })
+                .unwrap_or_default();
+            tracing::info!("dump {text}");
+            return;
+        }
+        let Some((op, args)) = step.split_once(':') else {
+            self.run_action(step);
+            return;
+        };
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        let num = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
+        match op {
+            "seek" => {
+                if let Some(s) = num(0) {
+                    self.state.player.seek((s * 1e6) as i64, true);
+                }
+            }
+            "media" => self.edit.media_pool.select_index(num(0).unwrap_or(0.0) as u32),
+            "tool" => self.set_tool(match parts.first().copied() {
+                Some("trim") => Tool::Trim,
+                Some("blade") => Tool::Blade,
+                _ => Tool::Select,
+            }),
+            "click" => {
+                if let Some(p) = num(0).and_then(|s| canvas.point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
+                    let mods = if parts.get(2) == Some(&"ctrl") { ModifierType::CONTROL_MASK } else { ModifierType::empty() };
+                    canvas.simulate_drag(p, p, mods);
+                }
+            }
+            "drag" => {
+                let track = parts.get(1).copied().unwrap_or("V1");
+                let from = num(0).and_then(|s| canvas.point_for(s, track));
+                let to = num(2).and_then(|s| canvas.point_for(s, parts.get(3).copied().unwrap_or(track)));
+                if let (Some(from), Some(to)) = (from, to) {
+                    canvas.simulate_drag(from, to, ModifierType::empty());
+                }
+            }
+            "trim" => {
+                let track = parts.get(1).copied().unwrap_or("V1");
+                let from = num(0).and_then(|s| canvas.point_for(s, track));
+                let to = num(0).zip(num(2)).and_then(|(s, d)| canvas.point_for(s + d, track));
+                if let (Some(from), Some(to)) = (from, to) {
+                    let mods = if parts.get(3) == Some(&"shift") { ModifierType::SHIFT_MASK } else { ModifierType::empty() };
+                    canvas.simulate_drag(from, to, mods);
+                }
+            }
+            "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
+            "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
+            "panel" => match parts.first().copied() {
+                Some("effects") => self.panel_buttons[1].set_active(true),
+                Some("inspector") => self.panel_buttons[2].set_active(true),
+                _ => {}
+            },
+            other => tracing::warn!("unknown script step {other}"),
+        }
+    }
+
     /// Playback figures for automated checks.
     pub fn stats(&self) -> String {
         let p = &self.state.player;
@@ -726,6 +815,13 @@ impl MainWindow {
             "win.cut" => actions::copy_selected(state, true),
             "win.paste" => actions::paste(state),
             "win.edit-replace" => actions::replace_selected(state),
+            "win.select-all" => state.select_all(),
+            "win.deselect-all" => state.select(None),
+            "win.link-toggle" => actions::toggle_link(state),
+            "win.linked-selection-toggle" => {
+                state.linked_selection.set(!state.linked_selection.get());
+                state.emit(Change::Options);
+            }
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
             "win.delete" => actions::delete_selected(state, false),

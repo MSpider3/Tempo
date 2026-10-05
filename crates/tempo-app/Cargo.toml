@@ -23,6 +23,7 @@ tracing-subscriber = { workspace = true }
 # Used only by the programs in examples/.
 [dev-dependencies]
 tempo-export = { path = "../tempo-export" }
+uuid = { workspace = true }
 tempo-timeline = { path = "../tempo-timeline" }
 tempo-media = { path = "../tempo-media" }
 tempo-project = { path = "../tempo-project" }

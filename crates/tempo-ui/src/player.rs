@@ -11,7 +11,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tempo_audio::AudioOutput;
 use tempo_media::{AudioReader, FfmpegDecoder, VideoFrame, OUT_CHANNELS, OUT_RATE};
-use tempo_timeline::{Clip, ClipProperties, ClipType, Project, TrackKind};
+use tempo_timeline::{Clip, ClipProperties, ClipType, Project, TitleData, TrackKind};
 use uuid::Uuid;
 
 /// How many container files may be open for decoding at once.
@@ -19,7 +19,10 @@ const MAX_OPEN_DECODERS: usize = 3;
 
 /// One decoded picture plus the clip settings needed to place it.
 pub struct Layer {
-    pub frame: VideoFrame,
+    /// The decoded picture, for video and image clips.
+    pub frame: Option<VideoFrame>,
+    /// The text to draw, for title clips.
+    pub title: Option<TitleData>,
     pub props: ClipProperties,
 }
 
@@ -472,29 +475,46 @@ impl Worker {
     /// Decode what is under the playhead and publish it, unless it is what is already shown.
     fn render(&mut self, snap: &Snapshot) {
         let pos = self.pos_us;
-        let mut wanted: Vec<(Uuid, i64, &Clip)> = Vec::new();
-        for clips in &snap.tracks {
-            if let Some(clip) = clips.iter().find(|c| c.contains_point(pos)) {
-                if clip.properties.enabled && matches!(clip.clip_type, ClipType::Video | ClipType::Image) {
-                    let offset = clip.source_offset_at(pos);
-                    wanted.push((clip.source_id, offset - offset % snap.frame_us, clip));
-                }
-            }
-        }
+        // What is under the playhead on each track, bottom first. Title clips need
+        // no decoding; the viewer draws their text.
+        let wanted: Vec<(&Clip, i64)> = snap
+            .tracks
+            .iter()
+            .filter_map(|clips| clips.iter().find(|c| c.contains_point(pos)))
+            .filter(|c| c.properties.enabled)
+            .map(|c| {
+                let offset = c.source_offset_at(pos);
+                (c, offset - offset % snap.frame_us)
+            })
+            .collect();
 
-        let key: Vec<(Uuid, i64)> = wanted.iter().map(|(id, off, _)| (*id, *off)).collect();
+        // Skip the work if this exact picture is already on screen. A title's key
+        // is its clip and how far through a fade it is.
+        let key: Vec<(Uuid, i64)> = wanted
+            .iter()
+            .map(|(c, offset)| match c.clip_type {
+                ClipType::Title => (c.id, (c.fade_factor(pos) * 1000.0) as i64),
+                _ => (c.source_id, *offset),
+            })
+            .collect();
         if key == self.last_shown && self.exact {
             return;
         }
 
         let mut layers = Vec::with_capacity(wanted.len());
-        for (source_id, offset, clip) in wanted {
-            let Some(path) = snap.sources.get(&source_id) else { continue };
+        for (clip, offset) in wanted {
+            let mut props = clip.properties.clone();
+            props.opacity *= clip.fade_factor(pos);
+            if clip.clip_type == ClipType::Title {
+                layers.push(Layer { frame: None, title: clip.title_data.clone(), props });
+                continue;
+            }
+            let Some(path) = snap.sources.get(&clip.source_id) else { continue };
             let exact = self.exact;
-            let Some(decoder) = self.decoder_for(source_id, path) else { continue };
+            let Some(decoder) = self.decoder_for(clip.source_id, path) else { continue };
             let result = if exact { decoder.decode_video_frame(offset) } else { decoder.decode_keyframe(offset) };
             match result {
-                Ok(frame) => layers.push(Layer { frame, props: clip.properties.clone() }),
+                Ok(frame) => layers.push(Layer { frame: Some(frame), title: None, props }),
                 Err(e) => tracing::debug!("decode failed for {}: {e}", path.display()),
             }
         }
@@ -590,7 +610,7 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             let Some(path) = snapshot.audio_sources.get(&clip.source_id) else { continue };
             let Some(reader) = reader_for(&mut readers, clip.source_id, path) else { continue };
             reader.read(clip.source_offset_at(*pos_us), &mut part);
-            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0);
+            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us);
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
             let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
             for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {

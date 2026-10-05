@@ -1302,6 +1302,7 @@ dependencies = [
  "tempo-ui",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

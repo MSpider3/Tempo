@@ -9,10 +9,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, graphene, gsk, pango};
-use tempo_timeline::{
-    ClipType, MarkerColor, MoveClipCommand, RippleTrimCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind,
-    TrimClipCommand, TrimEdge,
-};
+use tempo_timeline::{ClipType, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimEdge};
 use uuid::Uuid;
 
 use crate::actions::{self, Place};
@@ -67,7 +64,8 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
 enum Drag {
     Scrub,
     Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid },
-    Trim { clip: Uuid, edge: TrimEdge, delta: i64 },
+    /// `roll` moves the cut between two touching clips (Shift in Trim mode).
+    Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
 }
 
 mod imp {
@@ -81,6 +79,8 @@ mod imp {
         pub playhead: Cell<i64>,
         pub(super) drag: RefCell<Option<Drag>>,
         pub press: Cell<(f64, f64)>,
+        /// Modifier keys held when the pointer went down.
+        pub press_mods: Cell<gdk::ModifierType>,
         pub pointer_x: Cell<f64>,
         pub snap_line: Cell<Option<i64>>,
         pub hadj: gtk::Adjustment,
@@ -99,6 +99,7 @@ mod imp {
                 playhead: Cell::new(0),
                 drag: RefCell::new(None),
                 press: Cell::new((0.0, 0.0)),
+                press_mods: Cell::new(gdk::ModifierType::empty()),
                 pointer_x: Cell::new(0.0),
                 snap_line: Cell::new(None),
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
@@ -283,23 +284,38 @@ impl TimelineCanvas {
     }
 
     /// Clip under a point, and which edge (if any) the pointer is close to.
+    /// An edge can be grabbed from a few pixels either side of it, so the end of
+    /// a clip is reachable from the empty space after it. At a cut, the left
+    /// side of the line grabs the end of the left clip and the right side the
+    /// start of the right clip.
     fn hit(&self, x: f64, y: f64) -> Option<(Row, Uuid, Option<TrimEdge>)> {
         let row = self.row_at(y)?;
         let t = self.us_at(x);
         let state = self.state();
-        let (id, tin, tout) = state
-            .with_timeline(|tl| {
-                tl.find_track(row.track_id).and_then(|tr| tr.clip_at(t)).map(|c| (c.id, c.timeline_in, c.timeline_out))
-            })
+        let clips: Vec<(Uuid, i64, i64)> = state
+            .with_timeline(|tl| tl.find_track(row.track_id).map(|tr| tr.clips.iter().map(|c| (c.id, c.timeline_in, c.timeline_out)).collect()))
             .flatten()?;
-        let edge = if (x - self.x_of(tin)).abs() <= EDGE_GRAB_PX {
-            Some(TrimEdge::In)
-        } else if (x - self.x_of(tout)).abs() <= EDGE_GRAB_PX {
-            Some(TrimEdge::Out)
-        } else {
-            None
-        };
-        Some((row, id, edge))
+
+        let mut best: Option<(f64, Uuid, TrimEdge)> = None;
+        for (id, tin, tout) in &clips {
+            for (edge_us, edge) in [(*tin, TrimEdge::In), (*tout, TrimEdge::Out)] {
+                let edge_x = self.x_of(edge_us);
+                let distance = (x - edge_x).abs();
+                // Each edge is grabbed from its own clip's side of a shared cut.
+                let own_side = match edge {
+                    TrimEdge::In => x >= edge_x,
+                    TrimEdge::Out => x < edge_x,
+                };
+                let shared = clips.iter().any(|(other, oin, oout)| other != id && (*oin == edge_us || *oout == edge_us));
+                if distance <= EDGE_GRAB_PX && (own_side || !shared) && best.as_ref().is_none_or(|(d, ..)| distance < *d) {
+                    best = Some((distance, *id, edge));
+                }
+            }
+        }
+        if let Some((_, id, edge)) = best {
+            return Some((row, id, Some(edge)));
+        }
+        clips.iter().find(|(_, tin, tout)| t >= *tin && t < *tout).map(|(id, ..)| (row, *id, None))
     }
 
     fn snap(&self, us: i64, ignore: Option<Uuid>) -> (i64, bool) {
@@ -319,13 +335,39 @@ impl TimelineCanvas {
         }
     }
 
+    /// Screen position of a time on a track ("V1", "A2" …). For scripted checks.
+    pub fn point_for(&self, seconds: f64, track: &str) -> Option<(f64, f64)> {
+        let rows = self.state().with_timeline(rows).unwrap_or_default();
+        let row = rows.into_iter().find(|r| {
+            let prefix = if r.kind == TrackKind::Video { "V" } else { "A" };
+            format!("{prefix}{}", r.index).eq_ignore_ascii_case(track)
+        })?;
+        Some((self.x_of((seconds * 1_000_000.0) as i64), (row.y + row.h / 2.0) as f64))
+    }
+
+    /// Run a pointer press, drag and release through the same handlers the mouse
+    /// uses. For scripted checks of the editing gestures.
+    pub fn simulate_drag(&self, from: (f64, f64), to: (f64, f64), mods: gdk::ModifierType) {
+        self.imp().press_mods.set(mods);
+        self.on_press(from.0, from.1);
+        if from != to {
+            // A few intermediate points, as a real drag would produce.
+            for step in 1..=4 {
+                let t = step as f64 / 4.0;
+                self.on_drag(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            }
+        }
+        self.on_release();
+    }
+
     fn install_controllers(&self) {
         // Press, drag, release.
         let drag = gtk::GestureDrag::new();
         let c = self.downgrade();
-        drag.connect_drag_begin(move |_, x, y| {
+        drag.connect_drag_begin(move |gesture, x, y| {
             if let Some(c) = c.upgrade() {
                 c.grab_focus();
+                c.imp().press_mods.set(gesture.current_event_state());
                 c.on_press(x, y);
             }
         });
@@ -408,14 +450,29 @@ impl TimelineCanvas {
                     actions::split_at(&state, id, at - at % state.frame_us());
                 }
             }
-            (_, Some((row, id, edge))) => {
-                state.select(Some(id));
+            (tool, Some((row, id, edge))) => {
+                let mods = imp.press_mods.get();
+                if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+                    // Ctrl+click adds a clip to the selection or takes it out.
+                    state.toggle_select(id);
+                    return;
+                }
+                if !state.is_selected(id) {
+                    state.select(Some(id));
+                } else if state.selection.get() != Some(id) {
+                    // Clicking another clip of a multi-selection makes it the primary one.
+                    let rest: Vec<Uuid> = state.selected_ids().into_iter().filter(|s| *s != id).collect();
+                    state.selection.set(Some(id));
+                    *state.extra_selection.borrow_mut() = rest;
+                    state.emit(Change::Selection);
+                }
                 if row.locked {
                     return;
                 }
+                let roll = tool == Tool::Trim && mods.contains(gdk::ModifierType::SHIFT_MASK);
                 let Some(clip) = state.selected_clip() else { return };
                 *imp.drag.borrow_mut() = Some(match edge {
-                    Some(edge) => Drag::Trim { clip: id, edge, delta: 0 },
+                    Some(edge) => Drag::Trim { clip: id, edge, delta: 0, roll },
                     None => Drag::Move {
                         clip: id,
                         from_track: row.track_id,
@@ -472,7 +529,7 @@ impl TimelineCanvas {
                     }
                 }
             }
-            Some(Drag::Trim { clip, edge, delta }) => {
+            Some(Drag::Trim { clip, edge, delta, .. }) => {
                 let Some((tin, tout)) = self
                     .state()
                     .with_timeline(|t| t.find_clip(*clip).map(|(_, c)| (c.timeline_in, c.timeline_out)))
@@ -499,16 +556,22 @@ impl TimelineCanvas {
         let state = self.state();
         match drag {
             Some(Drag::Move { clip, from_track, orig_in, new_in, to_track, .. }) => {
-                if new_in != orig_in || to_track != from_track {
+                if state.selected_ids().len() > 1 {
+                    // Several clips (or a clip and its sound) move together in time.
+                    actions::move_selected_by(&state, new_in - orig_in);
+                } else if new_in != orig_in || to_track != from_track {
                     state.execute(Box::new(MoveClipCommand::new(clip, from_track, to_track, orig_in, new_in)));
                 }
             }
-            // Trim mode ripples: later clips follow. Selection mode leaves a gap.
-            Some(Drag::Trim { clip, edge, delta }) if delta != 0 => {
-                if state.tool.get() == Tool::Trim {
-                    state.execute(Box::new(RippleTrimCommand::new(clip, edge, delta)));
+            // Trim mode ripples (later clips follow), or rolls the cut with Shift.
+            // Selection mode leaves a gap.
+            Some(Drag::Trim { clip, edge, delta, roll }) if delta != 0 => {
+                if roll {
+                    if !actions::roll_cut(&state, clip, edge, delta) {
+                        state.message("There is no clip touching that edge to roll against.");
+                    }
                 } else {
-                    state.execute(Box::new(TrimClipCommand::new(clip, edge, delta)));
+                    actions::trim_clip(&state, clip, edge, delta, state.tool.get() == Tool::Trim);
                 }
             }
             _ => {}
@@ -606,8 +669,12 @@ impl TimelineCanvas {
 
         // Tracks and clips.
         let dragging = imp.drag.borrow().clone();
+        // While several clips are dragged, how far they have moved.
+        let multi_move = match &dragging {
+            Some(Drag::Move { orig_in, new_in, .. }) if state.selected_ids().len() > 1 => Some(*new_in - *orig_in),
+            _ => None,
+        };
         let rows = rows(timeline);
-        let selected = state.selection.get();
         for row in &rows {
             s.append_color(&line, &rect(0.0, row.y + row.h - 1.0, w, 1.0));
             let Some(track) = timeline.find_track(row.track_id) else { continue };
@@ -618,11 +685,19 @@ impl TimelineCanvas {
                     Some(Drag::Move { clip: id, new_in, len, to_track, .. }) if *id == clip.id => {
                         tin = *new_in;
                         tout = *new_in + *len;
-                        if let Some(r) = rows.iter().find(|r| r.track_id == *to_track) {
-                            y = r.y;
+                        if multi_move.is_none() {
+                            if let Some(r) = rows.iter().find(|r| r.track_id == *to_track) {
+                                y = r.y;
+                            }
                         }
                     }
-                    Some(Drag::Trim { clip: id, edge, delta }) if *id == clip.id => match edge {
+                    // The other selected clips follow the dragged one.
+                    Some(Drag::Move { .. }) if multi_move.is_some() && state.is_selected(clip.id) => {
+                        let delta = multi_move.unwrap_or(0);
+                        tin += delta;
+                        tout += delta;
+                    }
+                    Some(Drag::Trim { clip: id, edge, delta, .. }) if *id == clip.id => match edge {
                         TrimEdge::In => tin = (tin + delta).min(tout - 1),
                         TrimEdge::Out => tout = (tout + delta).max(tin + 1),
                     },
@@ -653,7 +728,7 @@ impl TimelineCanvas {
                     s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.6), &body);
                 }
                 s.pop();
-                if selected == Some(clip.id) {
+                if state.is_selected(clip.id) {
                     s.append_border(&rounded, &[2.0; 4], &[accent; 4]);
                 } else {
                     s.append_border(&rounded, &[1.0; 4], &[gdk::RGBA::new(0.0, 0.0, 0.0, 0.3); 4]);
