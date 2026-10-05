@@ -8,14 +8,6 @@ authors.workspace = true
 [dependencies]
 tempo-timeline = { path = "../tempo-timeline" }
 ffmpeg-next = { workspace = true }
-image = { workspace = true }
-rayon = { workspace = true }
-crossbeam = { workspace = true }
 uuid = { workspace = true }
-parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-tempo-audio = { path = "../tempo-audio" }
-tempo-render = { path = "../tempo-render" }

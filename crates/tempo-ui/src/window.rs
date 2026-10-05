@@ -121,7 +121,14 @@ impl MainWindow {
 
         let activity = label("", &["tempo-small", "tempo-dim"]);
         let left = gtk::Box::builder().spacing(14).margin_start(12).build();
-        left.append(&label("Tempo", &["tempo-heading"]));
+        let logo_box = gtk::Box::builder().spacing(8).build();
+        let logo_icon = gtk::Image::builder()
+            .icon_name("dev.tempo.Tempo-symbolic")
+            .pixel_size(16)
+            .build();
+        logo_box.append(&logo_icon);
+        logo_box.append(&label("Tempo", &["tempo-heading"]));
+        left.append(&logo_box);
         left.append(&activity);
         let home = tool_button("go-home-symbolic", "Project Manager (Shift+1)");
         home.set_margin_end(8);
@@ -756,6 +763,13 @@ fn loading_view(status: &gtk::Label) -> gtk::Box {
         .valign(gtk::Align::Center)
         .margin_start(96)
         .build();
+    let app_icon = gtk::Image::builder()
+        .icon_name("dev.tempo.Tempo")
+        .pixel_size(64)
+        .halign(gtk::Align::Start)
+        .margin_bottom(12)
+        .build();
+    column.append(&app_icon);
     column.append(&name);
     column.append(&version);
     column.append(&gtk::Box::builder().height_request(40).build());

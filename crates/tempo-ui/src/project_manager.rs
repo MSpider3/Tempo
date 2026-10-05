@@ -259,7 +259,7 @@ fn card_factory() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, obj| {
         let Some(item) = obj.downcast_ref::<gtk::ListItem>() else { return };
-        let icon = gtk::Image::builder().icon_name("video-x-generic-symbolic").pixel_size(40).build();
+        let icon = gtk::Image::builder().icon_name("dev.tempo.Tempo-symbolic").pixel_size(40).build();
         let thumb = gtk::Box::builder().css_classes(["project-thumb"]).width_request(224).height_request(126).halign(gtk::Align::Center).build();
         icon.set_hexpand(true);
         thumb.append(&icon);
@@ -280,7 +280,7 @@ fn card_factory() -> gtk::SignalListItemFactory {
         let name = thumb.as_ref().and_then(|t| t.next_sibling()).and_downcast::<gtk::Label>();
         let date = card.last_child().and_downcast::<gtk::Label>();
         if let Some(icon) = thumb.and_then(|t| t.first_child()).and_downcast::<gtk::Image>() {
-            icon.set_icon_name(Some(if entry.missing { "dialog-warning-symbolic" } else { "video-x-generic-symbolic" }));
+            icon.set_icon_name(Some(if entry.missing { "dialog-warning-symbolic" } else { "dev.tempo.Tempo-symbolic" }));
         }
         if let Some(n) = name {
             n.set_text(&entry.name);

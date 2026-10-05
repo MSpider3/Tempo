@@ -4,13 +4,10 @@ members = [
     "crates/tempo-ui",
     "crates/tempo-timeline",
     "crates/tempo-media",
-    "crates/tempo-render",
     "crates/tempo-audio",
     "crates/tempo-proxy",
     "crates/tempo-export",
-    "crates/tempo-plugin",
     "crates/tempo-project",
-    "crates/tempo-compute",
 ]
 resolver = "2"
 
@@ -28,60 +25,29 @@ libadwaita    = { version = "0.7",  features = ["v1_6"] }
 glib          = { version = "0.20" }
 gio           = { version = "0.20" }
 gdk4          = { version = "0.9"  }
-cairo-rs      = { version = "0.20" }
 
-# Rendering
-wgpu          = { version = "22" }
-skia-safe     = { version = "0.75", features = ["gl", "vulkan"] }
+# Media and audio
+ffmpeg-next   = { version = "9",    features = ["codec", "format", "software-resampling", "software-scaling"] }
+pipewire      = { version = "0.10", features = ["v0_3_49"] }
 
-# Media
-ffmpeg-next   = { version = "9",    features = ["codec", "format", "filter", "software-resampling", "software-scaling"] }
-image         = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif"] }
-
-# Audio
-pipewire      = { version = "0.10" }
-rubato        = { version = "0.15" }
-
-# Plugin sandbox
-wasmtime      = { version = "23",   features = ["component-model"] }
-
-# Lua (Code Mode plugin)
-mlua          = { version = "0.10", features = ["lua54", "vendored"] }
-
-# Database
+# Project file
 rusqlite      = { version = "0.32", features = ["bundled", "serde_json"] }
 
-# Async
-tokio         = { version = "1.40", features = ["full"] }
-futures       = { version = "0.3" }
-pollster      = { version = "0.4" }
-
 # Concurrency
-rayon         = { version = "1.10" }
 crossbeam     = { version = "0.8"  }
 parking_lot   = { version = "0.12" }
-indexmap      = { version = "2.6"  }
 
 # Serialization
 serde         = { version = "1",    features = ["derive"] }
 serde_json    = { version = "1"    }
-toml          = { version = "0.8"  }
 
-# Error handling
+# Errors, ids, time, logging
 thiserror     = { version = "2"    }
-anyhow        = { version = "1"    }
-
-# IDs and time
 uuid          = { version = "1",    features = ["v4", "serde"] }
 chrono        = { version = "0.4",  features = ["serde"] }
-
-# Utilities
-once_cell     = { version = "1"    }
 tempfile      = { version = "3"    }
 tracing       = { version = "0.1"  }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bitflags      = { version = "2"    }
-bytemuck      = { version = "1",    features = ["derive"] }
 
 [profile.dev]
 opt-level = 1          # Faster builds than 0, still debuggable

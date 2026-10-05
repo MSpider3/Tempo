@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 tempo-timeline = { path = "../tempo-timeline" }
 tempo-media = { path = "../tempo-media" }
+tempo-audio = { path = "../tempo-audio" }
 tempo-project = { path = "../tempo-project" }
 tempo-export = { path = "../tempo-export" }
 tempo-proxy = { path = "../tempo-proxy" }

@@ -8,6 +8,7 @@ use crate::window::MainWindow;
 
 pub const APP_ID: &str = "dev.tempo.Tempo";
 const CSS: &str = include_str!("../../../assets/style/tempo.css");
+pub(crate) const GRESOURCE_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tempo.gresource"));
 
 pub struct TempoApp {
     app: adw::Application,
@@ -24,6 +25,11 @@ impl TempoApp {
         let app = adw::Application::builder().application_id(APP_ID).build();
 
         app.connect_startup(|_| {
+            let bytes = glib::Bytes::from_static(GRESOURCE_BYTES);
+            if let Ok(resource) = gio::Resource::from_data(&bytes) {
+                gio::resources_register(&resource);
+            }
+
             // Tempo is dark only, like the editor it prepares people for.
             adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
             let provider = gtk::CssProvider::new();
@@ -31,7 +37,10 @@ impl TempoApp {
             if let Some(display) = gtk::gdk::Display::default() {
                 // Above user themes in ~/.config/gtk-4.0: Tempo has one fixed look by design.
                 gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
+                let theme = gtk::IconTheme::for_display(&display);
+                theme.add_resource_path("/dev/tempo/Tempo/icons");
             }
+            gtk::Window::set_default_icon_name(APP_ID);
         });
 
         app.connect_activate(|app| {
@@ -94,4 +103,76 @@ fn dev_hooks(app: &adw::Application, win: &std::rc::Rc<MainWindow>) {
         }
         app.quit();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_icons_are_present() {
+        let bytes = glib::Bytes::from_static(GRESOURCE_BYTES);
+        let resource = gio::Resource::from_data(&bytes).expect("bundled resource is valid GVDB");
+
+        let expected_icons = [
+            "audio-volume-high-symbolic",
+            "audio-volume-muted-symbolic",
+            "audio-x-generic-symbolic",
+            "changes-allow-symbolic",
+            "changes-prevent-symbolic",
+            "dev.tempo.Tempo-symbolic",
+            "dev.tempo.Tempo",
+            "dialog-warning-symbolic",
+            "document-edit-symbolic",
+            "document-properties-symbolic",
+            "document-send-symbolic",
+            "edit-undo-symbolic",
+            "emblem-favorite-symbolic",
+            "folder-symbolic",
+            "go-first-symbolic",
+            "go-home-symbolic",
+            "go-last-symbolic",
+            "image-x-generic-symbolic",
+            "list-add-symbolic",
+            "media-playback-pause-symbolic",
+            "media-playback-start-symbolic",
+            "media-playback-stop-symbolic",
+            "media-seek-backward-symbolic",
+            "media-skip-backward-symbolic",
+            "media-skip-forward-symbolic",
+            "send-to-symbolic",
+            "system-search-symbolic",
+            "video-x-generic-symbolic",
+            "view-conceal-symbolic",
+            "view-more-symbolic",
+            "view-reveal-symbolic",
+            "window-close-symbolic",
+            "zoom-fit-best-symbolic",
+            "zoom-in-symbolic",
+            "zoom-out-symbolic",
+        ];
+
+        for icon in expected_icons {
+            let found = resource
+                .lookup_data(
+                    &format!("/dev/tempo/Tempo/icons/scalable/actions/{icon}.svg"),
+                    gio::ResourceLookupFlags::NONE,
+                )
+                .is_ok()
+                || resource
+                    .lookup_data(
+                        &format!("/dev/tempo/Tempo/icons/scalable/mimetypes/{icon}.svg"),
+                        gio::ResourceLookupFlags::NONE,
+                    )
+                    .is_ok()
+                || resource
+                    .lookup_data(
+                        &format!("/dev/tempo/Tempo/icons/scalable/apps/{icon}.svg"),
+                        gio::ResourceLookupFlags::NONE,
+                    )
+                    .is_ok();
+
+            assert!(found, "Icon '{icon}' must be present in bundled GResource");
+        }
+    }
 }

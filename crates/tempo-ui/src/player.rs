@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
-use tempo_media::{FfmpegDecoder, VideoFrame};
+use tempo_audio::AudioOutput;
+use tempo_media::{AudioReader, FfmpegDecoder, VideoFrame, OUT_CHANNELS, OUT_RATE};
 use tempo_timeline::{Clip, ClipProperties, ClipType, Project, TrackKind};
 use uuid::Uuid;
 
@@ -26,7 +27,12 @@ pub struct Layer {
 pub struct Snapshot {
     /// Video tracks, bottom first. Each holds its clips sorted by time.
     tracks: Vec<Vec<Clip>>,
+    /// Audio tracks that are not muted, with their track volume.
+    audio: Vec<(Vec<Clip>, f32)>,
+    /// What the picture is decoded from: the proxy when there is one.
     sources: HashMap<Uuid, PathBuf>,
+    /// What the sound is decoded from: always the original file.
+    audio_sources: HashMap<Uuid, PathBuf>,
     pub duration_us: i64,
     pub frame_us: i64,
 }
@@ -52,8 +58,18 @@ impl Snapshot {
                 (*id, path)
             })
             .collect();
+        let audio = project
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio && t.enabled)
+            .map(|t| (t.clips.clone(), t.volume))
+            .collect();
+        let audio_sources = project.sources.iter().filter(|(_, s)| !s.is_missing).map(|(id, s)| (*id, s.path.clone())).collect();
         Self {
             tracks: video.iter().map(|t| t.clips.clone()).collect(),
+            audio,
+            audio_sources,
             sources,
             duration_us: project
                 .timeline
@@ -67,10 +83,12 @@ impl Snapshot {
     }
 
     /// A one-clip snapshot used to preview a Media Pool item.
-    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, frame_us: i64) -> Self {
-        let clip = Clip::new(Uuid::nil(), id, ClipType::Video, "", 0, duration_us, 0, duration_us);
+    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, frame_us: i64, has_video: bool, has_audio: bool) -> Self {
+        let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
         Self {
-            tracks: vec![vec![clip]],
+            tracks: if has_video { vec![vec![clip(ClipType::Video)]] } else { Vec::new() },
+            audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0)] } else { Vec::new() },
+            audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
             duration_us,
             frame_us: frame_us.max(1),
@@ -90,6 +108,8 @@ enum Cmd {
 
 #[derive(Default)]
 struct Shared {
+    /// Output level of the last audio block, left and right, as `f32` bits.
+    level: [AtomicU32; 2],
     position_us: AtomicI64,
     duration_us: AtomicI64,
     playing: AtomicBool,
@@ -169,6 +189,14 @@ impl Player {
         self.shared.playing.load(Ordering::Acquire)
     }
 
+    /// Current output level (0.0–1.0), left and right. Zero when nothing plays.
+    pub fn levels(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.shared.level[0].load(Ordering::Relaxed)),
+            f32::from_bits(self.shared.level[1].load(Ordering::Relaxed)),
+        )
+    }
+
     pub fn dropped_frames(&self) -> u32 {
         self.shared.dropped.load(Ordering::Relaxed)
     }
@@ -203,16 +231,40 @@ struct Worker {
     exact: bool,
     dirty: bool,
     last_shown: Vec<(Uuid, i64)>,
+    /// Sound output and the thread that feeds it. `None` without a sound server.
+    audio: Option<Arc<AudioOutput>>,
+    feeder: Sender<Feed>,
+    /// True while the sound clock drives the playhead.
+    audio_clock: bool,
+    /// Last frame count seen and when, to notice a stalled sound device.
+    audio_seen: (u64, Instant),
 }
 
 impl Worker {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
+        let audio = AudioOutput::start().map(Arc::new);
+        if audio.is_none() {
+            tracing::warn!("no sound server found: playback will be silent");
+        }
+        let (feeder, feed_rx) = unbounded();
+        if let Some(out) = audio.clone() {
+            let spawned = std::thread::Builder::new().name("tempo-audio-feed".into()).spawn(move || feed_audio(feed_rx, out));
+            if let Err(e) = spawned {
+                tracing::error!("could not start the audio thread: {e}");
+            }
+        }
         Self {
+            audio,
+            feeder,
+            audio_clock: false,
+            audio_seen: (0, Instant::now()),
             rx,
             shared,
             timeline: Arc::new(Snapshot {
                 tracks: Vec::new(),
+                audio: Vec::new(),
                 sources: HashMap::new(),
+                audio_sources: HashMap::new(),
                 duration_us: 0,
                 frame_us: 33_333,
             }),
@@ -246,6 +298,31 @@ impl Worker {
         self.restart_clock();
     }
 
+    /// Start or stop sound to match the transport. Sound plays only at normal
+    /// speed; shuttling and reverse are silent and run on the wall clock.
+    fn sync_audio(&mut self) {
+        let Some(out) = self.audio.clone() else { return };
+        let _ = self.feeder.send(Feed::Stop);
+        out.clear();
+        self.audio_clock = false;
+        for level in &self.shared.level {
+            level.store(0, Ordering::Relaxed);
+        }
+        if self.playing && self.speed == 1.0 {
+            // Wait for the audio thread to empty its queue, so the frame count starts at zero.
+            let deadline = Instant::now() + Duration::from_millis(150);
+            while out.clear_pending() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if !out.clear_pending() {
+                let _ = self.feeder.send(Feed::Start { snapshot: self.active(), pos_us: self.pos_us });
+                self.audio_clock = true;
+                self.audio_seen = (0, Instant::now());
+            }
+        }
+        self.restart_clock();
+    }
+
     /// Returns false when the worker should stop.
     fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
@@ -255,6 +332,10 @@ impl Worker {
                 self.timeline = s;
                 self.dirty = true;
                 self.last_shown.clear();
+                // An edit while playing: the sound must follow the new timeline.
+                if self.playing {
+                    self.sync_audio();
+                }
             }
             Cmd::Source(s) => {
                 if self.source.is_none() {
@@ -263,6 +344,7 @@ impl Worker {
                 self.pos_us = if s.is_some() { 0 } else { self.timeline_pos };
                 self.source = s;
                 self.set_playing(false);
+                self.sync_audio();
                 self.exact = true;
                 self.dirty = true;
                 self.last_shown.clear();
@@ -271,15 +353,17 @@ impl Worker {
                 self.pos_us = us;
                 self.exact = exact;
                 self.dirty = true;
-                self.restart_clock();
+                self.sync_audio();
             }
             Cmd::Play(speed) => {
                 self.speed = speed;
                 self.exact = speed > 0.0 && speed <= 2.0;
                 self.set_playing(true);
+                self.sync_audio();
             }
             Cmd::Pause => {
                 self.set_playing(false);
+                self.sync_audio();
                 self.exact = true;
                 self.dirty = true;
             }
@@ -291,7 +375,10 @@ impl Worker {
                 self.dirty = true;
                 self.last_shown.clear();
             }
-            Cmd::Quit => return false,
+            Cmd::Quit => {
+                let _ = self.feeder.send(Feed::Quit);
+                return false;
+            }
         }
         true
     }
@@ -326,13 +413,34 @@ impl Worker {
             self.shared.duration_us.store(snap.duration_us, Ordering::Release);
 
             if self.playing {
-                let elapsed = self.clock_start.elapsed().as_micros() as f64;
-                let pos = self.clock_base_us + (elapsed * self.speed) as i64;
+                let pos = match (self.audio.clone(), self.audio_clock) {
+                    (Some(out), true) => {
+                        let frames = out.frames_played();
+                        if frames != self.audio_seen.0 {
+                            self.audio_seen = (frames, Instant::now());
+                        } else if self.audio_seen.1.elapsed() > Duration::from_millis(700) {
+                            // The sound device has stopped asking for data; carry on by the wall clock.
+                            tracing::warn!("sound output stalled; continuing without the audio clock");
+                            self.pos_us = self.clock_base_us + (frames * 1_000_000 / OUT_RATE as u64) as i64;
+                            self.audio_clock = false;
+                            self.restart_clock();
+                        }
+                        let (l, r) = out.peaks();
+                        self.shared.level[0].store(l.to_bits(), Ordering::Relaxed);
+                        self.shared.level[1].store(r.to_bits(), Ordering::Relaxed);
+                        self.clock_base_us + (frames * 1_000_000 / OUT_RATE as u64) as i64
+                    }
+                    _ => {
+                        let elapsed = self.clock_start.elapsed().as_micros() as f64;
+                        self.clock_base_us + (elapsed * self.speed) as i64
+                    }
+                };
                 // Stop at the end going forward, or at the start going backward.
                 let ended = (self.speed > 0.0 && pos >= snap.duration_us) || (self.speed < 0.0 && pos <= 0);
                 if ended {
                     self.pos_us = pos.clamp(0, snap.duration_us.max(0));
                     self.set_playing(false);
+                    self.sync_audio();
                     self.exact = true;
                 } else {
                     self.pos_us = pos;
@@ -418,4 +526,103 @@ impl Worker {
         }
         self.decoders.last_mut().map(|(_, d)| d)
     }
+}
+
+// ---- Sound --------------------------------------------------------------------
+
+enum Feed {
+    Start { snapshot: Arc<Snapshot>, pos_us: i64 },
+    Stop,
+    Quit,
+}
+
+/// Frames mixed per step: 10 ms, so a cut lands within 10 ms of where it is drawn.
+const FEED_FRAMES: usize = OUT_RATE as usize / 100;
+/// How much sound to keep queued ahead of the speaker.
+const FEED_AHEAD_FRAMES: usize = OUT_RATE as usize / 5;
+const MAX_OPEN_READERS: usize = 4;
+
+/// Mixes the audio tracks and keeps the output queue topped up while playing.
+fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
+    let mut readers: Vec<(Uuid, AudioReader)> = Vec::new();
+    let mut job: Option<(Arc<Snapshot>, i64)> = None;
+    let mut mix = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
+    let mut part = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
+    loop {
+        // Idle: wait for work. Playing: look for a command without waiting.
+        let cmd = if job.is_none() {
+            match rx.recv() {
+                Ok(c) => Some(c),
+                Err(_) => return,
+            }
+        } else {
+            match rx.try_recv() {
+                Ok(c) => Some(c),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        };
+        match cmd {
+            Some(Feed::Start { snapshot, pos_us }) => {
+                readers.retain(|(id, _)| snapshot.audio_sources.contains_key(id));
+                job = Some((snapshot, pos_us));
+                continue;
+            }
+            Some(Feed::Stop) => {
+                job = None;
+                continue;
+            }
+            Some(Feed::Quit) => return,
+            None => {}
+        }
+        let Some((snapshot, pos_us)) = job.as_mut() else { continue };
+        if out.clear_pending() || out.queued_frames() >= FEED_AHEAD_FRAMES {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        mix.fill(0.0);
+        for (clips, track_volume) in &snapshot.audio {
+            let Some(clip) = clips.iter().find(|c| c.contains_point(*pos_us)) else { continue };
+            if clip.properties.muted {
+                continue;
+            }
+            let Some(path) = snapshot.audio_sources.get(&clip.source_id) else { continue };
+            let Some(reader) = reader_for(&mut readers, clip.source_id, path) else { continue };
+            reader.read(clip.source_offset_at(*pos_us), &mut part);
+            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0);
+            let pan = clip.properties.pan.clamp(-1.0, 1.0);
+            let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
+            for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
+                m[0] += p[0] * left;
+                m[1] += p[1] * right;
+            }
+        }
+        for sample in &mut mix {
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+        out.push(&mix);
+        *pos_us += (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+    }
+}
+
+fn reader_for<'a>(readers: &'a mut Vec<(Uuid, AudioReader)>, id: Uuid, path: &PathBuf) -> Option<&'a mut AudioReader> {
+    if let Some(idx) = readers.iter().position(|(r, _)| *r == id) {
+        let entry = readers.remove(idx);
+        readers.push(entry);
+    } else {
+        match AudioReader::open(path) {
+            Ok(r) => {
+                if readers.len() >= MAX_OPEN_READERS {
+                    readers.remove(0);
+                }
+                readers.push((id, r));
+            }
+            Err(e) => {
+                tracing::debug!("no sound from {}: {e}", path.display());
+                return None;
+            }
+        }
+    }
+    readers.last_mut().map(|(_, r)| r)
 }

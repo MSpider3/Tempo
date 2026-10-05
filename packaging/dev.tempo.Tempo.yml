@@ -34,6 +34,8 @@ modules:
       - install -Dm755 target/release/tempo /app/bin/tempo
       - install -Dm644 packaging/dev.tempo.Tempo.desktop /app/share/applications/dev.tempo.Tempo.desktop
       - install -Dm644 packaging/dev.tempo.Tempo.appdata.xml /app/share/metainfo/dev.tempo.Tempo.appdata.xml
+      - install -Dm644 assets/icons/dev.tempo.Tempo.svg /app/share/icons/hicolor/scalable/apps/dev.tempo.Tempo.svg
+      - install -Dm644 assets/icons/dev.tempo.Tempo-symbolic.svg /app/share/icons/hicolor/symbolic/apps/dev.tempo.Tempo-symbolic.svg
     sources:
       - type: dir
         path: ..

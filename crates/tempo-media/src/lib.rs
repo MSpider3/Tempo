@@ -1,11 +1,11 @@
-//! tempo-media: Media import, FFmpeg probe, decode, and thumbnailing.
+//! tempo-media: probing and decoding through FFmpeg.
 
+pub mod audio;
 pub mod decoder;
 pub mod error;
-pub mod hwaccel;
 pub mod probe;
 
-pub use decoder::{AudioBuffer, FfmpegDecoder, PixelFormat, VideoFrame, SEEK_THRESHOLD_US};
+pub use audio::{waveform_peaks, AudioReader, OUT_CHANNELS, OUT_RATE};
+pub use decoder::{FfmpegDecoder, VideoFrame, SEEK_THRESHOLD_US};
 pub use error::{MediaError, Result};
-pub use hwaccel::VaapiHwContext;
 pub use probe::{ensure_ffmpeg_init, AudioMetadata, MediaEngine, MediaMetadata, VideoMetadata};

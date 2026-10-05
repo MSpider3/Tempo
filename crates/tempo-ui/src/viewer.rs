@@ -204,7 +204,8 @@ impl Viewer {
             self.state
                 .with_project(|p| {
                     p.sources.get(&id).map(|s| {
-                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.fps.frame_duration_us())
+                        let has_video = s.media_type != tempo_timeline::MediaType::Audio;
+                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.fps.frame_duration_us(), has_video, s.audio_channels.is_some())
                     })
                 })
                 .flatten()
