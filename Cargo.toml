@@ -15,7 +15,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["Mehul <MSpider3>"]
-license = "MIT"
+license = "GPL-3.0-only"
 repository = "https://github.com/MSpider3/Tempo"
 
 [workspace.dependencies]

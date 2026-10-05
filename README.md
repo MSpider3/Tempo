@@ -135,7 +135,7 @@ Run `./scripts/run_all_tests.sh` before opening a pull request.
 
 ## Licence
 
-See [LICENSE](LICENSE).
+Tempo is free software under the GNU General Public License, version 3. See [LICENSE](LICENSE).
 
 DaVinci Resolve is a trademark of Blackmagic Design. Tempo is an independent project and is
 not affiliated with or endorsed by Blackmagic Design.
