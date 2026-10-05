@@ -1295,6 +1295,7 @@ name = "tempo-app"
 version = "0.1.0"
 dependencies = [
  "glib",
+ "tempo-export",
  "tempo-media",
  "tempo-project",
  "tempo-timeline",
