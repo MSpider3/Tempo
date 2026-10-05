@@ -561,7 +561,7 @@ pub fn step_frames(state: &Rc<AppState>, frames: i64) {
 /// Set (or clear) In / Out. In source mode the marks belong to the source clip.
 pub fn set_mark(state: &Rc<AppState>, is_in: bool, clear: bool) {
     let value = (!clear).then(|| state.player.position_us());
-    let source = state.source_clip.get().is_some();
+    let source = state.source_mode();
     match (source, is_in) {
         (true, true) => state.src_in.set(value),
         (true, false) => state.src_out.set(value),

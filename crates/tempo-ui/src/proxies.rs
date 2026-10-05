@@ -58,7 +58,8 @@ impl Proxies {
 
     fn start_next(self: &Rc<Self>) {
         // `TEMPO_NO_PROXY=1` turns proxies off, to measure playback of original files.
-        if self.running.get() || std::env::var_os("TEMPO_NO_PROXY").is_some() {
+        let off = !self.state.settings.borrow().auto_proxies || std::env::var_os("TEMPO_NO_PROXY").is_some();
+        if self.running.get() || off {
             return;
         }
         let next = self

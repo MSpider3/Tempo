@@ -11,6 +11,7 @@ pub mod media_pool;
 pub mod player;
 pub mod project_manager;
 pub mod proxies;
+pub mod settings;
 pub mod state;
 pub mod timeline;
 pub mod util;

@@ -712,6 +712,16 @@
   },
   {
    "group": "File",
+   "action": "app.preferences",
+   "keys": [
+    "<Primary>comma"
+   ],
+   "alt": [],
+   "label": "Preferences",
+   "resolve": "resolvePreferences"
+  },
+  {
+   "group": "File",
    "action": "win.import-media",
    "keys": [
     "<Primary>i"

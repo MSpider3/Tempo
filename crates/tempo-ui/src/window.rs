@@ -24,7 +24,8 @@ use crate::util::{label, labelled_toggle, tool_button};
 use crate::viewer::Viewer;
 use crate::waveforms::Waveforms;
 
-const AUTOSAVE_SECONDS: u32 = 120;
+/// How often the autosave timer looks at the clock; the interval itself is a setting.
+const AUTOSAVE_CHECK_SECONDS: u32 = 30;
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
@@ -34,6 +35,8 @@ pub struct MainWindow {
     project_view: adw::ToolbarView,
     pages: gtk::Stack,
     viewer: Rc<Viewer>,
+    /// The second viewer of dual-viewer mode, made the first time it is switched on.
+    source_viewer: std::cell::RefCell<Option<Rc<Viewer>>>,
     edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
@@ -86,6 +89,7 @@ impl MainWindow {
         edit_menu.append(Some("Copy Chapter List"), Some("win.copy-chapters"));
         menu.append_section(None, &edit_menu);
         let help = gio::Menu::new();
+        help.append(Some("Preferences"), Some("win.preferences"));
         help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("About Tempo"), Some("win.about"));
         help.append(Some("Quit"), Some("win.quit"));
@@ -200,6 +204,7 @@ impl MainWindow {
             project_view,
             pages,
             viewer,
+            source_viewer: Default::default(),
             edit,
             export,
             proxies: Proxies::new(&state_for_proxies),
@@ -276,10 +281,27 @@ impl MainWindow {
 
         // Autosave: only when something changed, and on a worker thread.
         let w = self.clone();
-        glib::timeout_add_seconds_local(AUTOSAVE_SECONDS, move || {
-            w.autosave();
+        let waited = Cell::new(0u32);
+        glib::timeout_add_seconds_local(AUTOSAVE_CHECK_SECONDS, move || {
+            waited.set(waited.get() + AUTOSAVE_CHECK_SECONDS);
+            if waited.get() >= w.state.settings.borrow().autosave_seconds {
+                waited.set(0);
+                w.autosave();
+            }
             glib::ControlFlow::Continue
         });
+
+        // Where a Media Pool clip opens depends on the viewer mode.
+        let w = self.clone();
+        *self.state.open_source.borrow_mut() = Some(Rc::new(move |source| {
+            let source_viewer = w.source_viewer.borrow().clone();
+            match source_viewer.filter(|_| w.state.dual_viewer.get()) {
+                Some(v) => v.show_source(source),
+                None => w.viewer.show_source(source),
+            }
+        }));
+        let w = self.clone();
+        self.viewer.connect_dual(move |on| w.set_dual_viewer(on));
 
         let w = self.clone();
         self.window.connect_close_request(move |_| w.on_close_request());
@@ -299,11 +321,11 @@ impl MainWindow {
 
     /// Menu items are window actions that forward to `run_action`.
     fn install_actions(self: &Rc<Self>) {
-        for name in ["import-media", "save", "undo", "redo", "copy-chapters", "show-shortcuts", "about", "quit"] {
+        for name in ["import-media", "save", "undo", "redo", "copy-chapters", "preferences", "show-shortcuts", "about", "quit"] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
-                "save" | "quit" => format!("app.{name}"),
+                "save" | "quit" | "preferences" => format!("app.{name}"),
                 _ => format!("win.{name}"),
             };
             action.connect_activate(move |_, _| w.run_action(&full));
@@ -326,7 +348,15 @@ impl MainWindow {
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
             w.loading_status.set_text("STARTING MEDIA ENGINE");
-            let _ = gio::spawn_blocking(tempo_media::ensure_ffmpeg_init).await;
+            let settings = gio::spawn_blocking(|| {
+                tempo_media::ensure_ffmpeg_init();
+                crate::settings::Settings::load()
+            })
+            .await
+            .unwrap_or_default();
+            w.state.player.set_max_height(settings.playback_height);
+            tempo_media::set_hardware_decode(settings.hardware_decode);
+            *w.state.settings.borrow_mut() = settings;
             w.loading_status.set_text("OPENING PROJECTS");
             match std::env::var_os("TEMPO_OPEN").map(PathBuf::from) {
                 Some(path) => w.open_project(path),
@@ -557,6 +587,28 @@ impl MainWindow {
         self.panel_buttons[1].set_visible(is_edit);
     }
 
+    /// Dual viewer: the source clip gets its own viewer and playback beside the timeline viewer.
+    fn set_dual_viewer(self: &Rc<Self>, on: bool) {
+        if on == self.state.dual_viewer.get() {
+            return;
+        }
+        // Leave single-viewer source mode before switching.
+        self.viewer.show_source(None);
+        self.state.dual_viewer.set(on);
+        if on && self.source_viewer.borrow().is_none() {
+            let player = crate::player::Player::new();
+            player.set_max_height(self.state.settings.borrow().playback_height);
+            let source = Viewer::new_source(&self.state, player);
+            self.edit.source_slot.append(&source.root);
+            *self.source_viewer.borrow_mut() = Some(source);
+        }
+        self.edit.source_slot.set_visible(on);
+        if let Some(v) = self.source_viewer.borrow().as_ref() {
+            v.show_source(if on { self.state.media_selection.get() } else { None });
+        }
+        self.state.source_clip.set(if on { self.state.media_selection.get() } else { None });
+    }
+
     fn set_cinema(&self, on: bool) {
         self.cinema.set(on);
         self.project_view.set_reveal_top_bars(!on);
@@ -648,6 +700,7 @@ impl MainWindow {
                     canvas.simulate_drag(from, to, mods);
                 }
             }
+            "dual" => self.set_dual_viewer(parts.first() == Some(&"on")),
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
             "panel" => match parts.first().copied() {
@@ -681,6 +734,10 @@ impl MainWindow {
             }
             "win.show-shortcuts" => {
                 dialogs::shortcuts(&self.window);
+                return;
+            }
+            "app.preferences" => {
+                dialogs::preferences(&self.window, &self.state);
                 return;
             }
             "win.about" => {
@@ -737,7 +794,7 @@ impl MainWindow {
             }
             "win.mark-clip" => actions::mark_clip(state),
             "win.goto-in" | "win.goto-out" => {
-                let source = state.source_clip.get().is_some();
+                let source = state.source_mode();
                 let mark = match (source, action == "win.goto-in") {
                     (true, true) => state.src_in.get(),
                     (true, false) => state.src_out.get(),
@@ -845,8 +902,11 @@ impl MainWindow {
             "win.zoom-fit" => self.edit.timeline.canvas.zoom_fit(),
             "win.viewer-toggle" => {
                 // Back to the timeline, or to the clip selected in the Media Pool.
-                let target = if state.source_clip.get().is_some() { None } else { state.media_selection.get() };
-                self.viewer.show_source(target);
+                // With two viewers both are always on screen, so there is nothing to switch.
+                if !state.dual_viewer.get() {
+                    let target = if state.source_clip.get().is_some() { None } else { state.media_selection.get() };
+                    self.viewer.show_source(target);
+                }
             }
             "win.focus-media-pool" => {
                 self.panel_buttons[0].set_active(true);

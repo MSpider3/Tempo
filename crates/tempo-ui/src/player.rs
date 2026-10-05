@@ -85,6 +85,10 @@ impl Snapshot {
         }
     }
 
+    pub fn empty() -> Self {
+        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, frame_us: 33_333 }
+    }
+
     /// A one-clip snapshot used to preview a Media Pool item.
     pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, frame_us: i64, has_video: bool, has_audio: bool) -> Self {
         let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);

@@ -23,6 +23,8 @@ pub struct EditPage {
     pub timeline: TimelineArea,
     /// Holds the viewer while this page is showing.
     pub viewer_slot: gtk::Box,
+    pub source_slot: gtk::Box,
+    vertical: Cell<bool>,
     upper: gtk::Box,
     lower: gtk::Box,
     effects_column: gtk::Box,
@@ -36,13 +38,16 @@ pub struct EditPage {
 
 impl EditPage {
     pub fn new(state: &Rc<AppState>, viewer: &Rc<Viewer>) -> Rc<Self> {
-        let v = viewer.clone();
-        let media_pool = MediaPool::new(state, move |id| v.show_source(Some(id)));
+        let s = state.clone();
+        let media_pool = MediaPool::new(state, move |id| s.show_source(Some(id)));
         let inspector = Inspector::new(state);
         inspector.root.set_visible(false);
 
         let viewer_slot = gtk::Box::builder().hexpand(true).vexpand(true).build();
+        // Holds the source viewer in dual-viewer mode.
+        let source_slot = gtk::Box::builder().hexpand(true).vexpand(true).visible(false).css_classes(["tempo-sep-right"]).build();
         let upper = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        upper.append(&source_slot);
         upper.append(&viewer_slot);
         upper.append(&inspector.root);
 
@@ -85,6 +90,8 @@ impl EditPage {
             inspector,
             timeline,
             viewer_slot,
+            source_slot,
+            vertical: Cell::new(false),
             upper,
             lower,
             effects_column,
@@ -98,8 +105,10 @@ impl EditPage {
 
         let p = page.clone();
         state.connect(move |change| {
-            if matches!(change, Change::Options) {
-                p.sync_options();
+            match change {
+                Change::Options => p.sync_options(),
+                Change::Project => p.layout_viewer(),
+                _ => {}
             }
         });
         page
@@ -140,6 +149,31 @@ impl EditPage {
             self.upper.prepend(pool);
         }
         self.effects_column.set_visible(effects);
+    }
+
+    /// For a project taller than it is wide, give the viewer a full-height column
+    /// at the right, as DaVinci Resolve does. Otherwise it sits above the timeline.
+    fn layout_viewer(&self) {
+        let vertical = self.state.with_project(|p| p.height > p.width).unwrap_or(false);
+        if vertical == self.vertical.replace(vertical) {
+            return;
+        }
+        let slot = &self.viewer_slot;
+        if let Some(parent) = slot.parent().and_downcast::<gtk::Box>() {
+            parent.remove(slot);
+        }
+        if vertical {
+            slot.set_hexpand(false);
+            slot.set_width_request(380);
+            self.root.append(slot);
+            // With the viewer gone from the upper area, the Inspector fills it.
+            self.inspector.root.set_hexpand(true);
+        } else {
+            slot.set_hexpand(true);
+            slot.set_width_request(-1);
+            self.inspector.root.set_hexpand(false);
+            self.upper.insert_child_after(slot, Some(&self.source_slot));
+        }
     }
 
     /// Hide everything except the viewer (cinema viewer), or bring it back.

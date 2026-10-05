@@ -65,6 +65,11 @@ pub struct AppState {
     pub media_selection: Cell<Option<Uuid>>,
     /// The clip last copied or cut.
     pub clipboard: RefCell<Option<Clip>>,
+    pub settings: RefCell<crate::settings::Settings>,
+    /// True while the source clip has its own viewer beside the timeline viewer.
+    pub dual_viewer: Cell<bool>,
+    /// Opens a Media Pool clip in whichever viewer shows source clips.
+    pub open_source: RefCell<Option<Rc<dyn Fn(Option<Uuid>)>>>,
     /// Loudness of each source, 50 values a second, for drawing waveforms.
     pub waveforms: RefCell<std::collections::HashMap<Uuid, Rc<Vec<u8>>>>,
     pub player: Player,
@@ -92,6 +97,9 @@ impl AppState {
             src_out: Cell::new(None),
             media_selection: Cell::new(None),
             clipboard: RefCell::new(None),
+            settings: RefCell::new(Default::default()),
+            dual_viewer: Cell::new(false),
+            open_source: RefCell::new(None),
             waveforms: RefCell::new(Default::default()),
             player: Player::new(),
             listeners: RefCell::new(Vec::new()),
@@ -121,6 +129,18 @@ impl AppState {
 
     pub fn with_project<R>(&self, f: impl FnOnce(&Project) -> R) -> Option<R> {
         self.project.borrow().as_ref().map(f)
+    }
+
+    /// True when In/Out and the transport act on a source clip shown in the single viewer.
+    pub fn source_mode(&self) -> bool {
+        self.source_clip.get().is_some() && !self.dual_viewer.get()
+    }
+
+    pub fn show_source(&self, source: Option<Uuid>) {
+        let open = self.open_source.borrow().clone();
+        if let Some(open) = open {
+            open(source);
+        }
     }
 
     pub fn frame_us(&self) -> i64 {

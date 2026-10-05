@@ -273,3 +273,109 @@ fn find_files(folder: &std::path::Path, wanted: &[(uuid::Uuid, std::ffi::OsStrin
     }
     found
 }
+
+/// Preferences. Each change is applied and saved at once.
+pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    use crate::settings::{cache_dir, cache_size, Settings};
+    const AUTOSAVE: [(&str, u32); 4] = [("Every minute", 60), ("Every 2 minutes", 120), ("Every 5 minutes", 300), ("Every 10 minutes", 600)];
+    const QUALITY: [(&str, u32); 3] = [("Full", 0), ("Half", 540), ("Quarter", 270)];
+    let current = state.settings.borrow().clone();
+
+    // Apply a change to the settings, then save them on a worker.
+    let change = {
+        let state = state.clone();
+        move |apply: &dyn Fn(&mut Settings)| {
+            apply(&mut state.settings.borrow_mut());
+            let snapshot = state.settings.borrow().clone();
+            state.player.set_max_height(snapshot.playback_height);
+            // Switching proxies on starts work on footage that is waiting for one.
+            state.emit(crate::state::Change::Media);
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(Err(e)) = gtk::gio::spawn_blocking(move || snapshot.save()).await {
+                    tracing::warn!("could not save settings: {e}");
+                }
+            });
+        }
+    };
+
+    let general = adw::PreferencesGroup::builder().title("General").build();
+    let autosave = adw::ComboRow::builder().title("Autosave").model(&gtk::StringList::new(&AUTOSAVE.map(|a| a.0))).build();
+    autosave.set_selected(AUTOSAVE.iter().position(|a| a.1 == current.autosave_seconds).unwrap_or(1) as u32);
+    let c = change.clone();
+    autosave.connect_selected_notify(move |row| c(&|s| s.autosave_seconds = AUTOSAVE[row.selected() as usize].1));
+    general.add(&autosave);
+
+    let playback = adw::PreferencesGroup::builder()
+        .title("Playback")
+        .description("Lower quality and proxies make playback smoother on a slow computer. Export always uses full quality.")
+        .build();
+    let quality = adw::ComboRow::builder().title("Playback quality").model(&gtk::StringList::new(&QUALITY.map(|q| q.0))).build();
+    quality.set_selected(QUALITY.iter().position(|q| q.1 == current.playback_height).unwrap_or(1) as u32);
+    let c = change.clone();
+    quality.connect_selected_notify(move |row| c(&|s| s.playback_height = QUALITY[row.selected() as usize].1));
+    playback.add(&quality);
+    let proxies = adw::SwitchRow::builder()
+        .title("Make proxies automatically")
+        .subtitle("Small copies of heavy footage, made in the background")
+        .active(current.auto_proxies)
+        .build();
+    let c = change.clone();
+    proxies.connect_active_notify(move |row| c(&|s| s.auto_proxies = row.is_active()));
+    playback.add(&proxies);
+    let hardware = adw::SwitchRow::builder()
+        .title("Hardware decoding (experimental)")
+        .subtitle("Let the graphics chip decode video when it can. Takes effect for files opened after the change")
+        .active(current.hardware_decode)
+        .build();
+    let c = change.clone();
+    hardware.connect_active_notify(move |row| {
+        c(&|s| s.hardware_decode = row.is_active());
+        tempo_media::set_hardware_decode(row.is_active());
+    });
+    playback.add(&hardware);
+
+    let storage = adw::PreferencesGroup::builder().title("Storage").build();
+    let cache = adw::ActionRow::builder().title("Cache").subtitle("Waveforms and proxies. Tempo makes them again when needed.").build();
+    let clear = gtk::Button::builder().label("Clear").valign(gtk::Align::Center).css_classes(["pill-outline"]).build();
+    cache.add_suffix(&clear);
+    storage.add(&cache);
+    let show_size = {
+        let cache = cache.clone();
+        move || {
+            let cache = cache.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let bytes = gtk::gio::spawn_blocking(cache_size).await.unwrap_or(0);
+                cache.set_title(&format!("Cache — {}", glib::format_size(bytes)));
+            });
+        }
+    };
+    show_size();
+    let state_for_clear = state.clone();
+    clear.connect_clicked(move |_| {
+        let show_size = show_size.clone();
+        let state = state_for_clear.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let _ = gtk::gio::spawn_blocking(|| std::fs::remove_dir_all(cache_dir())).await;
+            // Proxies are gone: go back to the original files until they are made again.
+            if let Some(project) = state.project.borrow_mut().as_mut() {
+                for source in project.sources.values_mut() {
+                    source.proxy_ready = false;
+                    source.proxy_path = None;
+                }
+            }
+            state.waveforms.borrow_mut().clear();
+            state.sync_player();
+            state.emit(crate::state::Change::Media);
+            state.emit(crate::state::Change::Waveform);
+            show_size();
+        });
+    });
+
+    let page = adw::PreferencesPage::new();
+    page.add(&general);
+    page.add(&playback);
+    page.add(&storage);
+    let dialog = adw::PreferencesDialog::builder().title("Preferences").build();
+    dialog.add(&page);
+    dialog.present(Some(parent));
+}

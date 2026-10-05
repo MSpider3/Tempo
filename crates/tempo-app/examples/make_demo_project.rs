@@ -12,7 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let media = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media");
     tempo_media::ensure_ffmpeg_init();
 
-    let mut project = Project::new("Demo Project", 1920, 1080, RationalFps::FPS_30);
+    // `TEMPO_DEMO_VERTICAL=1` makes a 9:16 project, to check the vertical layout.
+    let (w, h) = if std::env::var_os("TEMPO_DEMO_VERTICAL").is_some() { (1080, 1920) } else { (1920, 1080) };
+    let mut project = Project::new("Demo Project", w, h, RationalFps::FPS_30);
     let track = |p: &Project, kind: TrackKind, index: u32| {
         p.timeline.tracks.iter().find(|t| t.kind == kind && t.kind_index == index).map(|t| t.id)
     };

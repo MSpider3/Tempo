@@ -1,14 +1,69 @@
 //! Video decoding: one open file, decoded on demand.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use ffmpeg_next::format::{self, Pixel};
 use ffmpeg_next::media::Type as FfmpegMediaType;
 use ffmpeg_next::software::scaling::{context::Context as ScalerContext, flag::Flags};
-use ffmpeg_next::Rational;
+use ffmpeg_next::{ffi, Rational};
 
 use crate::error::{MediaError, Result};
 use crate::probe::ensure_ffmpeg_init;
+
+// ---- Hardware decoding (VA-API) -------------------------------------------------
+
+static HARDWARE_DECODE: AtomicBool = AtomicBool::new(false);
+
+/// Turn hardware decoding on or off for files opened from now on. When it is on
+/// but the graphics driver cannot be used, decoding quietly stays on the processor.
+pub fn set_hardware_decode(on: bool) {
+    HARDWARE_DECODE.store(on, Ordering::Relaxed);
+}
+
+/// The VA-API device, opened once and shared by every decoder.
+struct HwDevice(*mut ffi::AVBufferRef);
+// SAFETY: FFmpeg's buffer references are reference-counted with atomics, and
+// this one is only ever read (to make new references).
+unsafe impl Send for HwDevice {}
+unsafe impl Sync for HwDevice {}
+
+fn hw_device() -> Option<&'static HwDevice> {
+    static DEVICE: OnceLock<Option<HwDevice>> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            let mut device: *mut ffi::AVBufferRef = std::ptr::null_mut();
+            // SAFETY: `device` is a valid out-pointer; null arguments ask for the default device.
+            let result = unsafe {
+                ffi::av_hwdevice_ctx_create(&mut device, ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)
+            };
+            if result >= 0 && !device.is_null() {
+                tracing::info!("hardware video decoding (VA-API) is available");
+                Some(HwDevice(device))
+            } else {
+                tracing::info!("hardware video decoding is not available; decoding on the processor");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Called by FFmpeg to choose the output format. Takes the VA-API surface format
+/// when it is offered; otherwise the first format, which is ordinary software decoding.
+unsafe extern "C" fn pick_format(_ctx: *mut ffi::AVCodecContext, formats: *const ffi::AVPixelFormat) -> ffi::AVPixelFormat {
+    let mut p = formats;
+    // SAFETY: FFmpeg passes a list terminated by AV_PIX_FMT_NONE.
+    unsafe {
+        while *p != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *p == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                return *p;
+            }
+            p = p.add(1);
+        }
+        *formats
+    }
+}
 
 /// A forward jump shorter than this is decoded through; longer jumps seek.
 pub const SEEK_THRESHOLD_US: i64 = 2_000_000;
@@ -34,8 +89,9 @@ pub struct FfmpegDecoder {
     video_height: u32,
     out_width: u32,
     out_height: u32,
-    src_format: Pixel,
-    scaler: ScalerContext,
+    /// Converter to RGBA, built for the format frames actually arrive in (which
+    /// differs between software and hardware decoding) and rebuilt if that changes.
+    scaler: Option<(Pixel, ScalerContext)>,
     last_decoded_pts_us: i64,
     /// The request and result of the last exact decode. Asking again for a time
     /// that falls on the same frame returns this copy instead of reading on.
@@ -73,10 +129,19 @@ impl FfmpegDecoder {
             // so slice threading would decode on a single core.
             kind: ffmpeg_next::codec::threading::Type::Frame,
         });
+        if HARDWARE_DECODE.load(Ordering::Relaxed) {
+            if let Some(device) = hw_device() {
+                // SAFETY: the codec context is valid and not yet opened; it takes its own
+                // reference to the device, which FFmpeg releases with the context.
+                unsafe {
+                    let ctx = codec_ctx.as_mut_ptr();
+                    (*ctx).hw_device_ctx = ffi::av_buffer_ref(device.0);
+                    (*ctx).get_format = Some(pick_format);
+                }
+            }
+        }
         let decoder = codec_ctx.decoder().video().map_err(MediaError::Ffmpeg)?;
-        let (video_width, video_height, src_format) = (decoder.width(), decoder.height(), decoder.format());
-        let scaler = ScalerContext::get(src_format, video_width, video_height, Pixel::RGBA, video_width, video_height, Flags::FAST_BILINEAR)
-            .map_err(MediaError::Ffmpeg)?;
+        let (video_width, video_height) = (decoder.width(), decoder.height());
 
         // Only the video stream is read here; skipping the rest saves demuxing work.
         for mut s in ictx.streams_mut() {
@@ -97,8 +162,7 @@ impl FfmpegDecoder {
             video_height,
             out_width: video_width,
             out_height: video_height,
-            src_format,
-            scaler,
+            scaler: None,
             last_decoded_pts_us: -1,
             last_exact: None,
         })
@@ -122,20 +186,39 @@ impl FfmpegDecoder {
             let w = (self.video_width as u64 * max_height as u64 / self.video_height as u64) as u32;
             ((w.max(2) + 1) & !1, (max_height.max(2) + 1) & !1)
         };
-        if (w, h) == (self.out_width, self.out_height) {
-            return;
-        }
-        if let Ok(sc) = ScalerContext::get(self.src_format, self.video_width, self.video_height, Pixel::RGBA, w, h, Flags::FAST_BILINEAR) {
-            self.scaler = sc;
+        if (w, h) != (self.out_width, self.out_height) {
             self.out_width = w;
             self.out_height = h;
+            self.scaler = None;
             self.last_exact = None;
         }
     }
 
     fn scale_frame(&mut self, decoded: &ffmpeg_next::frame::Video, pts_us: i64) -> Result<VideoFrame> {
+        // A hardware frame lives in graphics memory: copy it down first.
+        let mut downloaded = ffmpeg_next::frame::Video::empty();
+        let decoded = if decoded.format() == Pixel::VAAPI {
+            // SAFETY: both frames are valid; FFmpeg allocates the destination's buffers.
+            let result = unsafe { ffi::av_hwframe_transfer_data(downloaded.as_mut_ptr(), decoded.as_ptr(), 0) };
+            if result < 0 {
+                return Err(MediaError::FrameDecodeFailed);
+            }
+            &downloaded
+        } else {
+            decoded
+        };
+
+        let format = decoded.format();
+        if self.scaler.as_ref().is_none_or(|(f, _)| *f != format) {
+            let scaler = ScalerContext::get(format, decoded.width(), decoded.height(), Pixel::RGBA, self.out_width, self.out_height, Flags::FAST_BILINEAR)
+                .map_err(MediaError::Ffmpeg)?;
+            self.scaler = Some((format, scaler));
+        }
         let mut rgba = ffmpeg_next::frame::Video::empty();
-        self.scaler.run(decoded, &mut rgba).map_err(|_| MediaError::FrameDecodeFailed)?;
+        match self.scaler.as_mut() {
+            Some((_, scaler)) => scaler.run(decoded, &mut rgba).map_err(|_| MediaError::FrameDecodeFailed)?,
+            None => return Err(MediaError::FrameDecodeFailed),
+        }
         let (width, height) = (self.out_width, self.out_height);
         let data = rgba.data(0);
         let stride = rgba.stride(0);
@@ -295,6 +378,18 @@ mod tests {
         assert!(d.decode_video_frame(3_600_000_000).is_ok());
         // And the decoder is usable afterwards.
         assert!(d.decode_video_frame(0).is_ok());
+    }
+
+    #[test]
+    fn hardware_decode_setting_never_breaks_decoding() {
+        // With the setting on, a machine without a usable driver must still decode
+        // (on the processor), and a machine with one must give the same picture size.
+        let Some(path) = sample("sample_1080p_h264.mp4") else { return };
+        set_hardware_decode(true);
+        let result = FfmpegDecoder::open(path).and_then(|mut d| d.decode_video_frame(1_000_000));
+        set_hardware_decode(false);
+        let frame = result.expect("frame");
+        assert_eq!((frame.width, frame.height), (1920, 1080));
     }
 
     #[test]
