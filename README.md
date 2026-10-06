@@ -13,8 +13,12 @@ editor for cutting a video and posting it.
 - **Same keys as Resolve.** Every shared shortcut is checked against a key file exported
   from DaVinci Resolve 20.
 
-> Tempo is early software (version 0.1). The basics work; see
-> [what is not done yet](#what-is-not-done-yet) before relying on it.
+> **Alpha release.** Tempo is version 0.1 and is not stable yet. Expect bugs, rough
+> edges and changes between versions, and keep a copy of anything you cannot afford to
+> lose. Do not rely on it for important work. The downloads on the Releases page are
+> marked as pre-releases for this reason. See
+> [what is not done yet](#what-is-not-done-yet), and please
+> [report what goes wrong](https://github.com/MSpider3/Tempo/issues).
 
 ## What it does
 
@@ -23,8 +27,13 @@ editor for cutting a video and posting it.
 - **Editing:** insert, overwrite, append, place on top, move, trim, blade, razor, ripple
   delete, snapping, nudge. Every edit can be undone.
 - **Preview with sound**, with the picture following the audio clock.
-- **Proxies:** heavy footage gets a small 540p copy made in the background, used for preview
-  only. Export always reads the original files.
+- **Right-click menus** on timeline clips, on gaps and in the Media Pool, for the edits a
+  beginner looks for first.
+- **Linked picture and sound:** a clip and its sound move, cut, trim and delete together
+  until you unlink them.
+- **Proxies and preview quality:** heavy footage gets a small 540p copy made in the
+  background. The **Preview** button above the viewer switches between Full (the original
+  file), Half and Quarter; Half is the default. Export always reads the original files.
 - **Markers that become chapters:** name a marker and it is written into the exported file
   and offered as a ready-to-paste timestamp list, with YouTube's rules checked.
 - **Export page:** pick an output by frame shape — 16:9, 9:16, 1:1 or 4:5 — queue several,
@@ -100,6 +109,9 @@ The full list is in [docs/KEYBINDS.md](docs/KEYBINDS.md).
 - No upload plugin for a real site ships yet. The plugin point works (see
   [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md)), but each site needs its own developer keys.
 - Keyframe animation.
+- The Inspector changes one clip at a time, also when several are selected.
+- Some DaVinci Resolve keys are listed in [docs/KEYBINDS.md](docs/KEYBINDS.md) but not
+  built yet (loop playback, paste insert, select forward, and others); that file marks them.
 
 The complete, current list is at the top of [docs/ROADMAP.md](docs/ROADMAP.md).
 

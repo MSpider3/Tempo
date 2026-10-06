@@ -107,8 +107,33 @@ fn dev_hooks(app: &adw::Application, win: &std::rc::Rc<MainWindow>) {
             Some(Ok(())) => tracing::info!("screenshot saved"),
             other => tracing::error!("screenshot failed: {other:?}"),
         }
+        // An open menu is a window of its own, so it gets a picture of its own
+        // beside the main one ("shot.png" → "shot.menu.png").
+        if let Some(menu) = open_popover(window.upcast_ref()) {
+            let (w, h) = (menu.width(), menu.height());
+            let snapshot = gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(&menu)).snapshot(&snapshot, w as f64, h as f64);
+            let target = std::path::PathBuf::from(&path).with_extension("menu.png");
+            let saved = snapshot.to_node().zip(menu.native().and_then(|n| n.renderer())).map(|(node, renderer)| renderer.render_texture(&node, None).save_to_png(&target));
+            tracing::info!("menu screenshot: {}", matches!(saved, Some(Ok(()))));
+        }
         app.quit();
     });
+}
+
+/// The first popover that is showing anywhere below `widget`.
+fn open_popover(widget: &gtk::Widget) -> Option<gtk::Popover> {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(popover) = c.downcast_ref::<gtk::Popover>().filter(|p| p.is_mapped()) {
+            return Some(popover.clone());
+        }
+        if let Some(found) = open_popover(&c) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 #[cfg(test)]

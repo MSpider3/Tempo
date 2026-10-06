@@ -50,6 +50,18 @@ pub fn h264_args(crf: u8, width: u32, height: u32, fast: bool) -> Vec<String> {
     }
 }
 
+/// Run the child at a lower priority (`niceness` 1–19), so it gives way to the
+/// interface and to playback.
+pub fn low_priority(command: &mut Command, niceness: i32) {
+    // SAFETY: `setpriority` is async-signal-safe and touches only the child process.
+    unsafe {
+        command.pre_exec(move || {
+            libc::setpriority(libc::PRIO_PROCESS, 0, niceness);
+            Ok(())
+        });
+    }
+}
+
 /// Make the child stop when Tempo does, so closing the app never leaves an
 /// encode running in the background.
 pub fn die_with_parent(command: &mut Command) {

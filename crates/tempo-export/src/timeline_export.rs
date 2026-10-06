@@ -1,6 +1,11 @@
 //! Real timeline export. The cut is described to FFmpeg as a filter graph, so
 //! FFmpeg reads the original files, composites the tracks, mixes the audio and
-//! encodes in one pass. No frames pass through this process.
+//! encodes. No frames pass through this process.
+//!
+//! FFmpeg keeps every input of a graph open at once, and each one costs memory.
+//! A timeline with many cuts is therefore rendered in sections of a few clips
+//! each, which are then joined without encoding the picture again. Memory use
+//! stays the same however long the timeline is.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -158,16 +163,47 @@ pub fn build_ffmpeg_args(
     e: &TimelineExport,
     metadata_file: Option<&PathBuf>,
 ) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
+    build_args(project, e, metadata_file, None)
+}
+
+/// The output frame a time falls on, counting from the start of the export.
+/// The picture is laid out in whole frames, so cuts that are not on a frame
+/// never add up to a drift between picture and sound.
+fn to_frame(us: i64, project: &Project) -> i64 {
+    let (num, den) = (project.fps.num.max(1) as i128, project.fps.den.max(1) as i128);
+    ((us as i128 * num + den * 500_000) / (den * 1_000_000)) as i64
+}
+
+/// The time at which an output frame starts.
+fn frame_time(frame: i64, project: &Project) -> i64 {
+    let (num, den) = (project.fps.num.max(1) as i128, project.fps.den.max(1) as i128);
+    ((frame as i128 * den * 1_000_000 + num / 2) / num) as i64
+}
+
+/// A section's length rounded to whole frames, so its picture and sound are
+/// exactly as long as each other and sections join without a gap.
+fn whole_frames(us: i64, project: &Project) -> i64 {
+    frame_time(to_frame(us, project).max(1), project)
+}
+
+/// `section` is set when this is one part of a longer export: `Some(true)` if
+/// the export has sound, so that every part carries a sound stream.
+fn build_args(
+    project: &Project,
+    e: &TimelineExport,
+    metadata_file: Option<&PathBuf>,
+    section: Option<bool>,
+) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
     let mut text_files: Vec<(PathBuf, String)> = Vec::new();
     let sx = ((e.width.max(16) + 1) & !1) as f32 / project.width.max(1) as f32;
     let sy = ((e.height.max(16) + 1) & !1) as f32 / project.height.max(1) as f32;
     let timeline_end = project.timeline.tracks.iter().map(|t| t.duration_us()).max().unwrap_or(0);
     let (r0, r1) = e.range.unwrap_or((0, timeline_end));
     let (r0, r1) = (r0.max(0), r1.min(timeline_end));
-    let total = r1 - r0;
-    if total <= 0 {
+    if r1 - r0 <= 0 {
         return Err(ExportError::InvalidParameter("There is nothing on the timeline to export.".into()));
     }
+    let total = if section.is_some() { whole_frames(r1 - r0, project) } else { r1 - r0 };
 
     let (w, h) = ((e.width.max(16) + 1) & !1, (e.height.max(16) + 1) & !1);
     let fps = format!("{}/{}", project.fps.num.max(1), project.fps.den.max(1));
@@ -207,37 +243,39 @@ pub fn build_ffmpeg_args(
             continue;
         }
         let mut segs = Vec::new();
+        // Everything on this strip is measured in output frames.
         let mut cursor = 0i64;
-        let gap = |graph: &mut Vec<String>, segs: &mut Vec<String>, len: i64| {
-            let label = format!("vg{ti}_{}", segs.len());
-            graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps}:d={},format=rgba[{label}]", secs(len)));
-            segs.push(label);
-        };
+        let blank = |frames: i64| format!("color=c=black@0.0:s={w}x{h}:r={fps},trim=end_frame={frames},format=rgba");
         for p in &parts {
-            if p.start > cursor {
-                gap(&mut graph, &mut segs, p.start - cursor);
+            let (first, end) = (to_frame(p.start, project).max(cursor), to_frame(p.end, project));
+            let frames = end - first;
+            if frames <= 0 {
+                // Shorter than a frame: it has no picture of its own.
+                continue;
+            }
+            if first > cursor {
+                let label = format!("vg{ti}_{}", segs.len());
+                graph.push(format!("{}[{label}]", blank(first - cursor)));
+                segs.push(label);
             }
             let len = p.end - p.start;
             let fades = fade_filters(p, r0, false);
             if p.clip.clip_type == ClipType::Title {
                 let Some(title) = &p.clip.title_data else { continue };
-                let file = std::env::temp_dir().join(format!("tempo-title-{}-{}.txt", std::process::id(), text_files.len()));
+                let file = std::env::temp_dir().join(format!("tempo-title-{}-{}-{}.txt", std::process::id(), r0, text_files.len()));
                 let label = format!("vc{ti}_{}", segs.len());
-                graph.push(format!(
-                    "color=c=black@0.0:s={w}x{h}:r={fps}:d={},format=rgba,{}{fades}[{label}]",
-                    secs(len),
-                    title_filter(title, &p.clip.properties, &file, sx, sy)
-                ));
+                graph.push(format!("{},{}{fades}[{label}]", blank(frames), title_filter(title, &p.clip.properties, &file, sx, sy)));
                 text_files.push((file, title.text.clone()));
                 segs.push(label);
-                cursor = p.end;
+                cursor = end;
                 continue;
             }
             let (path, media) = source_path(p.clip)?;
             if media == MediaType::Image {
                 inputs.extend(["-loop".into(), "1".into(), "-t".into(), secs(len)]);
             } else {
-                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len)]);
+                // One frame more than needed, so rounding never leaves the clip short.
+                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len + frame_time(1, project))]);
             }
             inputs.extend(["-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
@@ -251,7 +289,11 @@ pub fn build_ffmpeg_args(
             let label = format!("vc{ti}_{}", segs.len());
             // Blur radii are in pixels of a 1080-line picture.
             let effects = effect_filters(props, h as f32 / 1080.0);
-            let head = format!("[{idx}:v]fps={fps},{fit},setsar=1,format=rgba{effects},trim=duration={},setpts=PTS-STARTPTS", secs(len));
+            // If the file ends early its last picture is held, so the clip always
+            // gives exactly the frames the timeline has for it.
+            let head = format!(
+                "[{idx}:v]fps={fps},tpad=stop_mode=clone:stop_duration=2,{fit},setsar=1,format=rgba{effects},trim=end_frame={frames},setpts=PTS-STARTPTS"
+            );
             if is_default_transform(props) {
                 graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0{fades}[{label}]"));
             } else {
@@ -269,7 +311,7 @@ pub fn build_ffmpeg_args(
                 }
                 // Inspector positions are in project pixels; `sx`/`sy` scale them to the output size.
                 graph.push(format!("{chain}[{label}s]"));
-                graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps}:d={},format=rgba[{label}b]", secs(len)));
+                graph.push(format!("{}[{label}b]", blank(frames)));
                 graph.push(format!(
                     "[{label}b][{label}s]overlay=x=(W-w)/2+{:.2}:y=(H-h)/2+{:.2}:shortest=1,format=rgba{fades}[{label}]",
                     props.position_x * sx,
@@ -277,7 +319,10 @@ pub fn build_ffmpeg_args(
                 ));
             }
             segs.push(label);
-            cursor = p.end;
+            cursor = end;
+        }
+        if segs.is_empty() {
+            continue;
         }
         let out = format!("vt{ti}");
         if segs.len() == 1 {
@@ -289,7 +334,7 @@ pub fn build_ffmpeg_args(
         track_labels.push(out);
     }
 
-    graph.push(format!("color=c=black:s={w}x{h}:r={fps}:d={}[base0]", secs(total)));
+    graph.push(format!("color=c=black:s={w}x{h}:r={fps},trim=end_frame={}[base0]", to_frame(total, project).max(1)));
     let mut base = "base0".to_string();
     for (i, label) in track_labels.iter().enumerate() {
         let next = format!("base{}", i + 1);
@@ -361,8 +406,11 @@ pub fn build_ffmpeg_args(
         }
         audio_labels.push(out);
     }
-    let has_audio = !audio_labels.is_empty();
-    if has_audio {
+    let has_audio = !audio_labels.is_empty() || section == Some(true);
+    if audio_labels.is_empty() && has_audio {
+        // A silent part of an export that has sound elsewhere.
+        graph.push(format!("anullsrc=r=48000:cl=stereo,atrim=duration={}[aout]", secs(total)));
+    } else if has_audio {
         let joined: String = audio_labels.iter().map(|s| format!("[{s}]")).collect();
         graph.push(format!("{joined}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]", audio_labels.len()));
     }
@@ -377,7 +425,10 @@ pub fn build_ffmpeg_args(
         args.extend(["-i".into(), meta.to_string_lossy().into_owned(), "-map_metadata".into(), n_inputs.to_string()]);
     }
     args.extend(["-filter_complex".into(), graph.join(";"), "-map".into(), "[vout]".into()]);
-    if has_audio {
+    if has_audio && section.is_some() {
+        // Uncompressed in a section, so the joins are exact; encoded once at the end.
+        args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "pcm_s16le".into()]);
+    } else if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
     if e.hardware {
@@ -386,14 +437,71 @@ pub fn build_ffmpeg_args(
     } else {
         args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
     }
-    args.extend([
-        "-movflags".into(),
-        "+faststart".into(),
-        "-t".into(),
-        secs(total),
-        e.output.to_string_lossy().into_owned(),
-    ]);
+    if section.is_some() {
+        args.extend(["-f".into(), "matroska".into()]);
+    } else {
+        args.extend(["-movflags".into(), "+faststart".into()]);
+    }
+    args.extend(["-t".into(), secs(total), e.output.to_string_lossy().into_owned()]);
     Ok((args, total, text_files))
+}
+
+/// Most files one FFmpeg run may have open. Each costs about 25 MB with
+/// high-resolution footage, on top of about 500 MB for the run itself.
+const MAX_INPUTS: usize = 6;
+
+/// Split `[r0, r1)` into sections that each read at most `MAX_INPUTS` files.
+/// Sections meet at the output frame nearest a clip edge, and never inside a
+/// fade or dissolve, so a join is not visible or audible. One section means
+/// "no need to split".
+fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
+    let clips: Vec<&Clip> = project
+        .timeline
+        .tracks
+        .iter()
+        .filter(|t| t.enabled)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.properties.enabled && c.timeline_out > r0 && c.timeline_in < r1)
+        .collect();
+    let inputs = |a: i64, b: i64| clips.iter().filter(|c| c.clip_type != ClipType::Title && c.timeline_out > a && c.timeline_in < b).count();
+    if inputs(r0, r1) <= MAX_INPUTS {
+        return vec![(r0, r1)];
+    }
+    // Times a join must not fall inside.
+    let busy: Vec<(i64, i64)> = clips
+        .iter()
+        .flat_map(|c| {
+            let p = &c.properties;
+            [
+                (c.timeline_in, c.timeline_in + p.fade_in_us),
+                (c.timeline_out - p.fade_out_us, c.timeline_out),
+                (c.timeline_in - p.dissolve_in_us, c.timeline_in + p.dissolve_in_us),
+            ]
+        })
+        .filter(|(a, b)| b > a)
+        .collect();
+    let mut edges: Vec<i64> = clips
+        .iter()
+        .flat_map(|c| [c.timeline_in, c.timeline_out])
+        .map(|t| r0 + frame_time(to_frame(t - r0, project), project))
+        .filter(|t| *t > r0 && *t < r1 && !busy.iter().any(|(a, b)| t > a && t < b))
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    let mut sections = Vec::new();
+    let mut start = r0;
+    while inputs(start, r1) > MAX_INPUTS {
+        let mut later = edges.iter().copied().filter(|t| *t > start);
+        let Some(first) = later.next() else { break };
+        // The furthest edge that keeps the section within the limit; if even the
+        // nearest one does not (many tracks), take it anyway.
+        let end = later.take_while(|t| inputs(start, *t) <= MAX_INPUTS).last().unwrap_or(first);
+        sections.push((start, end));
+        start = end;
+    }
+    sections.push((start, r1));
+    sections
 }
 
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
@@ -423,18 +531,109 @@ fn run_ffmpeg(project: &Project, e: &TimelineExport, cancel: &AtomicBool, progre
     let metadata_file = if e.chapters.is_empty() {
         None
     } else {
-        let path = std::env::temp_dir().join(format!("tempo-chapters-{}.txt", std::process::id()));
+        // Numbered, so two exports in one process never share the file.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!("tempo-chapters-{}-{}.txt", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&path, ffmetadata(&e.chapters, range_len))?;
         Some(path)
     };
-    let (args, total, text_files) = build_ffmpeg_args(project, e, metadata_file.as_ref())?;
-    for (path, text) in &text_files {
+    let (r0, r1) = e.range.map(|(a, b)| (a.max(0), b.min(timeline_end))).unwrap_or((0, timeline_end));
+    let sections = plan_sections(project, r0, r1);
+    let result = if sections.len() > 1 {
+        run_sections(project, e, &sections, metadata_file.as_ref(), cancel, progress)
+    } else {
+        build_ffmpeg_args(project, e, metadata_file.as_ref()).and_then(|(args, total, text_files)| run_one(&args, total, &text_files, cancel, progress))
+    };
+    if let Some(meta) = metadata_file {
+        let _ = std::fs::remove_file(meta);
+    }
+    let cancelled = cancel.load(Ordering::Relaxed);
+    if result.is_err() || cancelled {
+        let _ = std::fs::remove_file(&e.output);
+    }
+    if cancelled {
+        return Err(ExportError::Ffmpeg("Cancelled".into()));
+    }
+    result?;
+    progress(1.0);
+    Ok(())
+}
+
+/// Render each section to a file beside the output, then join them. The picture
+/// is copied as it is; only the sound is encoded in the joining step.
+fn run_sections(
+    project: &Project,
+    e: &TimelineExport,
+    sections: &[(i64, i64)],
+    metadata_file: Option<&PathBuf>,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+) -> Result<()> {
+    let dir = e.output.with_extension("parts");
+    std::fs::create_dir_all(&dir)?;
+    let result = render_and_join(project, e, sections, metadata_file, &dir, cancel, progress);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn render_and_join(
+    project: &Project,
+    e: &TimelineExport,
+    sections: &[(i64, i64)],
+    metadata_file: Option<&PathBuf>,
+    dir: &std::path::Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+) -> Result<()> {
+    let (r0, r1) = (sections[0].0, sections[sections.len() - 1].1);
+    let whole = (r1 - r0).max(1) as f32;
+    let has_audio = project
+        .timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Audio && t.enabled)
+        .flat_map(|t| t.clips.iter())
+        .any(|c| c.properties.enabled && c.clip_type == ClipType::Audio && c.timeline_out > r0 && c.timeline_in < r1);
+
+    let mut list = String::new();
+    for (i, (a, b)) in sections.iter().enumerate() {
+        let name = format!("{i:05}.mkv");
+        let part = TimelineExport { range: Some((*a, *b)), chapters: Vec::new(), output: dir.join(&name), ..e.clone() };
+        let (args, total, text_files) = build_args(project, &part, None, Some(has_audio))?;
+        // Rendering is nearly all of the work; the last 2 % is the join.
+        let (done, share) = ((*a - r0) as f32 / whole, (*b - *a) as f32 / whole);
+        run_one(&args, total, &text_files, cancel, &mut |f| progress((done + f * share) * 0.98))?;
+        // Names are relative to the list, so no path needs escaping.
+        list.push_str(&format!("file '{name}'\n"));
+    }
+    let list_file = dir.join("list.txt");
+    std::fs::write(&list_file, list)?;
+
+    let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-nostats".into(), "-progress".into(), "pipe:1".into()];
+    args.extend(["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), list_file.to_string_lossy().into_owned()]);
+    if let Some(meta) = metadata_file {
+        args.extend(["-i".into(), meta.to_string_lossy().into_owned(), "-map_metadata".into(), "1".into()]);
+    }
+    args.extend(["-map".into(), "0:v:0".into(), "-c:v".into(), "copy".into()]);
+    if has_audio {
+        args.extend(["-map".into(), "0:a:0".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
+    }
+    args.extend(["-movflags".into(), "+faststart".into(), e.output.to_string_lossy().into_owned()]);
+    run_one(&args, r1 - r0, &[], cancel, &mut |f| progress(0.98 + f * 0.02))
+}
+
+/// Run FFmpeg once and follow its progress. The title text files are written
+/// first and removed afterwards.
+fn run_one(args: &[String], total: i64, text_files: &[(PathBuf, String)], cancel: &AtomicBool, progress: &mut dyn FnMut(f32)) -> Result<()> {
+    for (path, text) in text_files {
         std::fs::write(path, text)?;
     }
 
     let mut command = Command::new("ffmpeg");
-    command.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::ffmpeg::die_with_parent(&mut command);
+    // Leave the processor to the interface when both want it.
+    crate::ffmpeg::low_priority(&mut command, 10);
     let mut child = command
         .spawn()
         .map_err(|err| ExportError::Ffmpeg(format!("Could not start ffmpeg: {err}")))?;
@@ -464,24 +663,18 @@ fn run_ffmpeg(project: &Project, e: &TimelineExport, cancel: &AtomicBool, progre
     }
     let status = child.wait()?;
     let stderr_text = errors.join().unwrap_or_default();
-    if let Some(meta) = metadata_file {
-        let _ = std::fs::remove_file(meta);
-    }
-    for (path, _) in &text_files {
+    for (path, _) in text_files {
         let _ = std::fs::remove_file(path);
     }
 
     if cancelled || cancel.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&e.output);
         return Err(ExportError::Ffmpeg("Cancelled".into()));
     }
     if !status.success() {
-        let _ = std::fs::remove_file(&e.output);
         let reason = stderr_text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("FFmpeg failed").to_string();
         tracing::error!("ffmpeg export failed:\n{stderr_text}");
         return Err(ExportError::Ffmpeg(reason));
     }
-    progress(1.0);
     Ok(())
 }
 
@@ -644,6 +837,88 @@ mod tests {
             assert!(out.exists());
             let _ = std::fs::remove_file(&out);
         }
+    }
+
+    /// Nine frames at 30 fps, on the timeline's frame grid.
+    const CUT: i64 = 9 * 33_333;
+
+    /// A timeline of `n` clips of nine frames, picture and sound, with a gap in the middle.
+    fn project_with_many_cuts(path: PathBuf, n: i64) -> Project {
+        let mut project = project_with_clip(path);
+        for track in &mut project.timeline.tracks {
+            track.clips.clear();
+        }
+        let source = *project.sources.keys().next().unwrap();
+        let v = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).unwrap();
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        for i in 0..n {
+            // Clip 7 is left out to make a gap.
+            if i == 7 {
+                continue;
+            }
+            for (track, kind) in [(v, ClipType::Video), (a, ClipType::Audio)] {
+                let clip = Clip::new(track, source, kind, "c", i * CUT, (i + 1) * CUT, i * 100_000, i * 100_000 + CUT);
+                project.timeline.find_track_mut(track).unwrap().clips.push(clip);
+            }
+        }
+        project
+    }
+
+    #[test]
+    fn a_long_cut_is_planned_in_sections_that_avoid_fades() {
+        let mut project = project_with_many_cuts(PathBuf::from("/nonexistent.mp4"), 30);
+        let end = 30 * CUT;
+        // Few clips: one section. Many: several, covering the range with no holes.
+        assert_eq!(plan_sections(&project, 0, 3 * CUT), vec![(0, 3 * CUT)]);
+        let sections = plan_sections(&project, 0, end);
+        assert!(sections.len() >= 4, "{sections:?}");
+        assert_eq!((sections[0].0, sections[sections.len() - 1].1), (0, end));
+        assert!(sections.windows(2).all(|w| w[0].1 == w[1].0 && w[0].1 > w[0].0));
+        // No section reads more than the limit.
+        for (a, b) in &sections {
+            let inputs = project.timeline.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.timeline_out > *a && c.timeline_in < *b).count();
+            assert!(inputs <= MAX_INPUTS, "{inputs} inputs in {a}..{b}");
+        }
+        // A join never lands inside a fade: fade every clip across its edges and
+        // the only places left are the two sides of the gap.
+        for track in &mut project.timeline.tracks {
+            for clip in &mut track.clips {
+                clip.properties.dissolve_in_us = 100_000;
+            }
+        }
+        let joins: Vec<i64> = plan_sections(&project, 0, end).iter().skip(1).map(|s| s.0).collect();
+        assert!(!joins.is_empty() && joins.iter().all(|t| [63, 72].contains(&to_frame(*t, &project))), "{joins:?}");
+    }
+
+    #[test]
+    fn a_long_cut_exports_in_sections_with_picture_and_sound_in_step() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let project = project_with_many_cuts(path, 16);
+        assert!(plan_sections(&project, 0, 16 * CUT).len() > 1);
+        let out = std::env::temp_dir().join(format!("tempo-export-sections-{}.mp4", std::process::id()));
+        let mut e = settings(out.clone());
+        e.chapters = vec![Chapter { start_us: 0, title: "Intro".into() }, Chapter { start_us: 2_000_000, title: "Next".into() }];
+        let mut seen = Vec::new();
+        export_timeline(&project, &e, &AtomicBool::new(false), |p| seen.push(p)).unwrap();
+        assert_eq!(seen.last(), Some(&1.0));
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]), "progress never goes back");
+        assert!(!out.with_extension("parts").exists(), "the section files are removed");
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,duration,nb_frames", "-show_chapters", "-of", "default=nw=1"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let _ = std::fs::remove_file(&out);
+        assert!(text.contains("codec_name=h264") && text.contains("codec_name=aac") && text.contains("title=Next"), "{text}");
+        // 16 × 9 frames is 144; picture and sound are the same length.
+        assert!(text.contains("nb_frames=144"), "{text}");
+        let durations: Vec<f64> = text.lines().filter_map(|l| l.strip_prefix("duration=")).filter_map(|d| d.parse().ok()).collect();
+        assert!(durations.len() >= 2 && durations.iter().all(|d| (d - 4.8).abs() < 0.06), "{durations:?}");
     }
 
     #[test]

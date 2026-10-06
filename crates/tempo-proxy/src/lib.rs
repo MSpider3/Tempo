@@ -2,7 +2,9 @@
 //!
 //! A proxy is used only for preview. It is a quarter of the pixels of 1080p,
 //! has a keyframe twice a second so scrubbing is quick, and is made in the
-//! background at the lowest CPU priority. Export always reads the original.
+//! background at the lowest CPU priority, on one decoding and one encoding
+//! thread, and can be held while the editor needs the processor. Export
+//! always reads the original.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -29,12 +31,14 @@ pub fn needs_proxy(source: &MediaSource) -> bool {
 
 /// Make a proxy of `input` at `output`. Blocking: call from a worker thread.
 /// `progress` receives 0.0–1.0. Setting `cancel` stops the work; an unfinished
-/// file is never left at `output`.
+/// file is never left at `output`. While `hold` is set the work stands still
+/// and uses no processor time.
 pub fn generate_proxy(
     input: &Path,
     output: &Path,
     duration_us: i64,
     cancel: &AtomicBool,
+    hold: &AtomicBool,
     mut progress: impl FnMut(f32),
 ) -> Result<(), String> {
     if let Some(parent) = output.parent() {
@@ -44,28 +48,31 @@ pub fn generate_proxy(
     // half-written file that looks finished.
     let partial = output.with_extension("part.mp4");
 
-    let mut command = Command::new("nice");
+    let mut command = Command::new("ffmpeg");
     command
-        .args(["-n", "19", "ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i"])
+        // One thread to decode, one to scale, one to encode: about a third of a
+        // four-thread processor, measured, instead of nearly all of it.
+        .args(["-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-threads", "1", "-i"])
         .arg(input)
         // Picture only: sound is always read from the original file.
-        .args(["-map", "0:v:0", "-an", "-vf", &format!("scale=-2:{PROXY_HEIGHT}")])
+        .args(["-map", "0:v:0", "-an", "-filter_threads", "1", "-vf", &format!("scale=-2:{PROXY_HEIGHT}")])
         .args(tempo_export::ffmpeg::h264_args(28, 960, PROXY_HEIGHT, true))
         .args([
             "-pix_fmt", "yuv420p",
             // A keyframe every half second keeps seeking cheap.
             "-g", "15", "-bf", "0",
-            // Leave cores free for playback while the proxy is made.
-            "-threads", "2",
+            "-threads", "1",
         ])
         .arg(&partial)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     tempo_export::ffmpeg::die_with_parent(&mut command);
+    tempo_export::ffmpeg::low_priority(&mut command, 19);
     let mut child = command
         .spawn()
         .map_err(|e| format!("Could not start ffmpeg: {e}"))?;
+    let pid = child.id() as libc::pid_t;
 
     let stderr = child.stderr.take();
     let errors = std::thread::spawn(move || {
@@ -77,18 +84,40 @@ pub fn generate_proxy(
     });
 
     let mut cancelled = false;
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-            if cancel.load(Ordering::Relaxed) {
-                cancelled = true;
-                let _ = child.kill();
-                break;
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Holding and cancelling are done from here, because the loop below
+        // only wakes when FFmpeg writes a line, which a held FFmpeg never does.
+        scope.spawn(|| {
+            let signal = |sig| {
+                // SAFETY: the child is not waited for until this scope ends, so
+                // the process id still belongs to it.
+                unsafe { libc::kill(pid, sig) };
+            };
+            let mut held = false;
+            while !finished.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) {
+                    signal(libc::SIGKILL);
+                    return;
+                }
+                let want = hold.load(Ordering::Relaxed);
+                if want != held {
+                    signal(if want { libc::SIGSTOP } else { libc::SIGCONT });
+                    held = want;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
             }
-            if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
-                progress((us as f32 / duration_us.max(1) as f32).clamp(0.0, 1.0));
+        });
+        if let Some(stdout) = child.stdout.take() {
+            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+                if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
+                    progress((us as f32 / duration_us.max(1) as f32).clamp(0.0, 1.0));
+                }
             }
         }
-    }
+        finished.store(true, Ordering::Relaxed);
+    });
+    cancelled |= cancel.load(Ordering::Relaxed);
     let status = child.wait().map_err(|e| e.to_string())?;
     let stderr_text = errors.join().unwrap_or_default();
 
@@ -111,7 +140,7 @@ pub struct ProxyEngine;
 
 impl ProxyEngine {
     pub fn generate_proxy_sync(input: &Path, output: &Path) -> Result<(), String> {
-        generate_proxy(input, output, 1, &AtomicBool::new(false), |_| {})
+        generate_proxy(input, output, 1, &AtomicBool::new(false), &AtomicBool::new(false), |_| {})
     }
 }
 
@@ -145,7 +174,7 @@ mod tests {
         let Some(input) = media("sample_1080p_h264.mp4") else { return };
         let output = std::env::temp_dir().join(format!("tempo-proxy-test-{}.mp4", std::process::id()));
         let mut last = 0.0;
-        generate_proxy(&input, &output, 5_000_000, &AtomicBool::new(false), |p| last = p).expect("proxy");
+        generate_proxy(&input, &output, 5_000_000, &AtomicBool::new(false), &AtomicBool::new(false), |p| last = p).expect("proxy");
         assert_eq!(last, 1.0);
         let probe = Command::new("ffprobe")
             .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,height", "-of", "default=nw=1"])
@@ -158,10 +187,30 @@ mod tests {
     }
 
     #[test]
+    fn a_held_proxy_waits_and_can_still_be_cancelled() {
+        let Some(input) = media("sample_10s_sync.mp4") else { return };
+        let output = std::env::temp_dir().join(format!("tempo-proxy-hold-{}.mp4", std::process::id()));
+        let (cancel, hold) = (AtomicBool::new(false), AtomicBool::new(true));
+        let started = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            // Held from the start: nothing may finish. Then cancel while it is held.
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                assert!(!output.exists(), "a held proxy must not finish");
+                cancel.store(true, Ordering::Relaxed);
+            });
+            generate_proxy(&input, &output, 12_000_000, &cancel, &hold, |_| {})
+        });
+        assert_eq!(result, Err("Cancelled".to_string()));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
+        assert!(!output.exists() && !output.with_extension("part.mp4").exists());
+    }
+
+    #[test]
     fn cancel_leaves_no_file() {
         let Some(input) = media("sample_1080p_h264.mp4") else { return };
         let output = std::env::temp_dir().join(format!("tempo-proxy-cancel-{}.mp4", std::process::id()));
-        assert!(generate_proxy(&input, &output, 5_000_000, &AtomicBool::new(true), |_| {}).is_err());
+        assert!(generate_proxy(&input, &output, 5_000_000, &AtomicBool::new(true), &AtomicBool::new(false), |_| {}).is_err());
         assert!(!output.exists() && !output.with_extension("part.mp4").exists());
     }
 }

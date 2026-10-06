@@ -504,12 +504,18 @@ impl Track {
 
     /// The lead-in of a clip that is dissolving in at `position_us`, if any.
     pub fn dissolve_lead_at(&self, position_us: i64) -> Option<Clip> {
-        self.clips.iter().filter_map(Clip::dissolve_lead).find(|lead| lead.contains_point(position_us))
+        self.dissolve_leads().into_iter().find(|lead| lead.contains_point(position_us))
     }
 
-    /// Every dissolve lead-in on this track, as clips.
+    /// Every dissolve lead-in on this track, as clips. A dissolve needs a clip
+    /// to dissolve from: if the clip before was moved or deleted, there is none.
     pub fn dissolve_leads(&self) -> Vec<Clip> {
-        self.clips.iter().filter_map(Clip::dissolve_lead).collect()
+        self.clips.iter().filter(|c| self.has_clip_ending_at(c.timeline_in)).filter_map(Clip::dissolve_lead).collect()
+    }
+
+    /// True when a clip on this track ends exactly at `position_us`.
+    pub fn has_clip_ending_at(&self, position_us: i64) -> bool {
+        self.clips.iter().any(|c| c.timeline_out == position_us)
     }
 
     pub fn has_collision(&self, start_us: i64, end_us: i64, ignore_clip_id: Option<Uuid>) -> bool {

@@ -32,6 +32,11 @@
   </requires>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.1.1" date="2026-10-06" type="development">
+      <description>
+        <p>Alpha. Right-click menus, selectable gaps, a preview quality button, linked cuts, and many fixes from the first hands-on test.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-05">
       <description>
         <p>First release of the Rust rewrite.</p>
