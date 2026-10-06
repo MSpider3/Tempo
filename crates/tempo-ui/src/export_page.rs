@@ -72,6 +72,10 @@ pub struct ExportPage {
     chapters: gtk::CheckButton,
     range: gtk::DropDown,
     format_index: Cell<usize>,
+    /// The format toggles, in the order of `FORMATS`.
+    format_buttons: RefCell<Vec<gtk::ToggleButton>>,
+    /// When the current run was started, to ignore a double click on the button.
+    started: Cell<Option<std::time::Instant>>,
     jobs: RefCell<Vec<Job>>,
     queue_box: gtk::Box,
     render_all: gtk::Button,
@@ -179,6 +183,8 @@ impl ExportPage {
             chapters,
             range,
             format_index: Cell::new(0),
+            format_buttons: RefCell::new(Vec::new()),
+            started: Cell::new(None),
             jobs: RefCell::new(Vec::new()),
             queue_box,
             render_all,
@@ -203,6 +209,7 @@ impl ExportPage {
                 }
             });
             strip.append(&button);
+            page.format_buttons.borrow_mut().push(button);
         }
 
         let p = page.clone();
@@ -250,6 +257,20 @@ impl ExportPage {
         if self.location.text().is_empty() {
             let dir = glib::user_special_dir(glib::UserDirectory::Videos).unwrap_or_else(glib::home_dir);
             self.location.set_text(&dir.to_string_lossy());
+        }
+        // Start from the shape of the project: a vertical project exports
+        // vertical, a 4K one in 4K. Shapes are compared by cross-multiplying.
+        if let Some((w, h)) = self.state.with_project(|p| (p.width as u64, p.height as u64)) {
+            let same_shape = |f: &Format| f.width as u64 * h == f.height as u64 * w;
+            let best = FORMATS
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| same_shape(f))
+                .min_by_key(|(_, f)| (f.height as i64 - h as i64).abs())
+                .map(|(i, _)| i);
+            if let Some(button) = best.and_then(|i| self.format_buttons.borrow().get(i).cloned()) {
+                button.set_active(true);
+            }
         }
         self.update_free_space();
         self.refresh_settings();
@@ -350,20 +371,32 @@ impl ExportPage {
 
     fn render_all_clicked(self: &Rc<Self>) {
         if self.is_rendering() {
-            // The button reads "Stop" while a job runs.
-            for job in self.jobs.borrow().iter().filter(|j| j.status == Status::Rendering) {
-                job.cancel.store(true, Ordering::Relaxed);
+            // The button reads "Stop" while a job runs. The second click of a
+            // double click on "Render All" must not stop what the first started.
+            if self.started.get().is_some_and(|t| t.elapsed() < Duration::from_millis(700)) {
+                return;
             }
-            for job in self.jobs.borrow_mut().iter_mut().filter(|j| j.status == Status::Waiting) {
-                job.status = Status::Cancelled;
-            }
+            self.cancel_all();
         } else {
+            self.started.set(Some(std::time::Instant::now()));
             self.start_next();
         }
     }
 
+    /// Stop the running job and drop the ones waiting.
+    pub fn cancel_all(self: &Rc<Self>) {
+        for job in self.jobs.borrow().iter().filter(|j| j.status == Status::Rendering) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        for job in self.jobs.borrow_mut().iter_mut().filter(|j| j.status == Status::Waiting) {
+            job.status = Status::Cancelled;
+        }
+        self.rebuild_queue();
+    }
+
     pub fn render_all(self: &Rc<Self>) {
         if !self.is_rendering() {
+            self.started.set(Some(std::time::Instant::now()));
             self.start_next();
         }
     }

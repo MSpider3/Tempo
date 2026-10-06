@@ -100,6 +100,9 @@ impl CommandLog {
 pub struct InsertClipCommand {
     clip: Clip,
     ripple: bool,
+    /// Id for the second part of a clip the insert cuts in two. Chosen once, so
+    /// undo and redo always give that part the same id.
+    right_id: Uuid,
     previous_clips: Option<Vec<Clip>>,
     description: String,
 }
@@ -110,6 +113,7 @@ impl InsertClipCommand {
         Self {
             clip,
             ripple: false,
+            right_id: Uuid::new_v4(),
             previous_clips: None,
             description: desc,
         }
@@ -120,6 +124,7 @@ impl InsertClipCommand {
         Self {
             clip,
             ripple: true,
+            right_id: Uuid::new_v4(),
             previous_clips: None,
             description: desc,
         }
@@ -172,10 +177,14 @@ impl Command for InsertClipCommand {
                     let left_dur = insert_in - old.timeline_in;
                     left.timeline_out = insert_in;
                     left.source_out = left.source_in + left_dur;
+                    // As with a split, each fade stays at its own end.
+                    left.properties.fade_out_us = 0;
                     new_clips.push(left);
 
                     let mut right = old.clone();
-                    right.id = Uuid::new_v4();
+                    right.id = self.right_id;
+                    right.properties.fade_in_us = 0;
+                    right.properties.dissolve_in_us = 0;
                     right.timeline_in = insert_in + insert_dur;
                     right.timeline_out = old.timeline_out + insert_dur;
                     right.source_in = old.source_in + left_dur;
@@ -471,11 +480,16 @@ impl TrimClipCommand {
 
 impl Command for TrimClipCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
-        let (track_id, (tin, tout, sin, sout)) = {
+        let (track_id, (tin, tout, sin, sout), still) = {
             let (track, clip) = timeline
                 .find_clip(self.clip_id)
                 .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
-            (track.id, (clip.timeline_in, clip.timeline_out, clip.source_in, clip.source_out))
+            if track.locked {
+                return Err(TimelineError::TrackLocked(track.id));
+            }
+            // Titles and still pictures have no footage to run out of.
+            let still = matches!(clip.clip_type, ClipType::Title | ClipType::Image);
+            (track.id, (clip.timeline_in, clip.timeline_out, clip.source_in, clip.source_out), still)
         };
         self.saved_timeline_in = tin;
         self.saved_timeline_out = tout;
@@ -486,18 +500,26 @@ impl Command for TrimClipCommand {
             TrimEdge::In => {
                 let n_tin = tin + self.delta_us;
                 let n_sin = sin + self.delta_us;
-                if n_tin >= tout || n_sin < 0 {
+                if n_tin >= tout || n_tin < 0 || (n_sin < 0 && !still) {
                     return Err(TimelineError::InvalidTimeRange(n_tin, tout));
                 }
-                (n_tin, tout, n_sin, sout)
+                if still {
+                    (n_tin, tout, 0, tout - n_tin)
+                } else {
+                    (n_tin, tout, n_sin, sout)
+                }
             }
             TrimEdge::Out => {
                 let n_tout = tout + self.delta_us;
                 let n_sout = sout + self.delta_us;
-                if n_tout <= tin || n_sout <= sin {
+                if n_tout <= tin || (n_sout <= sin && !still) {
                     return Err(TimelineError::InvalidTimeRange(tin, n_tout));
                 }
-                (tin, n_tout, sin, n_sout)
+                if still {
+                    (tin, n_tout, 0, n_tout - tin)
+                } else {
+                    (tin, n_tout, sin, n_sout)
+                }
             }
         };
 
@@ -562,6 +584,9 @@ pub struct SplitClipCommand {
     second_clip_id: Uuid,
     original_timeline_out: i64,
     original_source_out: i64,
+    original_fade_out: i64,
+    /// Link id for the part after the cut, when it should differ from the first part's.
+    second_link: Option<Uuid>,
     description: String,
 }
 
@@ -574,8 +599,18 @@ impl SplitClipCommand {
             second_clip_id: Uuid::new_v4(),
             original_timeline_out: 0,
             original_source_out: 0,
+            original_fade_out: 0,
+            second_link: None,
             description: "Split clip".to_string(),
         }
+    }
+
+    /// Give the part after the cut this link id. Used when a picture and its
+    /// sound are cut together: the two later halves become a linked pair of
+    /// their own instead of staying tied to the earlier halves.
+    pub fn with_second_link(mut self, link: Uuid) -> Self {
+        self.second_link = Some(link);
+        self
     }
 
     pub fn second_clip_id(&self) -> Uuid {
@@ -611,6 +646,17 @@ impl Command for SplitClipCommand {
         let delta = self.split_time_us - clip.timeline_in;
         let split_source = clip.source_in + delta;
 
+        // A fade belongs to the end of the clip it was put on: the fade in stays
+        // with the first part and the fade out goes with the second.
+        self.original_fade_out = clip.properties.fade_out_us;
+        let mut second_properties = clip.properties.clone();
+        second_properties.fade_in_us = 0;
+        second_properties.dissolve_in_us = 0;
+        if let Some(link) = self.second_link {
+            second_properties.link = Some(link);
+        }
+        clip.properties.fade_out_us = 0;
+
         let second_clip = Clip {
             id: self.second_clip_id,
             track_id: self.track_id,
@@ -621,7 +667,7 @@ impl Command for SplitClipCommand {
             timeline_out: self.original_timeline_out,
             source_in: split_source,
             source_out: self.original_source_out,
-            properties: clip.properties.clone(),
+            properties: second_properties,
             title_data: clip.title_data.clone(),
         };
 
@@ -655,6 +701,7 @@ impl Command for SplitClipCommand {
             .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
         first.timeline_out = self.original_timeline_out;
         first.source_out = self.original_source_out;
+        first.properties.fade_out_us = self.original_fade_out;
 
         track.sort_clips();
         Ok(())
@@ -703,6 +750,9 @@ impl SetClipPropertyCommand {
 
 impl Command for SetClipPropertyCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        if let Some((track, _)) = timeline.find_clip(self.clip_id).filter(|(track, _)| track.locked) {
+            return Err(TimelineError::TrackLocked(track.id));
+        }
         let clip = timeline
             .find_clip_mut(self.clip_id)
             .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
@@ -969,6 +1019,9 @@ impl Command for RippleDeleteCommand {
 #[derive(Debug, Clone)]
 pub struct OverwriteClipCommand {
     clip: Clip,
+    /// Id for the second part of a clip the new one lands in the middle of.
+    /// Chosen once, so undo and redo always give that part the same id.
+    right_id: Uuid,
     previous_clips: Option<Vec<Clip>>,
     description: String,
 }
@@ -978,6 +1031,7 @@ impl OverwriteClipCommand {
         let desc = format!("Overwrite clip '{}'", clip.name);
         Self {
             clip,
+            right_id: Uuid::new_v4(),
             previous_clips: None,
             description: desc,
         }
@@ -1017,10 +1071,13 @@ impl Command for OverwriteClipCommand {
                 let left_dur = new_in - old.timeline_in;
                 left.timeline_out = new_in;
                 left.source_out = left.source_in + left_dur;
+                left.properties.fade_out_us = 0;
                 new_track_clips.push(left);
 
                 let mut right = old.clone();
-                right.id = Uuid::new_v4();
+                right.id = self.right_id;
+                right.properties.fade_in_us = 0;
+                right.properties.dissolve_in_us = 0;
                 let cut_offset = new_out - old.timeline_in;
                 right.timeline_in = new_out;
                 right.source_in = old.source_in + cut_offset;
@@ -1445,6 +1502,9 @@ impl EditClipCommand {
 
 impl Command for EditClipCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        if let Some((track, _)) = timeline.find_clip(self.after.id).filter(|(track, _)| track.locked) {
+            return Err(TimelineError::TrackLocked(track.id));
+        }
         let clip = timeline.find_clip_mut(self.after.id).ok_or(TimelineError::ClipNotFound(self.after.id))?;
         self.before = Some(std::mem::replace(clip, self.after.clone()));
         Ok(())
@@ -1966,6 +2026,100 @@ mod tests {
         let (_, c) = timeline.find_clip(clip_id).unwrap();
         assert_eq!(c.timeline_in, 0);
         assert_eq!(c.timeline_out, 4_000_000);
+    }
+
+    #[test]
+    fn split_shares_out_fades_and_can_relink_the_second_part() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let mut clip = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "test", 0, 4_000_000, 0, 4_000_000);
+        let (old_link, new_link) = (Uuid::new_v4(), Uuid::new_v4());
+        clip.properties.fade_in_us = 500_000;
+        clip.properties.fade_out_us = 700_000;
+        clip.properties.link = Some(old_link);
+        let clip_id = clip.id;
+        let before = clip.clone();
+        timeline.tracks[0].clips.push(clip);
+
+        let mut cmd = SplitClipCommand::new(track_id, clip_id, 2_000_000).with_second_link(new_link);
+        cmd.execute(&mut timeline).unwrap();
+        let first = timeline.find_clip(clip_id).unwrap().1.properties.clone();
+        let second = timeline.find_clip(cmd.second_clip_id()).unwrap().1.properties.clone();
+        // The fade in stays at the start, the fade out moves to the new end.
+        assert_eq!((first.fade_in_us, first.fade_out_us, first.link), (500_000, 0, Some(old_link)));
+        assert_eq!((second.fade_in_us, second.fade_out_us, second.link), (0, 700_000, Some(new_link)));
+
+        cmd.undo(&mut timeline).unwrap();
+        assert_eq!(timeline.find_clip(clip_id).unwrap().1, &before);
+    }
+
+    #[test]
+    fn overwrite_in_the_middle_can_be_redone_after_later_edits_are_undone() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let mut base = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "base", 0, 9_000_000, 0, 9_000_000);
+        base.properties.fade_in_us = 300_000;
+        base.properties.fade_out_us = 400_000;
+        timeline.tracks[0].clips.push(base);
+        let middle = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "new", 3_000_000, 6_000_000, 0, 3_000_000);
+
+        let mut log = crate::CommandLog::new();
+        log.execute(Box::new(OverwriteClipCommand::new(middle)), &mut timeline).unwrap();
+        let right = timeline.tracks[0].clips.iter().find(|c| c.timeline_in == 6_000_000).unwrap().clone();
+        // The two remaining parts share the fades between them.
+        let left = timeline.tracks[0].clips.iter().find(|c| c.timeline_in == 0).unwrap();
+        assert_eq!((left.properties.fade_in_us, left.properties.fade_out_us), (300_000, 0));
+        assert_eq!((right.properties.fade_in_us, right.properties.fade_out_us), (0, 400_000));
+
+        // Edit the right part, undo both steps, redo both: the edit must find its clip again.
+        log.execute(Box::new(TrimClipCommand::new(right.id, TrimEdge::Out, -1_000_000)), &mut timeline).unwrap();
+        log.undo(&mut timeline).unwrap();
+        log.undo(&mut timeline).unwrap();
+        log.redo(&mut timeline).unwrap();
+        log.redo(&mut timeline).unwrap();
+        assert_eq!(timeline.find_clip(right.id).unwrap().1.timeline_out, 8_000_000);
+    }
+
+    #[test]
+    fn locked_tracks_refuse_trims_and_property_changes_and_stills_trim_freely() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let title = Clip::new(track_id, Uuid::nil(), ClipType::Title, "title", 2_000_000, 4_000_000, 0, 2_000_000);
+        let id = title.id;
+        timeline.tracks[0].clips.push(title);
+
+        // A title has no footage before its start, yet its start can be pulled earlier.
+        TrimClipCommand::new(id, TrimEdge::In, -1_000_000).execute(&mut timeline).unwrap();
+        let clip = timeline.find_clip(id).unwrap().1;
+        assert_eq!((clip.timeline_in, clip.source_in, clip.source_out), (1_000_000, 0, 3_000_000));
+        // But not before the start of the timeline.
+        assert!(TrimClipCommand::new(id, TrimEdge::In, -5_000_000).execute(&mut timeline).is_err());
+
+        timeline.tracks[0].locked = true;
+        assert!(matches!(TrimClipCommand::new(id, TrimEdge::Out, 500_000).execute(&mut timeline), Err(TimelineError::TrackLocked(_))));
+        assert!(matches!(
+            SetClipPropertyCommand::new(id, PropertyChange::Opacity(0.5)).execute(&mut timeline),
+            Err(TimelineError::TrackLocked(_))
+        ));
+        let mut edited = timeline.find_clip(id).unwrap().1.clone();
+        edited.properties.fade_in_us = 100_000;
+        assert!(matches!(EditClipCommand::new("Fade", edited).execute(&mut timeline), Err(TimelineError::TrackLocked(_))));
+    }
+
+    #[test]
+    fn a_dissolve_needs_a_clip_to_dissolve_from() {
+        let mut timeline = Timeline::new_default();
+        let track_id = timeline.tracks[0].id;
+        let first = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 0, 2_000_000);
+        let mut second = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "b", 2_000_000, 4_000_000, 1_000_000, 3_000_000);
+        second.properties.dissolve_in_us = 500_000;
+        let first_id = first.id;
+        timeline.tracks[0].clips.extend([first, second]);
+        assert_eq!(timeline.tracks[0].dissolve_leads().len(), 1);
+        // With the first clip gone there is nothing to dissolve from.
+        timeline.tracks[0].clips.retain(|c| c.id != first_id);
+        assert!(timeline.tracks[0].dissolve_leads().is_empty());
+        assert!(timeline.tracks[0].dissolve_lead_at(1_800_000).is_none());
     }
 
     #[test]

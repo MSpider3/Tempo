@@ -24,6 +24,17 @@ The file was exported on a system where it notes `Ctrl` may mean Command (macOS)
 
 ---
 
+> **Not built yet (2026-10-06).** These rows are reserved and documented but do nothing in
+> the program: `win.play-again`, `win.loop-toggle`, `win.play-around`,
+> `win.play-in-to-out`, `win.scrub-audio-toggle`, `win.mark-selection`,
+> `win.edit-ripple-overwrite`, `win.join-clip`, `win.paste-insert`,
+> `win.select-track-after`, `win.select-all-after`, `win.select-track-before`,
+> `win.select-all-before`, `win.transition-add-video`, `win.transition-add-audio`,
+> `win.select-edit-point`, `win.viewer-fit`, `win.viewer-actual-size`,
+> `win.viewer-full-page`, `win.focus-source-viewer`, `win.focus-timeline-viewer`,
+> `win.project-settings`, `app.save-as`, `win.new-bin`. Everything else in this file is
+> bound in `assets/keybinds/keybinds.json`.
+
 ## 2. Playback
 
 | Key | Action | Tempo action | Resolve command |
@@ -32,9 +43,9 @@ The file was exported on a system where it notes `Ctrl` may mean Command (macOS)
 | `L` | Play forward; press again for 2×, 4×, 8× | `win.play-forward` | `controlPlayForward` |
 | `J` | Play reverse; press again for 2×, 4×, 8× | `win.play-reverse` | `controlPlayReverse` |
 | `K` | Stop | `win.stop` | `controlStop` |
-| `Shift+L` | Fast forward | `win.fast-forward` | `controlFastForward` |
-| `Shift+J` | Fast reverse | `win.fast-reverse` | `controlFastReverse` |
-| `Shift+K` | Play slow | `win.play-slow` | `controlPlaySlow` |
+| `Shift+L` | Faster forward: each press is one step up through −8×, −4×, −2×, −1×, stop, 1×, 2×, 4×, 8× (from a stop it starts at 2×) | `win.fast-forward` | `controlFastForward` |
+| `Shift+J` | Faster reverse: each press is one step down the same list (from a stop it starts at −2×) | `win.fast-reverse` | `controlFastReverse` |
+| `Shift+K` | Play at half speed (no sound) | `win.play-slow` | `controlPlaySlow` |
 | `Alt+L` | Play again | `win.play-again` | `controlPlayAgain` |
 | `→` / `←` | One frame forward / back | `win.step-forward` / `win.step-reverse` | `controlStepForward` / `controlStepReverse` |
 | `Shift+→` / `Shift+←` | One second forward / back | `win.large-step-forward` / `win.large-step-reverse` | `controlLargeStepForward` / `…Reverse` |

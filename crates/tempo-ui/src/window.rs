@@ -85,6 +85,7 @@ impl MainWindow {
         let menu = gio::Menu::new();
         let file = gio::Menu::new();
         file.append(Some("Import Media…"), Some("win.import-media"));
+        file.append(Some("Relink Missing Media…"), Some("win.relink-media"));
         file.append(Some("Save"), Some("win.save"));
         menu.append_section(None, &file);
         let edit_menu = gio::Menu::new();
@@ -241,7 +242,15 @@ impl MainWindow {
         win.connect_signals(&home, &quick_export);
         win.install_actions();
         let w = win.clone();
-        keybinds::install(&win.window, move |action| w.run_action(action));
+        keybinds::install(&win.window, move |action| {
+            // Outside a project only a few keys mean anything; the rest are left
+            // for the Project Manager's own list and fields.
+            let used = w.in_project() || matches!(action, "app.quit" | "win.show-shortcuts" | "app.preferences");
+            if used {
+                w.run_action(action);
+            }
+            used
+        });
         win.start();
         win
     }
@@ -273,7 +282,11 @@ impl MainWindow {
         quick_export.connect_clicked(move |_| w.run_action("win.quick-export"));
 
         let w = self.clone();
-        self.export.connect_activity(move |text| w.activity.set_text(text.as_deref().unwrap_or("")));
+        self.export.connect_activity(move |text| {
+            // An export wants the whole processor: proxy work waits for it.
+            w.proxies.set_busy(text.is_some());
+            w.activity.set_text(text.as_deref().unwrap_or(""));
+        });
         // Export progress takes the status line; proxy progress shows when no export runs.
         let w = self.clone();
         self.proxies.connect_activity(move |text| {
@@ -342,11 +355,20 @@ impl MainWindow {
             }
         });
         self.window.add_action(&run_plugin);
+        // Right-click menus name the action to run, the same names the keys use.
+        let run = gio::SimpleAction::new("do", Some(glib::VariantTy::STRING));
+        let w = self.clone();
+        run.connect_activate(move |_, target| {
+            if let Some(action) = target.and_then(|t| t.str()) {
+                w.run_action(action);
+            }
+        });
+        self.window.add_action(&run);
         let w = self.clone();
         self.plugins.connect_changed(move || w.refresh_plugin_menu());
         self.refresh_plugin_menu();
 
-        for name in ["import-media", "save", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
+        for name in ["import-media", "relink-media", "save", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
@@ -382,6 +404,8 @@ impl MainWindow {
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
             *w.state.settings.borrow_mut() = settings;
+            // The viewer shows the saved preview quality.
+            w.state.emit(Change::Options);
             w.plugins.reload();
             w.loading_status.set_text("OPENING PROJECTS");
             match std::env::var_os("TEMPO_OPEN").map(PathBuf::from) {
@@ -443,7 +467,16 @@ impl MainWindow {
                         "Tempo found changes that were not saved the last time this project was open.",
                         "Restore",
                         "Discard",
-                        move |restore| w2.load_project(path2.clone(), restore.then(|| auto.clone())),
+                        move |restore| {
+                            if !restore {
+                                // Discarded for good, so the question is not asked again next time.
+                                let stale = path2.clone();
+                                glib::MainContext::default().spawn_local(async move {
+                                    let _ = gio::spawn_blocking(move || tempo_project::remove_autosave(&stale)).await;
+                                });
+                            }
+                            w2.load_project(path2.clone(), restore.then(|| auto.clone()));
+                        },
                     );
                 }
                 None => w.load_project(path, None),
@@ -457,14 +490,20 @@ impl MainWindow {
         glib::MainContext::default().spawn_local(async move {
             let read_from = from.clone().unwrap_or_else(|| path.clone());
             let remember_path = path.clone();
-            let loaded = gio::spawn_blocking(move || {
-                tempo_project::load_project(&read_from).map(|mut project| {
-                    for source in project.sources.values_mut() {
-                        source.is_missing = !source.path.exists();
-                    }
-                    project_manager::remember(&project.name, &remember_path);
-                    project
-                })
+            let loaded = gio::spawn_blocking(move || -> Result<Project, String> {
+                // Opening a path that is not there would create an empty file at it.
+                if !read_from.is_file() {
+                    return Err("its file was moved or deleted. Right-click it in the list to remove it.".into());
+                }
+                tempo_project::load_project(&read_from)
+                    .map(|mut project| {
+                        for source in project.sources.values_mut() {
+                            source.is_missing = !source.path.exists();
+                        }
+                        project_manager::remember(&project.name, &remember_path);
+                        project
+                    })
+                    .map_err(|e| e.to_string())
             })
             .await;
             match loaded {
@@ -509,6 +548,13 @@ impl MainWindow {
 
     /// Save on a worker thread. `then` runs on the GTK thread once the file is written.
     fn save(self: &Rc<Self>, then: impl FnOnce() + 'static) {
+        self.save_then(false, then);
+    }
+
+    /// Save, then do `then`. With `leaving` (closing the window or the project),
+    /// a failed save asks whether to leave anyway instead of trapping the user
+    /// in a project that cannot be written.
+    fn save_then(self: &Rc<Self>, leaving: bool, then: impl FnOnce() + 'static) {
         let (Some(project), Some(path)) = (self.state.project.borrow().clone(), self.state.path.borrow().clone()) else {
             then();
             return;
@@ -523,15 +569,36 @@ impl MainWindow {
                 saved
             })
             .await;
-            match result {
+            let problem = match result {
                 Ok(Ok(())) => {
                     w.state.set_dirty(false);
                     w.flash_activity("Saved");
                     then();
+                    return;
                 }
-                Ok(Err(e)) => w.state.message(format!("Could not save: {e}")),
-                Err(_) => w.state.message("Could not save."),
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "the save stopped unexpectedly".to_string(),
+            };
+            if !leaving {
+                w.state.message(format!("Could not save: {problem}"));
+                return;
             }
+            // Escape and Enter both mean "stay": leaving loses work, so it takes a click.
+            let dialog = adw::AlertDialog::builder()
+                .heading("The project could not be saved")
+                .body(format!("{problem}\n\nIf you leave now, the changes since the last save are lost."))
+                .build();
+            dialog.add_responses(&[("leave", "Leave Without Saving"), ("stay", "Stay")]);
+            dialog.set_response_appearance("leave", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("stay"));
+            dialog.set_close_response("stay");
+            let then = std::cell::RefCell::new(Some(then));
+            dialog.connect_response(Some("leave"), move |_, _| {
+                if let Some(then) = then.borrow_mut().take() {
+                    then();
+                }
+            });
+            dialog.present(Some(&w.window));
         });
     }
 
@@ -551,11 +618,12 @@ impl MainWindow {
     }
 
     /// Show a short status in the page bar, unless an export is reporting there.
-    fn flash_activity(self: &Rc<Self>, text: &'static str) {
+    fn flash_activity(self: &Rc<Self>, text: impl Into<String>) {
         if self.export.has_unfinished_jobs() {
             return;
         }
-        self.activity.set_text(text);
+        let text: String = text.into();
+        self.activity.set_text(&text);
         let w = self.clone();
         glib::timeout_add_seconds_local_once(3, move || {
             if w.activity.text() == text {
@@ -569,15 +637,21 @@ impl MainWindow {
             let w = self.clone();
             dialogs::confirm(&self.window, "An export is running", "Closing now stops it.", "Close Anyway", "Keep Open", move |yes| {
                 if yes {
-                    w.state.player.shutdown();
-                    w.window.destroy();
+                    // Stop the export cleanly (its unfinished file is removed),
+                    // then save the project like any other close.
+                    w.export.cancel_all();
+                    let w2 = w.clone();
+                    w.save_then(true, move || {
+                        w2.state.player.shutdown();
+                        w2.window.destroy();
+                    });
                 }
             });
             return glib::Propagation::Stop;
         }
         if self.state.dirty.get() {
             let w = self.clone();
-            self.save(move || {
+            self.save_then(true, move || {
                 w.state.player.shutdown();
                 w.window.destroy();
             });
@@ -664,7 +738,8 @@ impl MainWindow {
     /// `seek:SECONDS` · `media:INDEX` · `tool:select|trim|blade` ·
     /// `click:SECONDS,TRACK[,ctrl]` · `drag:SECONDS,TRACK,TO_SECONDS[,TO_TRACK]` ·
     /// `trim:EDGE_SECONDS,TRACK,DELTA_SECONDS[,shift]` · `title:center|lower` ·
-    /// `fade:in|out,SECONDS` · `panel:effects|inspector` · `dump`
+    /// `fade:in|out,SECONDS` · `panel:effects|inspector` · `menu:SECONDS,TRACK` ·
+    /// `poolmenu:INDEX` · `pick:inspector|quick|effects` · `dump`
     pub fn run_script_step(self: &Rc<Self>, step: &str) {
         use gtk::gdk::ModifierType;
         let canvas = &self.edit.timeline.canvas;
@@ -733,6 +808,53 @@ impl MainWindow {
                 if let (Some(from), Some(to)) = (from, to) {
                     let mods = if parts.get(3) == Some(&"shift") { ModifierType::SHIFT_MASK } else { ModifierType::empty() };
                     canvas.simulate_drag(from, to, mods);
+                }
+            }
+            // Which widget a pointer press in the middle of a top-bar button would
+            // reach: the button itself, unless something lies over it.
+            "pick" => {
+                let button: gtk::Widget = match parts.first().copied() {
+                    Some("inspector") => self.panel_buttons[2].clone().upcast(),
+                    Some("effects") => self.panel_buttons[1].clone().upcast(),
+                    _ => match self.edit_only.first_child() {
+                        Some(quick_export) => quick_export,
+                        None => return,
+                    },
+                };
+                let centre = gtk::graphene::Point::new(button.width() as f32 / 2.0, button.height() as f32 / 2.0);
+                let hit = button
+                    .compute_point(&self.window, &centre)
+                    .and_then(|p| self.window.pick(p.x() as f64, p.y() as f64, gtk::PickFlags::DEFAULT));
+                let reached = hit.as_ref().is_some_and(|w| *w == button || w.is_ancestor(&button));
+                tracing::info!("pick {args}: reached={reached} widget={:?} sensitive={} size={}x{}", hit.map(|w| w.type_().name().to_string()), button.is_sensitive(), button.width(), button.height());
+            }
+            // Open the right-click menu of the timeline, or of a Media Pool clip.
+            "menu" => {
+                if let Some(p) = num(0).and_then(|s| canvas.point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
+                    canvas.show_menu(p.0, p.1);
+                }
+            }
+            "poolmenu" => self.edit.media_pool.show_menu_for_index(num(0).unwrap_or(0.0) as u32),
+            // Drop the nth Media Pool clip on a track at a time, as the mouse would.
+            "drop" => {
+                let source = self.edit.media_pool.id_at(num(0).unwrap_or(0.0) as u32);
+                let track = parts.get(2).and_then(|name| {
+                    self.state.with_timeline(|t| {
+                        crate::timeline::rows(t)
+                            .into_iter()
+                            .find(|r| format!("{}{}", if r.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" }, r.index).eq_ignore_ascii_case(name))
+                            .map(|r| r.track_id)
+                    })
+                    .flatten()
+                });
+                if let (Some(source), Some(at)) = (source, num(1)) {
+                    actions::place_source(&self.state, source, Place::Overwrite, Some((at * 1e6) as i64), track);
+                }
+            }
+            // Open the nth Media Pool clip in the viewer, as a double click would.
+            "open" => {
+                if let Some(source) = self.edit.media_pool.id_at(num(0).unwrap_or(0.0) as u32) {
+                    self.state.show_source(Some(source));
                 }
             }
             "dual" => self.set_dual_viewer(parts.first() == Some(&"on")),
@@ -812,10 +934,51 @@ impl MainWindow {
             "win.play-forward" | "win.play-reverse" => {
                 // Pressing the same direction again doubles the speed, up to 8×.
                 let dir = if action == "win.play-forward" { 1.0 } else { -1.0 };
-                let cur = self.speed.get();
+                // Playback started with Space or the on-screen button counts as 1×.
+                let cur = match (player.is_playing(), self.speed.get()) {
+                    (true, 0.0) => 1.0,
+                    (_, speed) => speed,
+                };
+                // At the end of the timeline, L starts again from the beginning.
+                if dir > 0.0 && !player.is_playing() && player.position_us() >= player.duration_us() {
+                    player.seek(0, true);
+                }
                 let next = if player.is_playing() && cur * dir > 0.0 { (cur.abs() * 2.0).min(8.0) * dir } else { dir };
                 self.speed.set(next);
                 player.play(next);
+                if next.abs() > 1.0 {
+                    self.flash_activity(format!("Playing at {}{}×", if next < 0.0 { "−" } else { "" }, next.abs()));
+                }
+            }
+            // Shift+L and Shift+J step through the speeds: each press of Shift+L is
+            // one step faster forward, each press of Shift+J one step the other way.
+            "win.fast-forward" | "win.fast-reverse" => {
+                const SPEEDS: [f64; 9] = [-8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0];
+                let now = if player.is_playing() { self.speed.get() } else { 0.0 };
+                // A plain "play" (Space or the button) counts as 1×.
+                let now = if player.is_playing() && now == 0.0 { 1.0 } else { now };
+                let at = SPEEDS.iter().position(|s| *s == now).unwrap_or(4);
+                let first_press = !player.is_playing();
+                let next = match (action == "win.fast-forward", first_press) {
+                    // From a stop, "fast" starts at double speed.
+                    (true, true) => 2.0,
+                    (false, true) => -2.0,
+                    (true, false) => SPEEDS[(at + 1).min(SPEEDS.len() - 1)],
+                    (false, false) => SPEEDS[at.saturating_sub(1)],
+                };
+                self.speed.set(next);
+                if next == 0.0 {
+                    player.pause();
+                    self.flash_activity("Stopped".to_string());
+                } else {
+                    player.play(next);
+                    self.flash_activity(format!("Playing at {}{}×", if next < 0.0 { "−" } else { "" }, next.abs()));
+                }
+            }
+            "win.play-slow" => {
+                self.speed.set(0.5);
+                player.play(0.5);
+                self.flash_activity("Playing at half speed");
             }
             "win.stop" => {
                 self.speed.set(0.0);
@@ -878,7 +1041,7 @@ impl MainWindow {
             // Pages and files
             "app.project-manager" => {
                 let w = self.clone();
-                self.save(move || {
+                self.save_then(true, move || {
                     w.state.set_project(None, None);
                     w.show_manager();
                 });
@@ -886,12 +1049,22 @@ impl MainWindow {
             "win.page-edit" => self.page_buttons[0].set_active(true),
             "win.page-export" => self.page_buttons[1].set_active(true),
             "app.save" => self.save(|| {}),
-            "win.undo" => state.undo(),
-            "win.redo" => state.redo(),
+            // Only where the timeline can be seen: an undo nobody sees is a surprise later.
+            "win.undo" if on_edit => state.undo(),
+            "win.redo" if on_edit => state.redo(),
+            "win.relink-media" => {
+                if state.with_project(|p| p.sources.values().any(|s| s.is_missing)).unwrap_or(false) {
+                    dialogs::relink_missing(&self.window, state);
+                } else {
+                    state.message("No media is missing.");
+                }
+            }
             "win.quick-export" => {
                 if self.export.add_to_queue() {
                     self.export.render_all();
-                    state.message("Exporting with the current export settings");
+                    // Show the job and its progress, so it is plain that something started.
+                    self.page_buttons[1].set_active(true);
+                    state.message("Export started. You can go back to the Edit page while it runs.");
                 }
             }
             "win.queue-add" if !on_edit => {
@@ -927,12 +1100,24 @@ impl MainWindow {
                 state.emit(Change::Options);
             }
             "win.transition-add" => actions::cross_dissolve(state, 0.5),
+            "win.fade-in" => actions::set_fade(state, true, 0.5),
+            "win.fade-out" => actions::set_fade(state, false, 0.5),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
             "win.delete" => actions::delete_selected(state, false),
             "win.ripple-delete" => actions::delete_selected(state, true),
-            "win.trim-start" => actions::trim_to_playhead(state, TrimEdge::In),
-            "win.trim-end" => actions::trim_to_playhead(state, TrimEdge::Out),
+            "win.trim-start" => actions::trim_to_playhead(state, TrimEdge::In, false),
+            "win.trim-end" => actions::trim_to_playhead(state, TrimEdge::Out, false),
+            "win.ripple-start" => actions::trim_to_playhead(state, TrimEdge::In, true),
+            "win.ripple-end" => actions::trim_to_playhead(state, TrimEdge::Out, true),
+            "win.fade-in-to-playhead" => actions::fade_to_playhead(state, true),
+            "win.fade-out-to-playhead" => actions::fade_to_playhead(state, false),
+            "win.select-at-playhead" => actions::select_at_playhead(state),
+            "win.ripple-cut" => {
+                actions::copy_selected(state, false);
+                actions::delete_selected(state, true);
+            }
+            "win.focus-effects" => self.panel_buttons[1].set_active(!self.panel_buttons[1].is_active()),
             "win.nudge-reverse" => actions::nudge(state, -1),
             "win.nudge-forward" => actions::nudge(state, 1),
             "win.nudge-multi-left" => actions::nudge(state, -5),

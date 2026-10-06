@@ -25,6 +25,8 @@ pub struct Viewer {
     dual_listener: RefCell<Option<Box<dyn Fn(bool)>>>,
     name: gtk::Label,
     proxy_badge: gtk::Label,
+    /// Shown while a Media Pool clip is in the viewer: the way back.
+    back: gtk::Button,
     scrub: gtk::Scale,
     play: gtk::Button,
     position_listeners: RefCell<Vec<Box<dyn Fn(i64)>>>,
@@ -52,17 +54,29 @@ impl Viewer {
         // Header: name in the middle, timecode and menu at the right.
         let name = label("", &["tempo-bright", "tempo-heading"]);
         let tc = label("00:00:00:00", &["tempo-timecode"]);
-        let quality = gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .tooltip_text("Viewer options")
-            .css_classes(["tool"])
-            .build();
-        let (popover, dual_check) = viewer_menu(state, &player, source_only);
-        quality.set_popover(Some(&popover));
         let end = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         end.append(&tc);
-        end.append(&quality);
+        let mut dual_check = None;
+        if !source_only {
+            // Only the main viewer has options of its own.
+            let options = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("Viewer options").css_classes(["tool"]).build();
+            let (popover, check) = viewer_menu();
+            options.set_popover(Some(&popover));
+            end.append(&options);
+            dual_check = Some(check);
+        }
         let header = gtk::CenterBox::builder().css_classes(["viewer-header"]).build();
+        // Preview quality is the setting that matters most on a slow computer,
+        // so it is in plain sight, not inside a menu.
+        let (quality, sync_quality) = quality_button(state);
+        let back = crate::util::text_button("Back to Timeline", "Stop looking at this Media Pool clip and show the timeline again (Q)");
+        back.set_visible(false);
+        let s = state.clone();
+        back.connect_clicked(move |_| s.show_source(None));
+        let start = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        start.append(&quality);
+        start.append(&back);
+        header.set_start_widget(Some(&start));
         header.set_center_widget(Some(&name));
         header.set_end_widget(Some(&end));
         root.append(&header);
@@ -117,6 +131,7 @@ impl Viewer {
             dual_listener: RefCell::new(None),
             name,
             proxy_badge,
+            back,
             scrub,
             play,
             position_listeners: RefCell::new(Vec::new()),
@@ -188,7 +203,20 @@ impl Viewer {
         });
 
         let v = viewer.clone();
+        let height = Cell::new(u32::MAX);
         state.connect(move |change| {
+            if matches!(change, Change::Options) {
+                v.show_marks();
+                // The quality may have changed, here or in Preferences.
+                let now = v.state.settings.borrow().playback_height;
+                if height.replace(now) != now {
+                    sync_quality(now);
+                    if v.source_only {
+                        v.player.set_max_height(now);
+                    }
+                    v.refresh();
+                }
+            }
             if matches!(change, Change::Project | Change::Timeline | Change::Media) {
                 v.refresh();
             }
@@ -270,8 +298,24 @@ impl Viewer {
         self.refresh();
     }
 
+    /// In and Out as ticks on the scrub bar: the source clip's own marks while
+    /// one is shown, the timeline's otherwise.
+    fn show_marks(&self) {
+        let state = &self.state;
+        let source = self.source_only || state.source_mode();
+        let (mark_in, mark_out) = if source { (state.src_in.get(), state.src_out.get()) } else { (state.mark_in.get(), state.mark_out.get()) };
+        self.scrub.clear_marks();
+        for (mark, name) in [(mark_in, "In"), (mark_out, "Out")] {
+            if let Some(us) = mark {
+                self.scrub.add_mark(us as f64, gtk::PositionType::Top, Some(name));
+            }
+        }
+    }
+
     fn refresh(&self) {
         let state = &self.state;
+        self.back.set_visible(!self.source_only && state.source_mode());
+        self.show_marks();
         let (w, h, title) = state
             .with_project(|p| {
                 let source = if self.source_only { self.shown_source.get() } else { state.source_clip.get().filter(|_| state.source_mode()) };
@@ -287,39 +331,74 @@ impl Viewer {
         self.name.set_text(&title);
         // Shown while any clip is previewed from its proxy.
         let proxied = state.with_project(|p| p.sources.values().any(|s| s.proxy_ready)).unwrap_or(false);
-        self.proxy_badge.set_visible(proxied && !self.source_only && !state.source_mode());
+        let uses_proxies = state.settings.borrow().playback_height != 0;
+        self.proxy_badge.set_visible(proxied && uses_proxies && !self.source_only && !state.source_mode());
     }
 }
 
-/// The viewer's menu: playback quality (lower settings decode to a smaller
-/// picture, which costs less CPU) and, on the main viewer, the dual-viewer switch.
-fn viewer_menu(state: &Rc<AppState>, player: &Player, source_only: bool) -> (gtk::Popover, Option<gtk::CheckButton>) {
-    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
-    list.append(&label("Playback quality", &["tempo-dim", "tempo-small"]));
-    let current = state.settings.borrow().playback_height;
-    let mut group: Option<gtk::CheckButton> = None;
-    for (text, height) in [("Full", 0u32), ("Half", 540), ("Quarter", 270)] {
-        let item = gtk::CheckButton::with_label(text);
-        if let Some(g) = &group {
-            item.set_group(Some(g));
-        } else {
-            group = Some(item.clone());
+/// Preview quality choices: label, what it means, and the height the picture is
+/// decoded at (0 is the original file at full size).
+const QUALITIES: [(&str, &str, u32); 3] = [
+    ("Full", "The original file at full size. Sharpest, and the heaviest.", 0),
+    ("Half", "A small proxy copy at half size. Smooth on most computers.", 540),
+    ("Quarter", "A proxy at quarter size. For slow computers and long timelines.", 270),
+];
+
+/// The "Preview: Half" button in the viewer header and a function that makes
+/// it show a given setting.
+fn quality_button(state: &Rc<AppState>) -> (gtk::MenuButton, impl Fn(u32)) {
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+    let heading = label("Preview quality", &["tempo-heading"]);
+    heading.set_xalign(0.0);
+    list.append(&heading);
+    let note = label("Lower quality plays more smoothly. Export always uses full quality.", &["tempo-dim", "tempo-small"]);
+    note.set_xalign(0.0);
+    note.set_margin_bottom(6);
+    list.append(&note);
+
+    let button = gtk::MenuButton::builder()
+        .tooltip_text("Preview quality: how sharp the picture is while you edit. Lower is smoother.")
+        .css_classes(["tool", "text"])
+        .build();
+    let mut items: Vec<gtk::CheckButton> = Vec::new();
+    for (name, about, height) in QUALITIES {
+        let item = gtk::CheckButton::with_label(name);
+        if let Some(first) = items.first() {
+            item.set_group(Some(first));
         }
-        item.set_active(height == current);
-        let p = player.clone();
-        item.connect_toggled(move |b| {
-            if b.is_active() {
-                p.set_max_height(height);
+        let s = state.clone();
+        let b = button.clone();
+        item.connect_toggled(move |i| {
+            if i.is_active() {
+                s.set_playback_height(height);
+                b.popdown();
             }
         });
         list.append(&item);
+        let about = label(about, &["tempo-dim", "tempo-small"]);
+        about.set_xalign(0.0);
+        about.set_margin_start(28);
+        about.set_margin_bottom(4);
+        list.append(&about);
+        items.push(item);
     }
-    let dual = (!source_only).then(|| {
-        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let check = gtk::CheckButton::with_label("Dual viewer");
-        check.set_tooltip_text(Some("Show the source clip in its own viewer beside the timeline viewer"));
-        list.append(&check);
-        check
-    });
-    (gtk::Popover::builder().child(&list).build(), dual)
+    button.set_popover(Some(&gtk::Popover::builder().child(&list).build()));
+
+    let b = button.clone();
+    let sync = move |height: u32| {
+        let index = QUALITIES.iter().position(|q| q.2 == height).unwrap_or(1);
+        b.set_label(&format!("Preview: {}", QUALITIES[index].0));
+        items[index].set_active(true);
+    };
+    sync(state.settings.borrow().playback_height);
+    (button, sync)
+}
+
+/// The main viewer's menu: the dual-viewer switch.
+fn viewer_menu() -> (gtk::Popover, gtk::CheckButton) {
+    let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).margin_bottom(8).margin_start(8).margin_end(8).build();
+    let check = gtk::CheckButton::with_label("Dual viewer");
+    check.set_tooltip_text(Some("Show the source clip in its own viewer beside the timeline viewer"));
+    list.append(&check);
+    (gtk::Popover::builder().child(&list).build(), check)
 }

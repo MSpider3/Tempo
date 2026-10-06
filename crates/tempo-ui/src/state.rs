@@ -40,6 +40,14 @@ pub enum Tool {
     Blade,
 }
 
+/// An empty stretch of a track between two clips (or before the first one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    pub track: Uuid,
+    pub start: i64,
+    pub end: i64,
+}
+
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
@@ -66,7 +74,10 @@ pub struct AppState {
     /// Item selected in the Media Pool.
     pub media_selection: Cell<Option<Uuid>>,
     /// The clip last copied or cut.
-    pub clipboard: RefCell<Option<Clip>>,
+    /// The clips last copied or cut.
+    pub clipboard: RefCell<Vec<Clip>>,
+    /// The selected gap, if a gap rather than a clip is selected.
+    pub gap: Cell<Option<Gap>>,
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
@@ -102,7 +113,8 @@ impl AppState {
             src_in: Cell::new(None),
             src_out: Cell::new(None),
             media_selection: Cell::new(None),
-            clipboard: RefCell::new(None),
+            clipboard: RefCell::new(Vec::new()),
+            gap: Cell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
             filters: RefCell::new(Vec::new()),
@@ -153,6 +165,35 @@ impl AppState {
         }
     }
 
+    /// The timeline playhead: where edits happen, whatever the viewer shows.
+    pub fn playhead_us(&self) -> i64 {
+        self.player.timeline_position_us()
+    }
+
+    /// The number of the frame a time is in. A time within a tenth of a frame
+    /// of the next frame counts as that frame, so positions stored to the
+    /// microsecond never read one frame low.
+    fn frame_index(&self, us: i64) -> i128 {
+        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        (us.max(0) as i128 * num * 10 + den * 1_000_000) / (den * 10_000_000)
+    }
+
+    fn frame_start(&self, frame: i128) -> i64 {
+        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        ((frame.max(0) * den * 1_000_000 + num / 2) / num) as i64
+    }
+
+    /// The start of the frame a time is in. Positions made with this stay on
+    /// true frame times however far along the timeline they are.
+    pub fn frame_floor(&self, us: i64) -> i64 {
+        self.frame_start(self.frame_index(us))
+    }
+
+    /// The start of the frame `frames` frames away from the one `us` is in.
+    pub fn frame_step(&self, us: i64, frames: i64) -> i64 {
+        self.frame_start(self.frame_index(us) + frames as i128)
+    }
+
     pub fn frame_us(&self) -> i64 {
         self.with_project(|p| p.fps.frame_duration_us()).unwrap_or(33_333).max(1)
     }
@@ -169,6 +210,8 @@ impl AppState {
         self.log.borrow_mut().clear();
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
+        self.gap.set(None);
+        self.clipboard.borrow_mut().clear();
         self.source_clip.set(None);
         self.waveforms.borrow_mut().clear();
         self.media_selection.set(None);
@@ -187,7 +230,9 @@ impl AppState {
     /// Hand the playback worker a fresh copy of the timeline.
     pub fn sync_player(&self) {
         if let Some(p) = self.project.borrow().as_ref() {
-            self.player.set_timeline(Snapshot::from_project(p));
+            // "Full" preview quality reads the original files; the others use proxies.
+            let proxies = self.settings.borrow().playback_height != 0;
+            self.player.set_timeline(Snapshot::from_project(p, proxies));
         }
     }
 
@@ -196,12 +241,14 @@ impl AppState {
         // Forget selected clips that no longer exist.
         let gone = |id: &Uuid| self.with_timeline(|t| t.find_clip(*id).is_none()).unwrap_or(true);
         let before = self.selected_ids();
+        // An edit may have filled or moved the gap, so it is not kept.
+        let had_gap = self.gap.take().is_some();
         self.extra_selection.borrow_mut().retain(|id| !gone(id));
         if self.selection.get().is_some_and(|id| gone(&id)) {
             let next = self.extra_selection.borrow_mut().pop();
             self.selection.set(next);
         }
-        if before != self.selected_ids() {
+        if had_gap || before != self.selected_ids() {
             self.emit(Change::Selection);
         }
         self.set_dirty(true);
@@ -292,7 +339,7 @@ impl AppState {
     }
 
     /// Clips linked to `id` (its sound or its picture), if linked selection is on.
-    fn linked_to(&self, id: Uuid) -> Vec<Uuid> {
+    pub fn linked_to(&self, id: Uuid) -> Vec<Uuid> {
         if !self.linked_selection.get() {
             return Vec::new();
         }
@@ -306,15 +353,43 @@ impl AppState {
     /// Select one clip (and what is linked to it), or nothing.
     pub fn select(&self, clip: Option<Uuid>) {
         let before = self.selected_ids();
+        let had_gap = self.gap.take().is_some();
         self.selection.set(clip);
         *self.extra_selection.borrow_mut() = clip.map(|id| self.linked_to(id)).unwrap_or_default();
-        if before != self.selected_ids() {
+        if had_gap || before != self.selected_ids() {
             self.emit(Change::Selection);
         }
     }
 
+    /// Select an empty stretch of a track instead of a clip.
+    pub fn select_gap(&self, gap: Gap) {
+        self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
+        self.gap.set(Some(gap));
+        self.emit(Change::Selection);
+    }
+
+    /// Change the preview quality: the height the picture is decoded at, 0 for
+    /// the original files at full size. Applied at once and remembered.
+    pub fn set_playback_height(&self, height: u32) {
+        if self.settings.borrow().playback_height == height {
+            return;
+        }
+        self.settings.borrow_mut().playback_height = height;
+        self.player.set_max_height(height);
+        self.sync_player();
+        self.emit(Change::Options);
+        let snapshot = self.settings.borrow().clone();
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(Err(e)) = gtk4::gio::spawn_blocking(move || snapshot.save()).await {
+                tracing::warn!("could not save settings: {e}");
+            }
+        });
+    }
+
     /// Add a clip to the selection, or take it out (Ctrl+click).
     pub fn toggle_select(&self, id: Uuid) {
+        self.gap.set(None);
         let mut group = vec![id];
         group.extend(self.linked_to(id));
         if self.is_selected(id) {
@@ -335,6 +410,7 @@ impl AppState {
         let mut all: Vec<Uuid> = self
             .with_timeline(|t| t.tracks.iter().filter(|tr| !tr.locked).flat_map(|tr| tr.clips.iter().map(|c| c.id)).collect())
             .unwrap_or_default();
+        self.gap.set(None);
         self.selection.set(if all.is_empty() { None } else { Some(all.remove(0)) });
         *self.extra_selection.borrow_mut() = all;
         self.emit(Change::Selection);
@@ -374,7 +450,9 @@ fn friendly_error(e: &tempo_timeline::TimelineError) -> String {
 /// `HH:MM:SS:FF` for a position, using the project frame rate.
 pub fn timecode(us: i64, fps: f64) -> String {
     let fps_i = fps.round().max(1.0) as i64;
-    let total_frames = (us.max(0) as f64 * fps / 1_000_000.0).floor() as i64;
+    // A position on a frame is stored to the microsecond, a hair before the
+    // exact frame time; the allowance keeps it from reading one frame low.
+    let total_frames = (us.max(0) as f64 * fps / 1_000_000.0 + 0.1).floor() as i64;
     let frames = total_frames % fps_i;
     let secs = total_frames / fps_i;
     format!("{:02}:{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60, frames)
@@ -390,5 +468,9 @@ mod tests {
         assert_eq!(timecode(1_000_000, 24.0), "00:00:01:00");
         assert_eq!(timecode(1_500_000, 24.0), "00:00:01:12");
         assert_eq!(timecode(3_661_000_000, 30.0), "01:01:01:00");
+        // One frame at 30 fps is stored as 33 333 µs and must read as frame 1.
+        assert_eq!(timecode(33_333, 30.0), "00:00:00:01");
+        assert_eq!(timecode(966_667, 30.0), "00:00:00:29");
+        assert_eq!(timecode(41_708, 23.976), "00:00:00:01");
     }
 }

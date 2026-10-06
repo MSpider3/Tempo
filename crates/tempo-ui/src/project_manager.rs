@@ -146,7 +146,7 @@ impl ProjectManager {
         let selection = gtk::SingleSelection::builder().model(&store).autoselect(false).can_unselect(true).build();
         let grid = gtk::GridView::builder()
             .model(&selection)
-            .factory(&card_factory())
+            .factory(&card_factory(&selection))
             .max_columns(8)
             .min_columns(1)
             .css_classes(["projects"])
@@ -232,8 +232,13 @@ impl ProjectManager {
         let p = pm.clone();
         let open_cb = on_open.clone();
         menu_click.connect_pressed(move |gesture, _, x, y| {
-            let Some(entry) = p.selected() else { return };
             let Some(widget) = gesture.widget() else { return };
+            // The card under the pointer was selected by its own handler (see
+            // `card_factory`). Over empty space there is nothing to act on.
+            if widget.pick(x, y, gtk::PickFlags::DEFAULT).is_none_or(|hit| hit == widget) {
+                return;
+            }
+            let Some(entry) = p.selected() else { return };
             let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).margin_top(4).margin_bottom(4).margin_start(4).margin_end(4).build();
             let popover = gtk::Popover::builder().child(&list).has_arrow(false).build();
             popover.set_parent(&widget);
@@ -275,8 +280,14 @@ impl ProjectManager {
                 Box::new(move || {
                     let (pm, path) = (pm.clone(), path.clone());
                     glib::MainContext::default().spawn_local(async move {
-                        if let Err(e) = gio::File::for_path(&path).trash_future(glib::Priority::DEFAULT).await {
-                            tracing::warn!("could not move {} to the trash: {e}", path.display());
+                        // A file that is already gone only needs to leave the list.
+                        let gone = !path.exists();
+                        match gio::File::for_path(&path).trash_future(glib::Priority::DEFAULT).await {
+                            Err(e) if !gone => {
+                                pm.report(&format!("Could not move the project to the trash: {e}"));
+                                return;
+                            }
+                            _ => {}
                         }
                         let _ = gio::spawn_blocking(move || forget(&path)).await;
                         pm.reload();
@@ -305,10 +316,20 @@ impl ProjectManager {
         let pm = self.clone();
         glib::MainContext::default().spawn_local(async move {
             if let Ok(Err(e)) = gio::spawn_blocking(move || work(&path)).await {
-                tracing::warn!("project operation failed: {e}");
+                pm.report(&format!("That did not work: {e}"));
             }
             pm.reload();
         });
+    }
+
+    /// Tell the user about something that failed.
+    fn report(&self, text: &str) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        tracing::warn!("{text}");
+        let dialog = adw::AlertDialog::builder().heading("Project Manager").body(text).build();
+        dialog.add_responses(&[("ok", "OK")]);
+        dialog.present(Some(&self.root));
     }
 
     fn ask_rename(self: &Rc<Self>, parent: &gtk::Widget, entry: &Entry) {
@@ -355,9 +376,10 @@ impl ProjectManager {
     }
 }
 
-fn card_factory() -> gtk::SignalListItemFactory {
+fn card_factory(selection: &gtk::SingleSelection) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, obj| {
+    let selection = selection.downgrade();
+    factory.connect_setup(move |_, obj| {
         let Some(item) = obj.downcast_ref::<gtk::ListItem>() else { return };
         let icon = gtk::Image::builder().icon_name("dev.tempo.Tempo-symbolic").pixel_size(40).build();
         let thumb = gtk::Box::builder().css_classes(["project-thumb"]).width_request(224).height_request(126).halign(gtk::Align::Center).build();
@@ -369,6 +391,16 @@ fn card_factory() -> gtk::SignalListItemFactory {
         card.append(&thumb);
         card.append(&name);
         card.append(&date);
+        // A right click selects the card first, so the menu that the grid then
+        // opens is about the project under the pointer, not the one clicked before.
+        let click = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_SECONDARY).build();
+        let (weak_item, selection) = (item.downgrade(), selection.clone());
+        click.connect_pressed(move |_, _, _, _| {
+            if let (Some(item), Some(selection)) = (weak_item.upgrade(), selection.upgrade()) {
+                selection.set_selected(item.position());
+            }
+        });
+        card.add_controller(click);
         item.set_child(Some(&card));
     });
     factory.connect_bind(|_, obj| {

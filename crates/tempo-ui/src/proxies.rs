@@ -18,7 +18,10 @@ pub struct Proxies {
     /// Sources already tried in this session (done, failed or running).
     seen: RefCell<HashSet<Uuid>>,
     running: Cell<bool>,
+    busy: Cell<bool>,
     cancel: RefCell<Arc<AtomicBool>>,
+    /// Set while the editor is playing or exporting: proxy work stands still.
+    hold: Arc<AtomicBool>,
     activity: RefCell<Option<Box<dyn Fn(Option<String>)>>>,
 }
 
@@ -28,7 +31,9 @@ impl Proxies {
             state: state.clone(),
             seen: Default::default(),
             running: Cell::new(false),
+            busy: Cell::new(false),
             cancel: RefCell::new(Arc::new(AtomicBool::new(false))),
+            hold: Arc::new(AtomicBool::new(false)),
             activity: RefCell::new(None),
         });
         let p = proxies.clone();
@@ -48,6 +53,11 @@ impl Proxies {
     /// Called with a one-line status while a proxy is being made, `None` when idle.
     pub fn connect_activity(&self, f: impl Fn(Option<String>) + 'static) {
         *self.activity.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Hold proxy work (for example while an export runs). Playback holds it by itself.
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.set(busy);
     }
 
     fn report(&self, text: Option<String>) {
@@ -94,7 +104,11 @@ impl Proxies {
             if !p.running.get() {
                 return glib::ControlFlow::Break;
             }
-            p.report(Some(format!("Making proxy: {label} {}%", shown.load(Ordering::Relaxed))));
+            // Playback and export come first; the proxy carries on afterwards.
+            let hold = p.busy.get() || p.state.player.is_playing();
+            p.hold.store(hold, Ordering::Relaxed);
+            let percent = shown.load(Ordering::Relaxed);
+            p.report(Some(if hold { format!("Proxy paused: {label} {percent}%") } else { format!("Making proxy: {label} {percent}%") }));
             glib::ControlFlow::Continue
         });
 
@@ -102,12 +116,13 @@ impl Proxies {
         glib::MainContext::default().spawn_local(async move {
             let out = output.clone();
             let flag = cancel.clone();
+            let hold = p.hold.clone();
             let result = gio::spawn_blocking(move || {
                 // A proxy left by an earlier session is reused as it is.
                 if out.exists() {
                     return Ok(());
                 }
-                tempo_proxy::generate_proxy(&input, &out, duration, &flag, |f| progress.store((f * 100.0) as u32, Ordering::Relaxed))
+                tempo_proxy::generate_proxy(&input, &out, duration, &flag, &hold, |f| progress.store((f * 100.0) as u32, Ordering::Relaxed))
             })
             .await;
             p.running.set(false);

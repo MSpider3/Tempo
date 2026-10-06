@@ -171,7 +171,7 @@ impl Plugins {
         let Some((plugin, function, name)) = found else { return };
         let Some(timeline) = self.state.with_timeline(|t| t.clone()) else { return };
         let loudness: HashMap<_, _> = self.state.waveforms.borrow().iter().map(|(id, peaks)| (*id, Arc::new(peaks.as_ref().clone()))).collect();
-        let input = RunInput { timeline, playhead_us: self.state.player.position_us(), selection: self.state.selected_ids(), loudness };
+        let input = RunInput { timeline, playhead_us: self.state.playhead_us(), selection: self.state.selected_ids(), loudness };
 
         let plugins = self.clone();
         glib::MainContext::default().spawn_local(async move {

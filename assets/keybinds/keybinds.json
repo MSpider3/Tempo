@@ -34,6 +34,36 @@
   },
   {
    "group": "Playback",
+   "action": "win.fast-forward",
+   "keys": [
+    "<Shift>l"
+   ],
+   "alt": [],
+   "label": "Faster Forward (each press: one step faster)",
+   "resolve": "controlFastForward"
+  },
+  {
+   "group": "Playback",
+   "action": "win.fast-reverse",
+   "keys": [
+    "<Shift>j"
+   ],
+   "alt": [],
+   "label": "Faster Reverse (each press: one step the other way)",
+   "resolve": "controlFastReverse"
+  },
+  {
+   "group": "Playback",
+   "action": "win.play-slow",
+   "keys": [
+    "<Shift>k"
+   ],
+   "alt": [],
+   "label": "Play at Half Speed",
+   "resolve": "controlPlaySlow"
+  },
+  {
+   "group": "Playback",
    "action": "win.stop",
    "keys": [
     "k"
@@ -425,6 +455,16 @@
   },
   {
    "group": "Editing",
+   "action": "win.ripple-cut",
+   "keys": [
+    "<Primary><Shift>x"
+   ],
+   "alt": [],
+   "label": "Cut and Close the Gap",
+   "resolve": "editRippleCut"
+  },
+  {
+   "group": "Editing",
    "action": "win.copy",
    "keys": [
     "<Primary>c"
@@ -472,6 +512,16 @@
    "alt": [],
    "label": "Select All",
    "resolve": "editSelectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-at-playhead",
+   "keys": [
+    "<Shift>v"
+   ],
+   "alt": [],
+   "label": "Select the Clip at the Playhead",
+   "resolve": "editSelectItemAtPlayhead"
   },
   {
    "group": "Editing",
@@ -526,6 +576,50 @@
    ],
    "label": "Trim End to Playhead",
    "resolve": "editNudgeTrimStepTrimEnd"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.ripple-start",
+   "keys": [
+    "<Primary><Shift>bracketleft"
+   ],
+   "alt": [
+    "<Primary>braceleft"
+   ],
+   "label": "Trim Start to Playhead and Close the Gap",
+   "resolve": "trimRippleStartToPlayhead"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.ripple-end",
+   "keys": [
+    "<Primary><Shift>bracketright"
+   ],
+   "alt": [
+    "<Primary>braceright"
+   ],
+   "label": "Trim End to Playhead and Close the Gap",
+   "resolve": "trimRippleEndToPlayhead"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.fade-in-to-playhead",
+   "keys": [
+    "<Alt><Shift>d"
+   ],
+   "alt": [],
+   "label": "Fade In up to the Playhead",
+   "resolve": "trimFadeInToPlayhead"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.fade-out-to-playhead",
+   "keys": [
+    "<Alt><Shift>g"
+   ],
+   "alt": [],
+   "label": "Fade Out from the Playhead",
+   "resolve": "trimFadeOutToPlayhead"
   },
   {
    "group": "Trimming",
@@ -675,6 +769,16 @@
    "resolve": "viewActiveWindowSelectionInspector"
   },
   {
+   "group": "Panels",
+   "action": "win.focus-effects",
+   "keys": [
+    "<Primary>6"
+   ],
+   "alt": [],
+   "label": "Show or Hide Effects",
+   "resolve": "viewActiveWindowSelectionEffects"
+  },
+  {
    "group": "Pages",
    "action": "app.project-manager",
    "keys": [
@@ -778,6 +882,16 @@
    ],
    "alt": [],
    "label": "Export Page: Render All",
+   "resolve": null
+  },
+  {
+   "group": "Tempo only",
+   "action": "win.quick-export",
+   "keys": [
+    "<Primary><Shift>e"
+   ],
+   "alt": [],
+   "label": "Quick Export",
    "resolve": null
   },
   {

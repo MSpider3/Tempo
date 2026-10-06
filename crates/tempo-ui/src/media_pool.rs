@@ -1,5 +1,6 @@
 //! Media Pool: the files imported into the project.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -10,6 +11,7 @@ use tempo_media::MediaEngine;
 use tempo_timeline::MediaType;
 use uuid::Uuid;
 
+use crate::actions::{self, Place};
 use crate::state::{AppState, Change};
 use crate::util::{label, short_duration, tool_button};
 
@@ -31,6 +33,9 @@ pub struct MediaPool {
     pub root: gtk::Box,
     state: Rc<AppState>,
     store: gio::ListStore,
+    selection: gtk::SingleSelection,
+    /// The right-click menu while it is open.
+    menu: RefCell<Option<gtk::PopoverMenu>>,
     stack: gtk::Stack,
     search: gtk::SearchEntry,
     window: glib::WeakRef<gtk::Window>,
@@ -53,11 +58,13 @@ impl MediaPool {
         header.append(&import);
         root.append(&header);
 
+        // Filled in below, once the pool exists: called when a clip is right-clicked.
+        let on_menu: MenuHandler = Rc::new(RefCell::new(None));
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let selection = gtk::SingleSelection::builder().model(&store).autoselect(false).can_unselect(true).build();
         let grid = gtk::GridView::builder()
             .model(&selection)
-            .factory(&item_factory())
+            .factory(&item_factory(on_menu.clone()))
             .max_columns(6)
             .min_columns(2)
             .css_classes(["media"])
@@ -78,10 +85,27 @@ impl MediaPool {
             root,
             state: state.clone(),
             store,
+            selection: selection.clone(),
+            menu: RefCell::new(None),
             stack,
             search,
             window: glib::WeakRef::new(),
         });
+        pool.install_menu_actions();
+        let p = pool.clone();
+        *on_menu.borrow_mut() = Some(Box::new(move |position, widget, x, y| {
+            // Right-clicking a clip selects it, as a left click would.
+            p.selection.set_selected(position);
+            let id = p.store.item(position).and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id);
+            if let Some(point) = widget.compute_point(&p.root, &gtk::graphene::Point::new(x as f32, y as f32)) {
+                p.show_menu(id, point.x() as f64, point.y() as f64);
+            }
+        }));
+        // Right-clicking empty space offers Import.
+        let click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        let p = pool.clone();
+        click.connect_pressed(move |_, _, x, y| p.show_menu(None, x, y));
+        pool.root.add_controller(click);
 
         let p = pool.clone();
         import.connect_clicked(move |_| p.choose_files());
@@ -123,6 +147,78 @@ impl MediaPool {
         pool
     }
 
+    /// Actions behind the right-click menu. Each takes the clip's id as text.
+    fn install_menu_actions(self: &Rc<Self>) {
+        let group = gio::SimpleActionGroup::new();
+        let add = |name: &str, run: Box<dyn Fn(&Rc<Self>, Uuid)>| {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let pool = self.clone();
+            action.connect_activate(move |_, target| {
+                if let Some(id) = target.and_then(|t| t.str()).and_then(|t| Uuid::parse_str(t).ok()) {
+                    run(&pool, id);
+                }
+            });
+            group.add_action(&action);
+        };
+        add("insert", Box::new(|p, id| actions::place_source(&p.state, id, Place::Insert, None, None)));
+        add("overwrite", Box::new(|p, id| actions::place_source(&p.state, id, Place::Overwrite, None, None)));
+        add("append", Box::new(|p, id| actions::place_source(&p.state, id, Place::Append, None, None)));
+        add("open", Box::new(|p, id| p.state.show_source(Some(id))));
+        add("remove", Box::new(|p, id| actions::remove_source(&p.state, id)));
+        add(
+            "reveal",
+            Box::new(|p, id| {
+                if let Some(path) = p.state.with_project(|proj| proj.sources.get(&id).map(|s| s.path.clone())).flatten() {
+                    gtk::FileLauncher::new(Some(&gio::File::for_path(path))).open_containing_folder(p.window.upgrade().as_ref(), gio::Cancellable::NONE, |_| {});
+                }
+            }),
+        );
+        let import = gio::SimpleAction::new("import", None);
+        let pool = self.clone();
+        import.connect_activate(move |_, _| pool.choose_files());
+        group.add_action(&import);
+        self.root.insert_action_group("pool", Some(&group));
+    }
+
+    /// The right-click menu, for a clip or (with `None`) for empty space.
+    fn show_menu(&self, clip: Option<Uuid>, x: f64, y: f64) {
+        if self.state.project.borrow().is_none() {
+            return;
+        }
+        let menu = gio::Menu::new();
+        if let Some(id) = clip {
+            let section = |items: &[(&str, &str)]| {
+                let part = gio::Menu::new();
+                for (label, action) in items {
+                    let item = gio::MenuItem::new(Some(label), None);
+                    item.set_action_and_target_value(Some(action), Some(&id.to_string().to_variant()));
+                    part.append_item(&item);
+                }
+                part
+            };
+            menu.append_section(
+                None,
+                &section(&[("Insert at Playhead", "pool.insert"), ("Overwrite at Playhead", "pool.overwrite"), ("Add to End of Timeline", "pool.append")]),
+            );
+            menu.append_section(None, &section(&[("Open in Viewer", "pool.open"), ("Show in Files", "pool.reveal")]));
+            menu.append_section(None, &section(&[("Remove from Media Pool", "pool.remove")]));
+        }
+        let import = gio::Menu::new();
+        import.append(Some("Import Media…"), Some("pool.import"));
+        menu.append_section(None, &import);
+
+        if let Some(old) = self.menu.take() {
+            old.unparent();
+        }
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&self.root);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        *self.menu.borrow_mut() = Some(popover.clone());
+        popover.popup();
+    }
+
     pub fn set_window(&self, window: &impl IsA<gtk::Window>) {
         self.window.set(Some(window.upcast_ref()));
     }
@@ -132,6 +228,18 @@ impl MediaPool {
         if let Some(obj) = self.store.item(index).and_downcast::<glib::BoxedAnyObject>() {
             self.state.media_selection.set(Some(obj.borrow::<Item>().id));
         }
+    }
+
+    /// The id of the nth item. For scripted checks.
+    pub fn id_at(&self, index: u32) -> Option<Uuid> {
+        self.store.item(index).and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id)
+    }
+
+    /// Open the right-click menu of the nth item. For scripted checks.
+    pub fn show_menu_for_index(&self, index: u32) {
+        self.selection.set_selected(index);
+        let id = self.store.item(index).and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id);
+        self.show_menu(id, 60.0, 90.0);
     }
 
     pub fn focus(&self) {
@@ -223,9 +331,20 @@ impl MediaPool {
         items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
 
         let has_any = self.state.with_project(|p| !p.sources.is_empty()).unwrap_or(false);
+        // Rebuilding the list clears the selection; put it back, so a clip picked
+        // while other files are still importing stays picked.
+        let selected = self.state.media_selection.get();
         self.store.remove_all();
-        for (_, item) in items {
+        let mut reselect = None;
+        for (index, (_, item)) in items.into_iter().enumerate() {
+            if Some(item.id) == selected {
+                reselect = Some(index as u32);
+            }
             self.store.append(&glib::BoxedAnyObject::new(item));
+        }
+        match reselect {
+            Some(index) => self.selection.set_selected(index),
+            None => self.state.media_selection.set(selected.filter(|id| self.state.with_project(|p| p.sources.contains_key(id)).unwrap_or(false))),
         }
         self.stack.set_visible_child_name(if has_any { "grid" } else { "empty" });
     }
@@ -238,9 +357,12 @@ fn thumbnail_texture(data: &[u8]) -> Option<gdk::Texture> {
     Some(gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, w * 4).upcast())
 }
 
-fn item_factory() -> gtk::SignalListItemFactory {
+/// Called with the item's position, the cell and the pointer position in it.
+type MenuHandler = Rc<RefCell<Option<Box<dyn Fn(u32, &gtk::Widget, f64, f64)>>>>;
+
+fn item_factory(on_menu: MenuHandler) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, obj| {
+    factory.connect_setup(move |_, obj| {
         let Some(list_item) = obj.downcast_ref::<gtk::ListItem>() else { return };
         let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).build();
         picture.set_size_request(THUMB_W, THUMB_H);
@@ -271,6 +393,19 @@ fn item_factory() -> gtk::SignalListItemFactory {
             Some(gdk::ContentProvider::for_value(&id.to_value()))
         });
         cell.add_controller(drag);
+
+        let click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        let weak_item = list_item.downgrade();
+        let on_menu = on_menu.clone();
+        click.connect_pressed(move |gesture, _, x, y| {
+            let (Some(item), Some(widget)) = (weak_item.upgrade(), gesture.widget()) else { return };
+            // Claimed, so the pool's own "empty space" menu does not open as well.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(show) = on_menu.borrow().as_ref() {
+                show(item.position(), &widget, x, y);
+            }
+        });
+        cell.add_controller(click);
         list_item.set_child(Some(&cell));
     });
     factory.connect_bind(|_, obj| {

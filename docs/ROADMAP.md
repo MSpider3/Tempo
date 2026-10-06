@@ -28,11 +28,19 @@ recording:
 | Paused, project open | 0.6 % of one core, 193 MB |
 | Playing the original HEVC file at Half quality | 124 % of one core (about a third of the machine), 220 MB, 6 dropped frames in 25 s |
 | Playing its 540p proxy | 25 % of one core, 186 MB, no dropped frames |
-| Making the proxy | 51 s for a 135 s clip, in the background |
+| Making the proxy | About 1.5 × real time on one decoding and one encoding thread; 34 % of the processor (it was 89 %), 97 MB; held while playing or exporting |
+| Export, 60 s of 1080p with 20 cuts | 51 s, 574 MB at most (990 MB before sections; no longer grows with cuts) |
 | Program size | 4.4 MB |
 
 This is a newer i3 than the i3-6100 reference machine, and it has more memory, so the
 reference machine still needs its own run.
+
+**First hands-on test (2026-10-06).** The owner used 0.1.0 and reported eleven problems;
+all are fixed in 0.1.1 except one that could not be reproduced: the Inspector and Quick
+Export buttons "not working". Pointer hit-testing shows both buttons receive clicks, and
+the likely cause was the export using so much memory that the whole machine stalled. A
+code read-through afterwards found 30 more problems of the same kind; 24 are fixed and the
+rest are in the table below.
 
 **Checked without a person at the keyboard.** The editing gestures were run through the
 real mouse handlers by scripted steps (click, Ctrl+click, drag, trim, ripple, roll, blade,
@@ -51,6 +59,13 @@ has still not sat down and used it.
 | Proxies | Made for all heavy footage on import, not only when playback drops frames |
 | A/V sync | Picture follows the audio clock; the 40 ms target has not been measured |
 | Roll trim | Uses Shift in Trim mode, not Resolve's click-on-the-cut |
+| Inspector with several clips selected | Edits only the first clip; the title says "+N more" |
+| Title rotation | Shown in the viewer, ignored by export |
+| Render queue | A job keeps the project as it was when queued, so Retry after fixing the timeline renders the old state; jobs from a closed project stay listed |
+| Timeline drawing | The whole canvas is redrawn on each playhead move; not yet measured as a cost |
+| Frame grid in older projects | Positions made before 0.1.1 sit a fraction of a microsecond per frame early; past about five minutes they can read one frame low |
+| Keys listed in `KEYBINDS.md` but not built | Play again, loop, play around, play In to Out, audio scrubbing, mark selection, ripple overwrite, join clip, paste insert, select forward/backward, video-only and audio-only transition, select edit point, viewer fit/actual size/full page, source/timeline viewer focus, project settings, save as, new bin |
+| Silent cases | Importing a file twice says nothing; an empty export location writes to the working folder |
 
 ---
 

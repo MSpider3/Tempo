@@ -170,6 +170,17 @@ impl Inspector {
             }
         });
         grid.attach(&spin, 1, row, 1, 1);
+        // Enter or Escape finishes typing and hands the keyboard back to the
+        // editor, so Space plays and Delete deletes again without a click.
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_released(|controller, key, _, _| {
+            if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::Escape) {
+                if let Some(window) = controller.widget().and_then(|w| w.root()).and_downcast::<gtk::Window>() {
+                    gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+                }
+            }
+        });
+        spin.add_controller(keys);
 
         let drag = gtk::GestureDrag::new();
         let start: Rc<RefCell<Option<(f64, Clip)>>> = Rc::new(RefCell::new(None));

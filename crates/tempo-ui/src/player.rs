@@ -41,7 +41,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn from_project(project: &Project) -> Self {
+    /// `use_proxies` picks the proxy of a source when it has one.
+    pub fn from_project(project: &Project, use_proxies: bool) -> Self {
         let mut video: Vec<_> = project
             .timeline
             .tracks
@@ -55,7 +56,7 @@ impl Snapshot {
             .filter(|(_, s)| !s.is_missing)
             .map(|(id, s)| {
                 let path = match (&s.proxy_path, s.proxy_ready) {
-                    (Some(p), true) if p.exists() => p.clone(),
+                    (Some(p), true) if use_proxies && p.exists() => p.clone(),
                     _ => s.path.clone(),
                 };
                 (*id, path)
@@ -131,6 +132,8 @@ enum Cmd {
     Timeline(Arc<Snapshot>),
     Source(Option<Arc<Snapshot>>),
     Seek { us: i64, exact: bool },
+    /// Move the timeline playhead, even while a source clip is being shown.
+    SeekTimeline(i64),
     Play(f64),
     Pause,
     MaxHeight(u32),
@@ -142,6 +145,10 @@ struct Shared {
     /// Output level of the last audio block, left and right, as `f32` bits.
     level: [AtomicU32; 2],
     position_us: AtomicI64,
+    /// Where the timeline playhead is. Differs from `position_us` while a
+    /// source clip is shown, which has a position of its own.
+    timeline_position_us: AtomicI64,
+    showing_source: AtomicBool,
     duration_us: AtomicI64,
     playing: AtomicBool,
     serial: AtomicU64,
@@ -186,6 +193,7 @@ impl Player {
 
     /// Show a single source clip instead of the timeline; `None` returns to the timeline.
     pub fn set_source(&self, snapshot: Option<Snapshot>) {
+        self.shared.showing_source.store(snapshot.is_some(), Ordering::Release);
         self.send(Cmd::Source(snapshot.map(Arc::new)));
     }
 
@@ -193,7 +201,27 @@ impl Player {
     pub fn seek(&self, us: i64, exact: bool) {
         let us = us.max(0);
         self.shared.position_us.store(us, Ordering::Release);
+        if !self.shared.showing_source.load(Ordering::Acquire) {
+            self.shared.timeline_position_us.store(us, Ordering::Release);
+        }
         self.send(Cmd::Seek { us, exact });
+    }
+
+    /// Move the timeline playhead. While a source clip is shown, the viewer
+    /// stays on the source and the timeline is where it was put on return.
+    pub fn seek_timeline(&self, us: i64) {
+        let us = us.max(0);
+        self.shared.timeline_position_us.store(us, Ordering::Release);
+        if !self.shared.showing_source.load(Ordering::Acquire) {
+            self.shared.position_us.store(us, Ordering::Release);
+        }
+        self.send(Cmd::SeekTimeline(us));
+    }
+
+    /// The timeline playhead: where edits happen. Not the position inside a
+    /// source clip that is being looked at.
+    pub fn timeline_position_us(&self) -> i64 {
+        self.shared.timeline_position_us.load(Ordering::Acquire)
     }
 
     pub fn play(&self, speed: f64) {
@@ -252,7 +280,8 @@ struct Worker {
     timeline: Arc<Snapshot>,
     source: Option<Arc<Snapshot>>,
     timeline_pos: i64,
-    decoders: Vec<(Uuid, FfmpegDecoder)>,
+    /// Open decoders, least recently used first, with the file each one reads.
+    decoders: Vec<(Uuid, PathBuf, FfmpegDecoder)>,
     max_height: u32,
     playing: bool,
     speed: f64,
@@ -358,8 +387,10 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
             Cmd::Timeline(s) => {
-                // Drop decoders for files that are no longer referenced.
-                self.decoders.retain(|(id, _)| s.sources.contains_key(id) || self.source.is_some());
+                // Drop decoders for files that are no longer referenced, and those
+                // whose source now plays from another file (a proxy became ready,
+                // or the preview quality changed).
+                self.decoders.retain(|(id, path, _)| s.sources.get(id).map_or(self.source.is_some(), |now| now == path));
                 self.timeline = s;
                 self.dirty = true;
                 self.last_shown.clear();
@@ -386,6 +417,16 @@ impl Worker {
                 self.dirty = true;
                 self.sync_audio();
             }
+            Cmd::SeekTimeline(us) => {
+                if self.source.is_some() {
+                    self.timeline_pos = us;
+                } else {
+                    self.pos_us = us;
+                    self.exact = true;
+                    self.dirty = true;
+                    self.sync_audio();
+                }
+            }
             Cmd::Play(speed) => {
                 self.speed = speed;
                 self.exact = speed > 0.0 && speed <= 2.0;
@@ -400,7 +441,7 @@ impl Worker {
             }
             Cmd::MaxHeight(h) => {
                 self.max_height = h;
-                for (_, d) in &mut self.decoders {
+                for (_, _, d) in &mut self.decoders {
                     d.set_max_output_height(h);
                 }
                 self.dirty = true;
@@ -478,6 +519,8 @@ impl Worker {
                 }
             }
             self.shared.position_us.store(self.pos_us, Ordering::Release);
+            let timeline_pos = if self.source.is_some() { self.timeline_pos } else { self.pos_us };
+            self.shared.timeline_position_us.store(timeline_pos, Ordering::Release);
 
             let started = Instant::now();
             self.render(&snap);
@@ -553,7 +596,7 @@ impl Worker {
     }
 
     fn decoder_for(&mut self, id: Uuid, path: &PathBuf) -> Option<&mut FfmpegDecoder> {
-        if let Some(idx) = self.decoders.iter().position(|(d, _)| *d == id) {
+        if let Some(idx) = self.decoders.iter().position(|(d, open, _)| *d == id && open == path) {
             // Move to the back: most recently used.
             let entry = self.decoders.remove(idx);
             self.decoders.push(entry);
@@ -564,7 +607,7 @@ impl Worker {
                     if self.decoders.len() >= MAX_OPEN_DECODERS {
                         self.decoders.remove(0);
                     }
-                    self.decoders.push((id, d));
+                    self.decoders.push((id, path.clone(), d));
                 }
                 Err(e) => {
                     tracing::warn!("cannot open {}: {e}", path.display());
@@ -572,7 +615,7 @@ impl Worker {
                 }
             }
         }
-        self.decoders.last_mut().map(|(_, d)| d)
+        self.decoders.last_mut().map(|(_, _, d)| d)
     }
 }
 

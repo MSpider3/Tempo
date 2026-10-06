@@ -397,8 +397,8 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         .build();
     let quality = adw::ComboRow::builder().title("Playback quality").model(&gtk::StringList::new(&QUALITY.map(|q| q.0))).build();
     quality.set_selected(QUALITY.iter().position(|q| q.1 == current.playback_height).unwrap_or(1) as u32);
-    let c = change.clone();
-    quality.connect_selected_notify(move |row| c(&|s| s.playback_height = QUALITY[row.selected() as usize].1));
+    let st = state.clone();
+    quality.connect_selected_notify(move |row| st.set_playback_height(QUALITY[row.selected() as usize].1));
     playback.add(&quality);
     let proxies = adw::SwitchRow::builder()
         .title("Make proxies automatically")

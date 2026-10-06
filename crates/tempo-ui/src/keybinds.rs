@@ -41,9 +41,29 @@ pub fn display(accel: &str) -> String {
     }
 }
 
-/// Register every binding on the window. `run` receives the action name.
-/// Plain keys are left alone while the user is typing in a text field.
-pub fn install(window: &impl IsA<gtk::Window>, run: impl Fn(&str) + Clone + 'static) {
+/// Keys that lists, drop-downs and switches use themselves.
+const NAVIGATION: [&str; 10] = ["Up", "Down", "Left", "Right", "space", "Return", "Home", "End", "Page_Up", "Page_Down"];
+
+/// Whether a key press belongs to the widget that has the focus and not to
+/// the editor: the user is typing, or a dialog or menu is open, or the focus is
+/// in a list and the key moves around in it.
+fn belongs_to_focus(focus: &gtk::Widget, accel: &str) -> bool {
+    if focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.is::<gtk::Editable>() {
+        return true;
+    }
+    // Anything open on top of the editor keeps all of its keys.
+    if focus.ancestor(gtk::Popover::static_type()).is_some() || focus.ancestor(libadwaita::Dialog::static_type()).is_some() {
+        return true;
+    }
+    let in_list = [gtk::GridView::static_type(), gtk::ListView::static_type(), gtk::DropDown::static_type(), gtk::ListBox::static_type()]
+        .into_iter()
+        .any(|t| focus.type_().is_a(t) || focus.ancestor(t).is_some());
+    in_list && NAVIGATION.contains(&accel)
+}
+
+/// Register every binding on the window. `run` receives the action name and
+/// says whether it did anything with it; a key nobody used is passed on.
+pub fn install(window: &impl IsA<gtk::Window>, run: impl Fn(&str) -> bool + Clone + 'static) {
     let controller = gtk::ShortcutController::new();
     controller.set_scope(gtk::ShortcutScope::Global);
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -56,15 +76,15 @@ pub fn install(window: &impl IsA<gtk::Window>, run: impl Fn(&str) + Clone + 'sta
             let run = run.clone();
             let action_name = bind.action.clone();
             let window_weak = window.as_ref().downgrade();
+            let accel = accel.clone();
             let action = gtk::CallbackAction::new(move |_, _| {
-                let typing = window_weak
+                let elsewhere = window_weak
                     .upgrade()
                     .and_then(|w| gtk::prelude::GtkWindowExt::focus(&w))
-                    .is_some_and(|f| f.is::<gtk::Text>() || f.is::<gtk::TextView>() || f.is::<gtk::Editable>());
-                if typing {
+                    .is_some_and(|focus| belongs_to_focus(&focus, &accel));
+                if elsewhere || !run(&action_name) {
                     return glib::Propagation::Proceed;
                 }
-                run(&action_name);
                 glib::Propagation::Stop
             });
             controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));

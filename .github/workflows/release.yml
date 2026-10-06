@@ -177,3 +177,5 @@ jobs:
         with:
           files: dist/*
           body_path: notes.md
+          # Tempo is alpha: releases are marked as pre-releases until it is stable.
+          prerelease: true
