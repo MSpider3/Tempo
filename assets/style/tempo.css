@@ -30,7 +30,8 @@
 @define-color tempo_clip_video_top   #3b688e;
 @define-color tempo_clip_audio       #448f64;
 @define-color tempo_clip_audio_wave  #397955;
-@define-color tempo_clip_title       #8a6fb0;
+/* Resolve's default clip colours: video steel blue, audio light green, text beige. */
+@define-color tempo_clip_title       #9c8a68;
 @define-color tempo_track_edge_video #345b7b;
 @define-color tempo_track_edge_audio #356d4d;
 @define-color tempo_clip_text        #ffffff;

@@ -981,16 +981,22 @@ impl TimelineCanvas {
                     ClipType::Title => ("tempo_clip_title", "tempo_clip_title"),
                     _ => ("tempo_clip_video_top", "tempo_clip_video"),
                 };
+                // Like Resolve, a clip with adjustments or filters is a darker shade.
+                let shaded = |name: &str| {
+                    let c = color(name);
+                    let k = if clip.properties.is_modified() { 0.82 } else { 1.0 };
+                    gdk::RGBA::new(c.red() * k, c.green() * k, c.blue() * k, c.alpha())
+                };
                 let rounded = gsk::RoundedRect::from_rect(body, 3.0);
                 s.push_rounded_clip(&rounded);
-                s.append_color(&color(top), &body);
+                s.append_color(&shaded(top), &body);
                 let bar_y = body.y() + body.height() - NAME_BAR_H;
                 if clip.clip_type == ClipType::Audio {
                     if let Some(peaks) = state.waveforms.borrow().get(&clip.source_id) {
                         self.draw_waveform(s, peaks, clip.source_in + (tin - clip.timeline_in), x0, body.y(), x1 - x0, bar_y - body.y(), w);
                     }
                 }
-                s.append_color(&color(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
+                s.append_color(&shaded(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
                 // The name stays readable while the start of the clip is off screen.
                 let mut name_x = x0.max(0.0) + 6.0;
                 if clip.properties.link.is_some() && x1 - name_x > 40.0 {

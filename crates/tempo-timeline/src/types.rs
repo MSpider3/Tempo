@@ -155,6 +155,20 @@ impl Default for ClipProperties {
 }
 
 impl ClipProperties {
+    /// True when the clip differs from a freshly placed one in the ways Resolve shades a
+    /// clip darker for: filters, keyframes, and picture or sound adjustments. Fades,
+    /// dissolves and links show on the timeline themselves and do not count.
+    pub fn is_modified(&self) -> bool {
+        let d = Self::default();
+        let picture = (self.opacity, self.position_x, self.position_y, self.scale_x, self.scale_y, self.rotation);
+        let sound = (self.volume, self.pan);
+        !self.effects.is_empty()
+            || !self.keyframes.is_empty()
+            || picture != (d.opacity, d.position_x, d.position_y, d.scale_x, d.scale_y, d.rotation)
+            || sound != (d.volume, d.pan)
+            || (self.lift, self.gamma, self.gain) != (d.lift, d.gamma, d.gain)
+    }
+
     pub fn get_base_property(&self, property: &str) -> f32 {
         match property {
             "opacity" => self.opacity,
@@ -971,6 +985,37 @@ mod tests {
         c.properties.fade_in_us = 2_000_000;
         let c = c.with_fade(FadeEdge::In, -500_000, RationalFps::FPS_30);
         assert_eq!(c.properties.fade_in_us, 0);
+    }
+
+    #[test]
+    fn fresh_clip_is_not_modified_and_fades_do_not_count() {
+        let mut p = ClipProperties::default();
+        assert!(!p.is_modified());
+        (p.fade_in_us, p.fade_out_us, p.dissolve_in_us, p.link) = (1, 1, 1, Some(Uuid::new_v4()));
+        assert!(!p.is_modified());
+    }
+
+    #[test]
+    fn inspector_changes_mark_a_clip_modified() {
+        let changes: [fn(&mut ClipProperties); 12] = [
+            |p| p.opacity = 0.5,
+            |p| p.position_x = 10.0,
+            |p| p.position_y = -3.0,
+            |p| p.scale_x = 1.2,
+            |p| p.scale_y = 0.8,
+            |p| p.rotation = 5.0,
+            |p| p.volume = 0.7,
+            |p| p.pan = -0.2,
+            |p| p.lift = [0.1, 0.0, 0.0],
+            |p| p.gamma = [1.0, 1.1, 1.0],
+            |p| p.gain = [1.0, 1.0, 0.9],
+            |p| p.add_keyframe("opacity", 0, 1.0),
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut p = ClipProperties::default();
+            change(&mut p);
+            assert!(p.is_modified(), "change {i} should count");
+        }
     }
 
     #[test]
