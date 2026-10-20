@@ -263,7 +263,10 @@ pub enum TitleType {
     LowerThird,
 }
 
+/// Fields missing from saved data take their default value, so titles from older and
+/// newer versions load (the loader refuses unreadable clip data).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TitleData {
     pub title_type: TitleType,
     pub text: String,

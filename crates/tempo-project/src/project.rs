@@ -1055,6 +1055,13 @@ mod tests {
     }
 
     #[test]
+    fn titles_with_missing_fields_still_load() {
+        let (file, _) = tampered(r#"UPDATE clips SET title_data = '{"text":"Hello"}';"#);
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].clips[0].title_data.as_ref().map(|t| t.text.as_str()), Some("Hello"));
+    }
+
+    #[test]
     fn load_rejects_corrupt_clip_properties() {
         let (file, clip_id) = tampered("UPDATE clips SET properties = '{bad';");
         match load_project(file.path()) {
