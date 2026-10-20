@@ -693,6 +693,15 @@ const FEED_FRAMES: usize = OUT_RATE as usize / 100;
 const FEED_AHEAD_FRAMES: usize = OUT_RATE as usize / 5;
 const MAX_OPEN_READERS: usize = 4;
 
+/// How many source frames one mixing block of a retimed clip covers, starting at
+/// timeline position `pos_us`: exactly up to where the next block starts, rounded the way
+/// `AudioReader` rounds, so consecutive reads join up and the reader never seeks back.
+fn source_frames(clip: &Clip, pos_us: i64) -> usize {
+    let frame = |us: i64| us.max(0) * OUT_RATE as i64 / 1_000_000;
+    let next = pos_us + (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+    (frame(clip.source_offset_at(next)) - frame(clip.source_offset_at(pos_us))).max(1) as usize
+}
+
 /// Resample interleaved stereo `src` to fill `out`, by straight-line interpolation.
 /// Used for retimed clips: reading `speed` times as much sound into one block plays it
 /// faster (or slower), with the pitch moving too, as in Resolve on Linux and Windows.
@@ -768,7 +777,7 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             if speed == 1.0 {
                 reader.read(clip.source_offset_at(*pos_us), &mut part);
             } else {
-                let frames = ((FEED_FRAMES as f64 * speed).round() as usize).clamp(1, source.len() / OUT_CHANNELS);
+                let frames = source_frames(clip, *pos_us).min(source.len() / OUT_CHANNELS);
                 let block = &mut source[..frames * OUT_CHANNELS];
                 reader.read(clip.source_offset_at(*pos_us), block);
                 stretch(block, &mut part);
@@ -882,6 +891,20 @@ mod tests {
         let mut slow = vec![0.0f32; 4 * 2];
         stretch(&[0.0, 0.0, 1.0, 1.0], &mut slow);
         assert_eq!(slow, [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn retimed_blocks_read_the_source_without_gaps_or_overlaps() {
+        // At 36 % a block needs 172.8 source frames. Rounding each block on its own read
+        // one frame too many, so the next block started behind the reader and it seeked.
+        let mut c = clip(0, 1_000_000);
+        c.properties.speed = 0.36;
+        let start = |pos: i64| c.source_offset_at(pos) * OUT_RATE as i64 / 1_000_000;
+        let step = (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+        for block in 0..200 {
+            let pos = block * step;
+            assert_eq!(start(pos) + source_frames(&c, pos) as i64, start(pos + step), "block {block}");
+        }
     }
 
     #[test]
