@@ -671,6 +671,7 @@ impl TimelineCanvas {
                 clip_items.push((if enabled { "Turn Clip Off" } else { "Turn Clip On" }, "win.clip-enable-toggle"));
                 menu.append_section(None, &section(&clip_items));
                 menu.append_section(None, &section(&[("Fade In", "win.fade-in"), ("Fade Out", "win.fade-out"), ("Cross Dissolve", "win.transition-add")]));
+                menu.append_section(None, &section(&[("Change Clip Speed…", "win.clip-speed")]));
             }
             None => {
                 let gap = self.row_at(y).and_then(|row| actions::gap_at(&state, row.track_id, self.us_at(x)));
@@ -1022,7 +1023,12 @@ impl TimelineCanvas {
                     }
                     name_x += 18.0;
                 }
-                self.text(s, &clip.name, name_x, bar_y + 3.0, &white, true, x1 - name_x - 4.0);
+                // A retimed clip says its speed, as Resolve marks it.
+                let name = match clip.properties.speed {
+                    s if s != 1.0 => format!("{}  {}%", clip.name, (s * 100.0).round()),
+                    _ => clip.name.clone(),
+                };
+                self.text(s, &name, name_x, bar_y + 3.0, &white, true, x1 - name_x - 4.0);
                 if !row.enabled || !clip.properties.enabled {
                     s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.6), &body);
                 }

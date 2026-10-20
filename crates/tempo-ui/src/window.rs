@@ -1197,6 +1197,7 @@ impl MainWindow {
                 state.emit(Change::Options);
             }
             "win.transition-add" => actions::cross_dissolve(state, 0.5),
+            "win.clip-speed" => dialogs::change_clip_speed(&self.window, state),
             "win.fade-in" => actions::set_fade(state, true, 0.5),
             "win.fade-out" => actions::set_fade(state, false, 0.5),
             "win.razor" => actions::razor(state),

@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{Marker, MarkerColor, RationalFps};
+use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, MAX_SPEED, MIN_SPEED};
 
 use crate::actions;
 use crate::keybinds;
@@ -129,6 +129,72 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
             }
         }
         _ => {}
+    });
+    dialog.present(Some(parent));
+}
+
+/// Resolve's Change Clip Speed (R): a speed in percent, and Ripple Sequence (on by
+/// default) to let the clip change length and move the clips after it.
+pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let Some(clip) = state.selected_clip() else {
+        state.message("Select a clip first, then press R to change its speed.");
+        return;
+    };
+    if matches!(clip.clip_type, ClipType::Title | ClipType::Image) {
+        state.message("Only video and sound clips have a speed.");
+        return;
+    }
+    let Some((fps, limits)) = state.with_project(|p| {
+        let limits = p.sources.iter().filter(|(_, s)| s.duration_us > 0).map(|(id, s)| (*id, s.duration_us)).collect::<std::collections::HashMap<_, _>>();
+        (p.fps, limits)
+    }) else {
+        return;
+    };
+    let percent = gtk::SpinButton::with_range(MIN_SPEED * 100.0, MAX_SPEED * 100.0, 5.0);
+    percent.set_value((clip.properties.speed * 100.0).round());
+    percent.set_activates_default(true);
+    let ripple = gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
+    let length = label("", &["tempo-dim"]);
+    length.set_xalign(0.0);
+
+    let grid = form_grid();
+    form_row(&grid, 0, "Speed %", &percent);
+    form_row(&grid, 1, "Ripple Sequence", &ripple);
+    form_row(&grid, 2, "New length", &length);
+    let command = {
+        let (limits, id) = (limits.clone(), clip.id);
+        let (percent, ripple) = (percent.clone(), ripple.clone());
+        move || SetClipSpeedCommand::new(id, percent.value() / 100.0, ripple.is_active(), fps, limits.clone())
+    };
+    // The preview runs the real change on a copy, so it shows exactly what Change will do.
+    let preview = {
+        let (state, length, command) = (state.clone(), length.clone(), command.clone());
+        move || {
+            let result = state.with_timeline(|t| {
+                let mut copy = t.clone();
+                command().execute(&mut copy).map(|()| copy.find_clip(clip.id).map(|(_, c)| c.duration_us()).unwrap_or(0))
+            });
+            length.set_text(&match result {
+                Some(Ok(us)) => crate::state::timecode(us, fps.to_f64()),
+                Some(Err(e)) => e.to_string(),
+                None => String::new(),
+            });
+        }
+    };
+    preview();
+    let p = preview.clone();
+    percent.connect_value_changed(move |_| p());
+    let p = preview.clone();
+    ripple.connect_active_notify(move |_| p());
+
+    let dialog = adw::AlertDialog::builder().heading("Change Clip Speed").extra_child(&grid).build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("change", "Change")]);
+    dialog.set_response_appearance("change", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("change"));
+    dialog.set_close_response("cancel");
+    let state = state.clone();
+    dialog.connect_response(Some("change"), move |_, _| {
+        state.execute(Box::new(command()));
     });
     dialog.present(Some(parent));
 }

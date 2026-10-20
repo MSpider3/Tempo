@@ -168,6 +168,7 @@ easy to press by accident.
 | `V` | Select nearest edit point | `win.select-edit-point` | `editSelectEditPoint` |
 | `Alt+Shift+D` | Fade in to playhead | `win.fade-in-to-playhead` | `trimFadeInToPlayhead` |
 | `Alt+Shift+G` | Fade out to playhead | `win.fade-out-to-playhead` | `trimFadeOutToPlayhead` |
+| `R` | Change clip speed (dialog: speed %, Ripple Sequence) | `win.clip-speed` | `clipChangeClipSpeed` |
 | `Ctrl+Alt+=` / `Ctrl+Alt+-` | Clip volume up / down 1 dB | `win.volume-up-1` / `win.volume-down-1` | `clipAudioIncreaseAudioLevel1dB` / `…Decrease…` |
 | `Alt+Shift+=` / `Alt+Shift+-` | Clip volume up / down 3 dB | `win.volume-up-3` / `win.volume-down-3` | `clipAudioIncreaseAudioLevel3dB` / `…Decrease…` |
 | `Ctrl+Shift+1` … `4` | Enable / disable video track 1 … 4 | `win.video-track-toggle-N` | `editEnableDisableToggleVideoTrackN` |
@@ -272,8 +273,8 @@ so that the key is available, with the right meaning, when the feature arrives.
 
 | Key | Resolve action | Tempo plan |
 |---|---|---|
-| `R` | Range selection / Change clip speed | After 1.0 |
-| `Ctrl+R`, `Shift+R`, `Ctrl+Alt+R` | Retime controls, freeze frame, reset retime | After 1.0 |
+| `R` as Range selection | Range selection (Resolve also binds `R` to Change Clip Speed, which Tempo uses; a range tool would have to share `R` by context, as Resolve does) | After 1.0 |
+| `Ctrl+R`, `Shift+R`, `Ctrl+Alt+R` | Retime controls, freeze frame, reset retime (not Change Clip Speed) | After 1.0 |
 | `Ctrl+D` | Change clip duration | After 1.0 |
 | `W`, `Ctrl+K` | Dynamic trim mode, stop | After 1.0 |
 | `S` | Slip / slide mode | After 1.0 |
@@ -292,7 +293,7 @@ so that the key is available, with the right meaning, when the feature arrives.
 | `Alt+F`, `Ctrl+Shift+F` | Enhanced viewer / find clip, lightbox | Not planned |
 | `Alt+V`, `Alt+Shift+V` | Paste attributes, paste value | After 1.0 |
 | `Alt+B` | Create subclip | Not planned |
-| `Shift+F11` | Fit to fill | After 1.0 (needs speed change) |
+| `Shift+F11` | Fit to fill | After 1.0 (clip speed now exists) |
 | `1`…`9` | Multicam angle | Never |
 
 ---

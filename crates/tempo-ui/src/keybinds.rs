@@ -139,7 +139,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
-    const RESERVED: &[&str] = &["r", "w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>n", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>n", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
 
     #[test]
     fn every_hint_names_a_bound_action() {
