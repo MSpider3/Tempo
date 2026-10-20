@@ -834,6 +834,7 @@ impl MainWindow {
                 }
             }
             "media" => self.edit.media_pool.select_index(num(0).unwrap_or(0.0) as u32),
+            "import" => self.edit.media_pool.import(parts.iter().map(PathBuf::from).collect()),
             "tool" => self.set_tool(match parts.first().copied() {
                 Some("trim") => Tool::Trim,
                 Some("blade") => Tool::Blade,

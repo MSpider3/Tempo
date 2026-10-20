@@ -797,11 +797,128 @@ impl Project {
             ui_state: UiState::default(),
         }
     }
+
+    /// What to offer when `source` is the first video brought into an empty project
+    /// (Resolve's "Change Project Frame Rate?"), or `None` when it already matches or
+    /// clips are on the timeline. Odd rates snap to the nearest standard one, and frame
+    /// sizes to even numbers. A portrait clip gives a vertical project.
+    pub fn first_import_offer(&self, source: &MediaSource) -> Option<FormatOffer> {
+        if source.media_type != MediaType::Video || self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+            return None;
+        }
+        let (w, h, fps) = (source.video_width?, source.video_height?, source.video_fps?);
+        if w < 2 || h < 2 || fps.num == 0 || fps.den == 0 {
+            return None;
+        }
+        const STANDARD: [RationalFps; 8] = [
+            RationalFps::FPS_23_976,
+            RationalFps::FPS_24,
+            RationalFps::FPS_25,
+            RationalFps::FPS_29_97,
+            RationalFps::FPS_30,
+            RationalFps::FPS_50,
+            RationalFps::FPS_59_94,
+            RationalFps::FPS_60,
+        ];
+        let fps = STANDARD.into_iter().min_by(|a, b| (a.to_f64() - fps.to_f64()).abs().total_cmp(&(b.to_f64() - fps.to_f64()).abs()))?;
+        let offer = FormatOffer { width: w & !1, height: h & !1, fps };
+        (offer != FormatOffer { width: self.width, height: self.height, fps: self.fps }).then_some(offer)
+    }
+
+    /// Change the project's frame size and rate. Only while the timeline is empty, since
+    /// clips are placed on the frame grid.
+    pub fn apply_format(&mut self, offer: &FormatOffer) -> crate::Result<()> {
+        if self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+            return Err(crate::TimelineError::CommandFailed("the frame rate can't change once clips are on the timeline".into()));
+        }
+        (self.width, self.height, self.fps) = (offer.width, offer.height, offer.fps);
+        Ok(())
+    }
+}
+
+/// A frame size and rate offered for the project to match its first clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOffer {
+    pub width: u32,
+    pub height: u32,
+    pub fps: RationalFps,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video(w: u32, h: u32, fps: RationalFps) -> MediaSource {
+        let mut s = MediaSource::new(PathBuf::from("clip.mp4"), MediaType::Video, 10_000_000);
+        (s.video_width, s.video_height, s.video_fps) = (Some(w), Some(h), Some(fps));
+        s
+    }
+
+    #[test]
+    fn no_offer_when_the_clip_matches() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        assert_eq!(p.first_import_offer(&video(1920, 1080, RationalFps::FPS_30)), None);
+    }
+
+    #[test]
+    fn offer_matches_size_and_rate() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(3840, 2160, RationalFps::FPS_23_976)).unwrap();
+        assert_eq!(offer, FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_23_976 });
+    }
+
+    #[test]
+    fn odd_rates_snap_to_the_nearest_standard_rate() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_24);
+        // A phone's variable rate is often reported as something like 29.98 or 59.9.
+        let offer = p.first_import_offer(&video(1920, 1080, RationalFps { num: 2998, den: 100 })).unwrap();
+        assert_eq!(offer.fps, RationalFps::FPS_29_97);
+        let offer = p.first_import_offer(&video(1920, 1080, RationalFps { num: 120, den: 1 })).unwrap();
+        assert_eq!(offer.fps, RationalFps::FPS_60);
+    }
+
+    #[test]
+    fn portrait_clips_offer_a_vertical_project() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(1080, 1920, RationalFps::FPS_30)).unwrap();
+        assert_eq!((offer.width, offer.height), (1080, 1920));
+    }
+
+    #[test]
+    fn odd_sizes_round_down_to_even() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(1279, 719, RationalFps::FPS_30)).unwrap();
+        assert_eq!((offer.width, offer.height), (1278, 718));
+    }
+
+    #[test]
+    fn no_offer_once_the_timeline_has_clips() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let track = p.timeline.tracks[0].id;
+        p.timeline.tracks[0].clips.push(Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 0, 1, 0, 1));
+        let clip = video(3840, 2160, RationalFps::FPS_24);
+        assert_eq!(p.first_import_offer(&clip), None);
+        assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
+        assert_eq!((p.width, p.fps), (1920, RationalFps::FPS_30));
+    }
+
+    #[test]
+    fn no_offer_for_sound_or_unknown_rates() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let mut sound = video(3840, 2160, RationalFps::FPS_24);
+        sound.media_type = MediaType::Audio;
+        assert_eq!(p.first_import_offer(&sound), None);
+        let mut unknown = video(3840, 2160, RationalFps::FPS_24);
+        unknown.video_fps = None;
+        assert_eq!(p.first_import_offer(&unknown), None);
+    }
+
+    #[test]
+    fn apply_format_changes_an_empty_project() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        p.apply_format(&FormatOffer { width: 1080, height: 1920, fps: RationalFps::FPS_60 }).unwrap();
+        assert_eq!((p.width, p.height, p.fps), (1080, 1920, RationalFps::FPS_60));
+    }
 
     #[test]
     fn test_rational_fps() {
