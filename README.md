@@ -142,9 +142,10 @@ Design and behaviour are described in [docs/](docs/README.md).
 
 ## Contributing
 
-Read [docs/AGENT_PROMPT.md](docs/AGENT_PROMPT.md) first; it lists the rules the code
-follows (nothing slow on the interface thread, every edit undoable, Resolve's keys).
-Run `./scripts/run_all_tests.sh` before opening a pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Tempo is for weaker computers and for
+beginners. It keeps DaVinci Resolve's layout and keys on purpose, and effects and titles
+come as plugins. The guide explains what that means for a change, and lists the checks to
+run before opening a pull request.
 
 ## Licence
 

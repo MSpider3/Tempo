@@ -19,7 +19,7 @@ Plus G1 (Ice Lake) graphics, 19 GB RAM, Fedora 44, Tempo's `dev` profile (optimi
 Until 2026-10-20 evening only the old `i965` VA-API driver was installed, which does not
 support Ice Lake, so the "hw decode true" rows in the baseline are really software decoding.
 The `iHD` driver (`intel-media-driver` 26.1.5) was then installed; see
-[Hardware acceleration](#hardware-acceleration--2026-10-20-iHD-driver).
+[Hardware acceleration](#hardware-acceleration--2026-10-20-ihd-driver).
 
 ## Footage
 
