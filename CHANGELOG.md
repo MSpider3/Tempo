@@ -39,9 +39,10 @@ All notable changes to Tempo are recorded here. The format follows
 - Playback decodes more cheaply (no deblocking, half height) while it can't keep up, and
   returns to full quality when it stops or seeks. On a 4K60 stress clip, dropped frames
   fell from 83 % to 9.5 %.
-- Moving the playhead no longer redraws the whole timeline. This cut redraws during
-  playback from about 30 per second to none, and CPU use by 20–37 %.
-- Decoded frames are shared with the viewer instead of copied.
+- Moving the playhead no longer redraws the whole timeline. Redraws during playback fell
+  from about 30 per second to none.
+- Decoded frames are shared with the viewer instead of copied (CPU at Full preview
+  quality 52 → 45 %).
 - Proxies:
   - They are made only for footage that is on the timeline.
   - They are encoded on the graphics chip when it can (VA-API), falling back to the

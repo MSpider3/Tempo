@@ -81,6 +81,32 @@ Observations:
 
 Against the baseline:
 
-- CPU is 20–37 % lower in every ordinary case, mostly because the timeline is no longer redrawn every frame.
 - The 4K60 stress case drops 83 % → 9.5 % of frames from the original, and 0 % from its proxy.
 - Peak memory stays under 0.5 GB.
+
+**Correction (later the same day):** the CPU column of this table was an unusually good run
+and does not show a real gain. Re-measured back to back (A/B, below), the commit this table
+was taken from gives 58 / 79 / 44 % CPU for 1080p60 / 2160p30 / 1080p30 Full, not 44 / 67 /
+33 %. The CPU changes that hold up are:
+
+- Full preview: 52 → 45 %, from sharing frames (P1-T4).
+- 4K60 stress: 240 → 170 %, from adaptive decode (P1-T2), and 33 % from a proxy.
+
+Removing the per-frame timeline redraw (295 → 2 redraws) did not measurably change CPU on
+this short three-clip timeline. Compare runs taken back to back only.
+
+## Final — 2026-10-20, after Phases 2–3 and the review fixes
+
+| case | preview | hw decode | played s | dropped | dropped % | peak RSS MB | CPU % | canvas draws |
+|---|---|---|---|---|---|---|---|---|
+| 1080p30 | 540p | false | 10.0 | 0 | 0.0 | 277 | 38 | 2 |
+| 1080p60 | 540p | false | 10.0 | 0 | 0.0 | 272 | 59 | 2 |
+| 2160p30 | 540p | false | 9.9 | 0 | 0.0 | 444 | 79 | 2 |
+| 2160p30_hevc | 540p | false | 10.0 | 0 | 0.0 | 456 | 114 | 2 |
+| 1080p30_full | Full | false | 10.0 | 0 | 0.0 | 302 | 45 | 2 |
+| 2160p60_grain | 540p | false | 9.6 | 44 | 7.7 | 464 | 170 | 2 |
+| 2160p60_grain_proxy | 540p | false | 10.0 | 0 | 0.0 | 247 | 33 | 2 |
+
+A/B, run back to back with the same cases: the end of Phase 1 (`03856db`) gives 58 / 79 / 44 %
+CPU for 1080p60 / 2160p30 / 1080p30 Full, and this branch gives 59 / 79 / 45 %. Phases 2–3
+did not slow playback.

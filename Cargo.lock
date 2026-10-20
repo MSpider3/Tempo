@@ -1370,6 +1370,7 @@ dependencies = [
  "tempo-export",
  "tempo-media",
  "tempo-project",
+ "tempo-proxy",
  "tempo-timeline",
  "tempo-ui",
  "tracing",
@@ -1444,6 +1445,7 @@ version = "0.1.1"
 dependencies = [
  "libc",
  "tempo-export",
+ "tempo-media",
  "tempo-timeline",
  "tracing",
 ]
