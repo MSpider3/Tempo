@@ -361,6 +361,18 @@ impl Clip {
         scale_us(source_us, 1.0 / self.properties.speed)
     }
 
+    /// Like `to_timeline_us`, rounded down: the longest stretch of timeline that never
+    /// needs more than `source_us` of footage. For limits such as "trim to the start of
+    /// the footage", where rounding up would ask for a microsecond that isn't there.
+    pub fn to_timeline_floor_us(&self, source_us: i64) -> i64 {
+        let speed = self.properties.speed;
+        if speed == 1.0 || !speed.is_finite() || speed <= 0.0 {
+            source_us
+        } else {
+            (source_us as f64 / speed).floor() as i64
+        }
+    }
+
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
     pub fn dissolve_lead(&self) -> Option<Clip> {

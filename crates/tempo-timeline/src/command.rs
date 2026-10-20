@@ -1621,43 +1621,74 @@ impl Command for SetClipSpeedCommand {
             return Err(TimelineError::CommandFailed("Only video and sound clips have a speed.".into()));
         }
         // The clip and the clips linked to it (its sound or picture) change together.
-        let link = clip.properties.link;
-        let targets: Vec<(Uuid, Uuid)> = timeline
+        let (link, selected_out) = (clip.properties.link, clip.timeline_out);
+        let mut selected_shift = 0;
+        // New length of each of them, worked out before anything changes.
+        let mut targets: Vec<(Uuid, Uuid, i64)> = Vec::new();
+        for track in &timeline.tracks {
+            for c in track.clips.iter().filter(|c| c.id == self.clip_id || (link.is_some() && c.properties.link == link)) {
+                let mut probe = c.clone();
+                probe.properties.speed = self.speed;
+                let limit = self.source_limits.get(&c.source_id).copied().unwrap_or(i64::MAX);
+                let new_len = if self.ripple {
+                    self.whole_frames(probe.to_timeline_us(c.source_out - c.source_in), false)
+                } else {
+                    let available = probe.to_timeline_floor_us(limit.saturating_sub(c.source_in));
+                    if c.duration_us() <= available { c.duration_us() } else { self.whole_frames(available, true) }
+                };
+                if c.id == self.clip_id {
+                    selected_shift = new_len - c.duration_us();
+                }
+                targets.push((track.id, c.id, new_len));
+            }
+        }
+        // With ripple, everything that starts at or after the selected clip's end moves by
+        // its change in length, on every track, as Resolve ripples: linked clips stay in sync.
+        let is_target = |id: Uuid| targets.iter().any(|(_, t, _)| *t == id);
+        let shift = if self.ripple { selected_shift } else { 0 };
+        let moving: Vec<(Uuid, Uuid)> = if shift == 0 {
+            Vec::new()
+        } else {
+            timeline.tracks.iter().flat_map(|t| t.clips.iter().filter(|c| c.timeline_in >= selected_out && !is_target(c.id)).map(move |c| (t.id, c.id))).collect()
+        };
+        let touched: Vec<Uuid> = timeline
             .tracks
             .iter()
-            .flat_map(|t| t.clips.iter().filter(|c| c.id == self.clip_id || (link.is_some() && c.properties.link == link)).map(move |c| (t.id, c.id)))
+            .map(|t| t.id)
+            .filter(|id| targets.iter().any(|(t, ..)| t == id) || moving.iter().any(|(t, _)| t == id))
             .collect();
         // Check every track first, so a locked one leaves everything as it was.
-        if let Some(track) = timeline.tracks.iter().find(|t| t.locked && targets.iter().any(|(id, _)| *id == t.id)) {
+        if let Some(track) = timeline.tracks.iter().find(|t| t.locked && touched.contains(&t.id)) {
             return Err(TimelineError::TrackLocked(track.id));
         }
-        self.before = timeline.tracks.iter().filter(|t| targets.iter().any(|(id, _)| *id == t.id)).map(|t| (t.id, t.clips.clone())).collect();
+        self.before = timeline.tracks.iter().filter(|t| touched.contains(&t.id)).map(|t| (t.id, t.clips.clone())).collect();
 
-        for (track_id, clip_id) in targets {
-            let track = timeline.find_track_mut(track_id).ok_or(TimelineError::TrackNotFound(track_id))?;
-            let clip = track.find_clip_mut(clip_id).ok_or(TimelineError::ClipNotFound(clip_id))?;
-            let (old_out, old_len) = (clip.timeline_out, clip.duration_us());
+        for (_, clip_id, new_len) in targets {
+            let clip = timeline.find_clip_mut(clip_id).ok_or(TimelineError::ClipNotFound(clip_id))?;
             let limit = self.source_limits.get(&clip.source_id).copied().unwrap_or(i64::MAX);
             clip.properties.speed = self.speed;
-            let new_len = if self.ripple {
-                self.whole_frames(clip.to_timeline_us(clip.source_out - clip.source_in), false)
-            } else {
-                let available = clip.to_timeline_us(limit.saturating_sub(clip.source_in));
-                if old_len <= available { old_len } else { self.whole_frames(available, true) }
-            };
             clip.timeline_out = clip.timeline_in + new_len;
             clip.source_out = (clip.source_in + clip.to_source_us(new_len)).min(limit);
             let p = &mut clip.properties;
             p.fade_in_us = p.fade_in_us.min(new_len);
             p.fade_out_us = p.fade_out_us.min(new_len - p.fade_in_us);
-            if self.ripple {
-                let shift = new_len - old_len;
-                for other in track.clips.iter_mut().filter(|c| c.id != clip_id && c.timeline_in >= old_out) {
-                    other.timeline_in += shift;
-                    other.timeline_out += shift;
-                }
+        }
+        for (_, clip_id) in &moving {
+            if let Some(c) = timeline.find_clip_mut(*clip_id) {
+                c.timeline_in += shift;
+                c.timeline_out += shift;
             }
+        }
+        // A split edit (picture and sound of different lengths) can still collide: then
+        // nothing changes.
+        for track_id in &touched {
+            let Some(track) = timeline.find_track_mut(*track_id) else { continue };
             track.sort_clips();
+            if let Some(pair) = track.clips.windows(2).find(|w| w[0].timeline_out > w[1].timeline_in) {
+                let at = pair[1].timeline_in;
+                self.undo(timeline)?;
+                return Err(TimelineError::ClipCollision(*track_id, at));
+            }
         }
         Ok(())
     }
@@ -2662,6 +2693,54 @@ mod tests {
         assert!(matches!(speed(video, 0.5, true, &limits).execute(&mut timeline), Err(TimelineError::TrackLocked(_))));
         assert_eq!(timeline, locked);
         timeline.find_track_mut(audio_track).unwrap().locked = false;
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn ripple_moves_later_clips_on_every_track_together() {
+        // V1: A (0-4 s, no sound linked), then B (4-6 s) linked to B' on A1 (4-6 s).
+        let mut timeline = Timeline::new_default();
+        let (v, a) = (timeline.tracks[0].id, timeline.tracks[2].id);
+        let a_clip = Clip::new(v, Uuid::new_v4(), ClipType::Video, "A", 0, 4_000_000, 0, 4_000_000);
+        let a_id = a_clip.id;
+        let link = Some(Uuid::new_v4());
+        let mut b = Clip::new(v, Uuid::new_v4(), ClipType::Video, "B", 4_000_000, 6_000_000, 0, 2_000_000);
+        let mut b2 = Clip::new(a, b.source_id, ClipType::Audio, "B'", 4_000_000, 6_000_000, 0, 2_000_000);
+        (b.properties.link, b2.properties.link) = (link, link);
+        timeline.find_track_mut(v).unwrap().clips.extend([a_clip, b]);
+        timeline.find_track_mut(a).unwrap().clips.push(b2);
+        SetClipSpeedCommand::new(a_id, 0.5, true, crate::RationalFps::FPS_30, Default::default()).execute(&mut timeline).unwrap();
+        for track in [v, a] {
+            let moved = timeline.find_track(track).unwrap().clips.iter().find(|c| c.name.starts_with('B')).unwrap();
+            assert_eq!((moved.timeline_in, moved.timeline_out), (8_000_000, 10_000_000), "{}", moved.name);
+        }
+
+        // A locked track that would have to move refuses the change.
+        let mut locked = timeline.clone();
+        locked.find_track_mut(a).unwrap().locked = true;
+        let before = locked.clone();
+        let result = SetClipSpeedCommand::new(a_id, 0.25, true, crate::RationalFps::FPS_30, Default::default()).execute(&mut locked);
+        assert!(matches!(result, Err(TimelineError::TrackLocked(_))));
+        assert_eq!(locked, before);
+    }
+
+    #[test]
+    fn ripple_that_would_overlap_a_split_edit_changes_nothing() {
+        // An L-cut: the sound runs 1 s past the picture, and the next sound clip follows it.
+        let mut timeline = Timeline::new_default();
+        let (v, a) = (timeline.tracks[0].id, timeline.tracks[2].id);
+        let link = Some(Uuid::new_v4());
+        let mut pic = Clip::new(v, Uuid::new_v4(), ClipType::Video, "pic", 0, 4_000_000, 0, 4_000_000);
+        let mut snd = Clip::new(a, pic.source_id, ClipType::Audio, "snd", 0, 5_000_000, 0, 5_000_000);
+        (pic.properties.link, snd.properties.link) = (link, link);
+        let pic_id = pic.id;
+        let next = Clip::new(a, Uuid::new_v4(), ClipType::Audio, "next", 5_000_000, 7_000_000, 0, 2_000_000);
+        timeline.find_track_mut(v).unwrap().clips.push(pic);
+        timeline.find_track_mut(a).unwrap().clips.extend([snd, next]);
+        let before = timeline.clone();
+        // The picture grows by 4 s, so later clips move 4 s; the sound grows by 5 s and would cover "next".
+        let result = SetClipSpeedCommand::new(pic_id, 0.5, true, crate::RationalFps::FPS_30, Default::default()).execute(&mut timeline);
+        assert!(matches!(result, Err(TimelineError::ClipCollision(..))), "{result:?}");
         assert_eq!(timeline, before);
     }
 
