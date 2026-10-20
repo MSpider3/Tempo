@@ -746,8 +746,9 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         };
         match cmd {
             Some(Feed::Start { snapshot, pos_us }) => {
-                // Keep readers of the file each source should now be read from.
-                readers.retain(|(id, path, _)| snapshot.sources.get(id).or(snapshot.audio_sources.get(id)) == Some(path));
+                // Keep readers of a file the source may still be read from: its proxy or its
+                // original. (A proxy without sound would otherwise be retried on every play.)
+                readers.retain(|(id, path, _)| snapshot.sources.get(id) == Some(path) || snapshot.audio_sources.get(id) == Some(path));
                 job = Some((snapshot, pos_us));
                 continue;
             }
