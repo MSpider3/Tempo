@@ -693,12 +693,34 @@ const FEED_FRAMES: usize = OUT_RATE as usize / 100;
 const FEED_AHEAD_FRAMES: usize = OUT_RATE as usize / 5;
 const MAX_OPEN_READERS: usize = 4;
 
+/// Resample interleaved stereo `src` to fill `out`, by straight-line interpolation.
+/// Used for retimed clips: reading `speed` times as much sound into one block plays it
+/// faster (or slower), with the pitch moving too, as in Resolve on Linux and Windows.
+fn stretch(src: &[f32], out: &mut [f32]) {
+    let (n, m) = (src.len() / OUT_CHANNELS, out.len() / OUT_CHANNELS);
+    if n == 0 {
+        out.fill(0.0);
+        return;
+    }
+    let step = n as f64 / m.max(1) as f64;
+    for (i, frame) in out.chunks_exact_mut(OUT_CHANNELS).enumerate() {
+        let x = i as f64 * step;
+        let (j, t) = (x as usize, (x - x.floor()) as f32);
+        let (a, b) = (j.min(n - 1), (j + 1).min(n - 1));
+        for (c, sample) in frame.iter_mut().enumerate() {
+            *sample = src[a * OUT_CHANNELS + c] * (1.0 - t) + src[b * OUT_CHANNELS + c] * t;
+        }
+    }
+}
+
 /// Mixes the audio tracks and keeps the output queue topped up while playing.
 fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
     let mut readers: Vec<(Uuid, PathBuf, AudioReader)> = Vec::new();
     let mut job: Option<(Arc<Snapshot>, i64)> = None;
     let mut mix = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
     let mut part = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
+    // Room for a block of a clip at the fastest speed, allocated once.
+    let mut source = vec![0.0f32; (FEED_FRAMES as f64 * tempo_timeline::MAX_SPEED).ceil() as usize * OUT_CHANNELS];
     loop {
         // Idle: wait for work. Playing: look for a command without waiting.
         let cmd = if job.is_none() {
@@ -742,7 +764,15 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             let original = snapshot.audio_sources.get(&clip.source_id);
             let Some(preferred) = snapshot.sources.get(&clip.source_id).or(original) else { continue };
             let Some(reader) = reader_for(&mut readers, clip.source_id, preferred, original) else { continue };
-            reader.read(clip.source_offset_at(*pos_us), &mut part);
+            let speed = clip.properties.speed;
+            if speed == 1.0 {
+                reader.read(clip.source_offset_at(*pos_us), &mut part);
+            } else {
+                let frames = ((FEED_FRAMES as f64 * speed).round() as usize).clamp(1, source.len() / OUT_CHANNELS);
+                let block = &mut source[..frames * OUT_CHANNELS];
+                reader.read(clip.source_offset_at(*pos_us), block);
+                stretch(block, &mut part);
+            }
             let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us);
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
             let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
@@ -839,6 +869,19 @@ mod tests {
         for _ in 0..10 {
             assert!(!o.record(FRAME * 6 / 5, FRAME)); // 1.2x is within 1.25x
         }
+    }
+
+    #[test]
+    fn stretch_fills_the_block_and_reads_the_source_at_speed() {
+        // A ramp of 8 stereo frames read at double speed into 4 frames: every other one.
+        let src: Vec<f32> = (0..8).flat_map(|i| [i as f32, -(i as f32)]).collect();
+        let mut out = vec![9.0f32; 4 * 2];
+        stretch(&src, &mut out);
+        assert_eq!(out, [0.0, -0.0, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0]);
+        // Half speed: 2 source frames spread over 4, in between values interpolated.
+        let mut slow = vec![0.0f32; 4 * 2];
+        stretch(&[0.0, 0.0, 1.0, 1.0], &mut slow);
+        assert_eq!(slow, [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

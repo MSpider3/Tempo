@@ -289,7 +289,7 @@ fn build_args(
                 inputs.extend(["-loop".into(), "1".into(), "-t".into(), secs(len)]);
             } else {
                 // One frame more than needed, so rounding never leaves the clip short.
-                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len + frame_time(1, project))]);
+                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len + frame_time(1, project)))]);
             }
             inputs.extend(["-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
@@ -303,10 +303,13 @@ fn build_args(
             let label = format!("vc{ti}_{}", segs.len());
             // Blur radii are in pixels of a 1080-line picture.
             let effects = effect_filters(props, h as f32 / 1080.0);
+            // A retimed clip's pictures are spread out (or packed together) before the
+            // frame rate is set, so slow motion repeats frames and fast motion skips them.
+            let retime = if props.speed != 1.0 { format!("setpts=(PTS-STARTPTS)/{:.6},", props.speed) } else { String::new() };
             // If the file ends early its last picture is held, so the clip always
             // gives exactly the frames the timeline has for it.
             let head = format!(
-                "[{idx}:v]fps={fps},tpad=stop_mode=clone:stop_duration=2,{fit},setsar=1,format=rgba{effects},trim=end_frame={frames},setpts=PTS-STARTPTS"
+                "[{idx}:v]{retime}fps={fps},tpad=stop_mode=clone:stop_duration=2,{fit},setsar=1,format=rgba{effects},trim=end_frame={frames},setpts=PTS-STARTPTS"
             );
             if is_default_transform(props) {
                 graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0{fades}[{label}]"));
@@ -395,15 +398,18 @@ fn build_args(
             }
             let len = p.end - p.start;
             let (path, _) = source_path(p.clip)?;
-            inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len), "-i".into(), path.to_string_lossy().into_owned()]);
+            inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len)), "-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
             n_inputs += 1;
             let props = &p.clip.properties;
+            // Sound plays faster or slower with the picture, and its pitch moves with it,
+            // as in Resolve on Linux and Windows and as Tempo's preview plays it.
+            let retime = if props.speed != 1.0 { format!("asetrate={},aresample=48000,", (48_000.0 * props.speed).round() as u32) } else { String::new() };
             let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track_volume.max(0.0) };
             let (left, right) = (1.0 - props.pan.max(0.0), 1.0 + props.pan.min(0.0));
             let label = format!("ac{ti}_{}", segs.len());
             graph.push(format!(
-                "[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
+                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
                  volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}[{label}]",
                 secs(len),
                 fade_filters(p, r0, true)
@@ -818,6 +824,42 @@ mod tests {
         assert!(text.contains("title=Next"), "chapters are embedded: {text}");
         let duration: f64 = text.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse().ok()).unwrap_or(0.0);
         assert!((duration - 3.0).abs() < 0.2, "duration was {duration}");
+    }
+
+    /// Where the loudest sound is in a file, in seconds (mono, 48 kHz).
+    fn loudest_at(path: &std::path::Path) -> f64 {
+        let pcm = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(path).args(["-f", "s16le", "-ac", "1", "-ar", "48000", "-"]).output().unwrap().stdout;
+        let samples: Vec<i16> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let at = samples.iter().enumerate().max_by_key(|(_, s)| s.unsigned_abs()).map(|(i, _)| i).unwrap_or(0);
+        at as f64 / 48_000.0
+    }
+
+    #[test]
+    fn retimed_clip_exports_at_its_speed() {
+        let click = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media/sample_click.mp4");
+        if !click.exists() || Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        // 3 s of source with a click at 1 s, at double speed: 1.5 s, click at 0.5 s.
+        let mut project = Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        let mut source = MediaSource::new(click, MediaType::Video, 3_000_000);
+        source.audio_channels = Some(2);
+        for kind in [TrackKind::Video, TrackKind::Audio] {
+            let track = project.timeline.tracks.iter().find(|t| t.kind == kind).map(|t| t.id).unwrap();
+            let clip_type = if kind == TrackKind::Video { ClipType::Video } else { ClipType::Audio };
+            let mut clip = Clip::new(track, source.id, clip_type, "c", 0, 1_500_000, 0, 3_000_000);
+            clip.properties.speed = 2.0;
+            project.timeline.find_track_mut(track).unwrap().clips.push(clip);
+        }
+        project.sources.insert(source.id, source);
+        let out = std::env::temp_dir().join(format!("tempo-speed-{}.mp4", std::process::id()));
+        export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+        let probe = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(&out).output().unwrap();
+        let duration: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
+        let click_at = loudest_at(&out);
+        let _ = std::fs::remove_file(&out);
+        assert!((duration - 1.5).abs() < 0.1, "duration was {duration}");
+        assert!((click_at - 0.5).abs() < 0.02, "click at {click_at} s");
     }
 
     #[test]
