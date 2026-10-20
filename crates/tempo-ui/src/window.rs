@@ -808,7 +808,12 @@ impl MainWindow {
                             .map(|c| {
                                 let sel = if self.state.is_selected(c.id) { "*" } else { "" };
                                 let off = if c.properties.enabled { "" } else { "(off)" };
-                                format!("{sel}{}{off}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
+                                let p = &c.properties;
+                                let fades = match (p.fade_in_us, p.fade_out_us) {
+                                    (0, 0) => String::new(),
+                                    (i, o) => format!("(fade {:.2}/{:.2})", i as f64 / 1e6, o as f64 / 1e6),
+                                };
+                                format!("{sel}{}{off}{fades}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
                             })
                             .collect();
                         let kind = if row.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" };
@@ -844,6 +849,12 @@ impl MainWindow {
                 if let Some(p) = num(0).and_then(|s| canvas.point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
                     let mods = if parts.get(2) == Some(&"ctrl") { ModifierType::CONTROL_MASK } else { ModifierType::empty() };
                     canvas.simulate_drag(p, p, mods);
+                }
+            }
+            "fadedrag" => {
+                let track = parts.get(1).copied().unwrap_or("V1");
+                if let (Some(from), Some(to)) = (num(0).and_then(|s| canvas.top_point_for(s, track)), num(2).and_then(|s| canvas.top_point_for(s, track))) {
+                    canvas.simulate_drag(from, to, ModifierType::empty());
                 }
             }
             "drag" => {

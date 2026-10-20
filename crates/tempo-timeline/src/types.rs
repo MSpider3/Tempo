@@ -348,6 +348,23 @@ impl Clip {
         Some(lead)
     }
 
+    /// This clip with its fade at `edge` set to `us`, rounded to whole frames and kept
+    /// between zero and what the fade at the other end leaves free.
+    pub fn with_fade(&self, edge: FadeEdge, us: i64, fps: RationalFps) -> Clip {
+        let mut clip = self.clone();
+        let p = &mut clip.properties;
+        let other = match edge {
+            FadeEdge::In => p.fade_out_us,
+            FadeEdge::Out => p.fade_in_us,
+        };
+        let length = frame_to_us(us_to_frame(us.max(0), fps), fps).min((self.duration_us() - other).max(0));
+        match edge {
+            FadeEdge::In => p.fade_in_us = length,
+            FadeEdge::Out => p.fade_out_us = length,
+        }
+        clip
+    }
+
     /// How much of the clip shows through its fades at a timeline position:
     /// 0.0 at the very start of a fade in, 1.0 outside the fades.
     pub fn fade_factor(&self, timeline_time_us: i64) -> f32 {
@@ -836,6 +853,13 @@ impl Project {
     }
 }
 
+/// The start or end of a clip, where its fade handles sit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FadeEdge {
+    In,
+    Out,
+}
+
 /// A frame size and rate offered for the project to match its first clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatOffer {
@@ -918,6 +942,35 @@ mod tests {
         let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
         p.apply_format(&FormatOffer { width: 1080, height: 1920, fps: RationalFps::FPS_60 }).unwrap();
         assert_eq!((p.width, p.height, p.fps), (1080, 1920, RationalFps::FPS_60));
+    }
+
+    fn ten_second_clip() -> Clip {
+        Clip::new(Uuid::new_v4(), Uuid::new_v4(), ClipType::Video, "c", 0, 10_000_000, 0, 10_000_000)
+    }
+
+    #[test]
+    fn with_fade_snaps_to_whole_frames() {
+        let c = ten_second_clip().with_fade(FadeEdge::In, 1_010_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, frame_to_us(30, RationalFps::FPS_30));
+        let c = c.with_fade(FadeEdge::Out, 500_000, RationalFps::FPS_25);
+        assert_eq!(c.properties.fade_out_us, 520_000); // 13 frames at 25 fps, the nearest whole frame
+    }
+
+    #[test]
+    fn with_fade_leaves_room_for_the_other_fade() {
+        let mut c = ten_second_clip();
+        c.properties.fade_out_us = 4_000_000;
+        let c = c.with_fade(FadeEdge::In, 9_000_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, 6_000_000);
+        assert_eq!(c.properties.fade_out_us, 4_000_000);
+    }
+
+    #[test]
+    fn with_fade_is_never_negative() {
+        let mut c = ten_second_clip();
+        c.properties.fade_in_us = 2_000_000;
+        let c = c.with_fade(FadeEdge::In, -500_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
-use tempo_timeline::{ClipType, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimEdge};
+use tempo_timeline::{ClipType, EditClipCommand, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimEdge};
 use uuid::Uuid;
 
 use crate::actions::{self, Place};
@@ -26,6 +26,9 @@ const EDGE_GRAB_PX: f64 = 6.0;
 /// A press becomes a drag only after the pointer has travelled this far.
 const DRAG_START_PX: f64 = 4.0;
 const SNAP_PX: f64 = 8.0;
+/// Fade handles: how far from a clip's top corner they can be grabbed, and their size.
+const FADE_GRAB_PX: f64 = 7.0;
+const FADE_HANDLE_PX: f32 = 8.0;
 pub const MIN_PPS: f64 = 0.5;
 pub const MAX_PPS: f64 = 400.0;
 
@@ -75,6 +78,8 @@ enum Drag {
     Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid },
     /// `roll` moves the cut between two touching clips (Shift in Trim mode).
     Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
+    /// Dragging a fade handle: the fade length at the start of the drag and now.
+    Fade { clip: Uuid, edge: FadeEdge, from: i64, to: i64 },
 }
 
 mod imp {
@@ -93,6 +98,8 @@ mod imp {
         /// Modifier keys held when the pointer went down.
         pub press_mods: Cell<gdk::ModifierType>,
         pub pointer_x: Cell<f64>,
+        /// The clip under the pointer, which shows its fade handles.
+        pub hover: Cell<Option<Uuid>>,
         pub snap_line: Cell<Option<i64>>,
         pub hadj: gtk::Adjustment,
         pub zoom_listener: RefCell<Option<Box<dyn Fn(f64)>>>,
@@ -118,6 +125,7 @@ mod imp {
                 dragging: Cell::new(false),
                 press_mods: Cell::new(gdk::ModifierType::empty()),
                 pointer_x: Cell::new(0.0),
+                hover: Cell::new(None),
                 snap_line: Cell::new(None),
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
                 zoom_listener: RefCell::new(None),
@@ -403,6 +411,13 @@ impl TimelineCanvas {
 
     /// Run a pointer press, drag and release through the same handlers the mouse
     /// uses. For scripted checks of the editing gestures.
+    /// Like `point_for`, but at the top edge of the row, where fade handles are.
+    pub fn top_point_for(&self, seconds: f64, track: &str) -> Option<(f64, f64)> {
+        let (x, y) = self.point_for(seconds, track)?;
+        let row = self.row_at(y)?;
+        Some((x, row.y as f64 + 3.0))
+    }
+
     pub fn simulate_drag(&self, from: (f64, f64), to: (f64, f64), mods: gdk::ModifierType) {
         self.imp().press_mods.set(mods);
         self.on_press(from.0, from.1);
@@ -414,6 +429,22 @@ impl TimelineCanvas {
             }
         }
         self.on_release();
+    }
+
+    /// A fade handle under the pointer: near a clip's top corner, or where its fade
+    /// ends. Locked tracks have none.
+    fn fade_hit(&self, x: f64, y: f64) -> Option<(Uuid, FadeEdge, i64)> {
+        // Only the top strip of an unlocked row holds fade handles.
+        self.row_at(y).filter(|r| !r.locked && y - (r.y as f64) < 2.0 * FADE_GRAB_PX)?;
+        let (_, id, _) = [0.0, -FADE_GRAB_PX, FADE_GRAB_PX].into_iter().find_map(|dx| self.hit(x + dx, y))?;
+        let (tin, tout, fade_in, fade_out) = self.state().with_timeline(|t| {
+            t.find_clip(id).map(|(_, c)| (c.timeline_in, c.timeline_out, c.properties.fade_in_us, c.properties.fade_out_us))
+        })??;
+        [(FadeEdge::In, tin + fade_in, fade_in), (FadeEdge::Out, tout - fade_out, fade_out)]
+            .into_iter()
+            .filter(|(_, at, _)| (self.x_of(*at) - x).abs() <= FADE_GRAB_PX)
+            .min_by(|a, b| (self.x_of(a.1) - x).abs().total_cmp(&(self.x_of(b.1) - x).abs()))
+            .map(|(edge, _, length)| (id, edge, length))
     }
 
     fn install_controllers(&self) {
@@ -461,12 +492,25 @@ impl TimelineCanvas {
             if let Some(c) = c.upgrade() {
                 c.imp().pointer_x.set(x);
                 let tool = c.state().tool.get();
-                let cursor = match (tool, c.hit(x, y)) {
+                let hit = c.hit(x, y);
+                if c.imp().hover.replace(hit.as_ref().map(|(_, id, _)| *id)) != hit.as_ref().map(|(_, id, _)| *id) {
+                    c.redraw();
+                }
+                let cursor = match (tool, hit) {
                     (Tool::Blade, Some(_)) => Some("crosshair"),
+                    (Tool::Select | Tool::Trim, _) if c.fade_hit(x, y).is_some() => Some("ew-resize"),
                     (Tool::Select | Tool::Trim, Some((_, _, Some(_)))) => Some("col-resize"),
                     _ => None,
                 };
                 c.set_cursor_from_name(cursor);
+            }
+        });
+        let c = self.downgrade();
+        motion.connect_leave(move |_| {
+            if let Some(c) = c.upgrade() {
+                if c.imp().hover.take().is_some() {
+                    c.redraw();
+                }
             }
         });
         self.add_controller(motion);
@@ -513,6 +557,15 @@ impl TimelineCanvas {
         if y < RULER_H as f64 {
             *imp.drag.borrow_mut() = Some(Drag::Scrub);
             self.scrub(x);
+            return;
+        }
+
+        let plain = !imp.press_mods.get().contains(gdk::ModifierType::CONTROL_MASK);
+        if let Some((id, edge, length)) = self.fade_hit(x, y).filter(|_| plain && state.tool.get() != Tool::Blade) {
+            if !state.is_selected(id) {
+                state.select(Some(id));
+            }
+            *imp.drag.borrow_mut() = Some(Drag::Fade { clip: id, edge, from: length, to: length });
             return;
         }
 
@@ -659,6 +712,10 @@ impl TimelineCanvas {
         let delta_us = ((x - px) / self.pps() * 1_000_000.0) as i64;
         let mut drag = imp.drag.borrow_mut();
         match drag.as_mut() {
+            Some(Drag::Fade { edge, from, to, .. }) => {
+                // Toward the middle of the clip lengthens the fade.
+                *to = (*from + if *edge == FadeEdge::In { delta_us } else { -delta_us }).max(0);
+            }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
                 let raw = (*orig_in + delta_us).max(0);
                 let moving = self.moving_with(*clip);
@@ -742,6 +799,12 @@ impl TimelineCanvas {
                     actions::move_selected(&state, new_in - orig_in, shift);
                 } else if new_in != orig_in || to_track != from_track {
                     state.execute(Box::new(MoveClipCommand::new(clip, from_track, to_track, orig_in, new_in)));
+                }
+            }
+            Some(Drag::Fade { clip, edge, from, to }) if to != from => {
+                let edited = state.with_project(|p| p.timeline.find_clip(clip).map(|(_, c)| c.with_fade(edge, to, p.fps))).flatten();
+                if let Some(edited) = edited {
+                    state.execute(Box::new(EditClipCommand::new(if edge == FadeEdge::In { "Fade In" } else { "Fade Out" }, edited)));
                 }
             }
             // Trim mode ripples (later clips follow), or rolls the cut with Shift.
@@ -955,6 +1018,40 @@ impl TimelineCanvas {
                     let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
                     s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
                     s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);
+                }
+                // Fades: a ramp from the corner down to where the fade ends, and handles
+                // on the clip under the pointer.
+                let (mut fade_in, mut fade_out) = (clip.properties.fade_in_us, clip.properties.fade_out_us);
+                if let Some(Drag::Fade { clip: id, edge, to, .. }) = &dragging {
+                    if *id == clip.id {
+                        let preview = clip.with_fade(*edge, *to, state.with_project(|p| p.fps).unwrap_or_default());
+                        (fade_in, fade_out) = (preview.properties.fade_in_us, preview.properties.fade_out_us);
+                    }
+                }
+                let (top, bottom) = (body.y(), bar_y);
+                for (corner, end, length) in [(x0, self.x_of(tin + fade_in) as f32, fade_in), (x1, self.x_of(tout - fade_out) as f32, fade_out)] {
+                    if length <= 0 {
+                        continue;
+                    }
+                    let shade = gsk::PathBuilder::new();
+                    shade.move_to(corner, top);
+                    shade.line_to(end, top);
+                    shade.line_to(corner, bottom);
+                    shade.close();
+                    s.append_fill(&shade.to_path(), gsk::FillRule::Winding, &gdk::RGBA::new(0.0, 0.0, 0.0, 0.35));
+                    let ramp = gsk::PathBuilder::new();
+                    ramp.move_to(corner, bottom);
+                    ramp.line_to(end, top);
+                    s.append_stroke(&ramp.to_path(), &gsk::Stroke::new(1.5), &white);
+                }
+                let hovered = imp.hover.get() == Some(clip.id) || matches!(&dragging, Some(Drag::Fade { clip: id, .. }) if *id == clip.id);
+                if hovered && !row.locked {
+                    for at in [self.x_of(tin + fade_in) as f32, self.x_of(tout - fade_out) as f32] {
+                        let x = (at - FADE_HANDLE_PX / 2.0).clamp(x0, (x1 - FADE_HANDLE_PX).max(x0));
+                        let handle = gsk::RoundedRect::from_rect(rect(x, top + 1.0, FADE_HANDLE_PX, FADE_HANDLE_PX), 2.0);
+                        s.append_color(&white, handle.bounds());
+                        s.append_border(&handle, &[1.0; 4], &[gdk::RGBA::new(0.0, 0.0, 0.0, 0.6); 4]);
+                    }
                 }
                 if state.is_selected(clip.id) {
                     s.append_border(&rounded, &[2.0; 4], &[accent; 4]);
