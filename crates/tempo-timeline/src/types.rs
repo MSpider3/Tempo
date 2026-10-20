@@ -86,7 +86,9 @@ pub struct Keyframe {
     pub value: f32,
 }
 
+/// Fields missing from saved data take their default value, so older and newer files load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClipProperties {
     pub opacity: f32,
     pub position_x: f32,
