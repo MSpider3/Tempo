@@ -6,6 +6,69 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Change Clip Speed** on `R`, as in DaVinci Resolve. You set a speed from 25 % to 400 %.
+  - With **Ripple Sequence** on (the default), the clip changes length and later clips move
+    with it.
+  - With it off, the clip keeps its length and never covers the next clip.
+  - The linked sound changes with the picture.
+  - The sound's pitch moves with the speed, in preview and in export.
+  - Retimed clips show their speed after their name.
+- **Fade handles** on timeline clips: hover a clip and drag a top corner toward the middle.
+  Fades snap to whole frames and are drawn as ramps.
+- **Solo** (`S`) on audio track headers. It is for listening only: export still includes every
+  enabled track.
+- **Change Project Frame Rate?** When the first video goes into an empty project, Tempo
+  offers to match the project to the clip's size and frame rate. Odd rates snap to the
+  nearest standard one, and portrait clips get a vertical project.
+- **Project Backups**, kept like Resolve's: every 10 minutes while you edit, 6 from the last
+  hour, one per hour for today and one per day for 5 days.
+  - Each backup is checked before it is kept.
+  - Right-click a project and choose **Project Backups…** to open one as a copy. The
+    original is never changed.
+  - A project written by an older Tempo is copied to `<file>.v<N>.bak` before it is upgraded.
+- A **≤ 10 MB** export card for Discord and email. It picks the bitrate (and 720p when
+  needed) so the file fits, and is greyed out when the export is too long to fit watchably.
+- Shortcut hints in the bottom bar for what is under the pointer, read from the keybind
+  table.
+- `scripts/bench_playback.sh` and `docs/PERF.md`: a playback benchmark and its results.
+
+### Changed
+
+- Playback decodes more cheaply (no deblocking, half height) while it can't keep up, and
+  returns to full quality when it stops or seeks. On a 4K60 stress clip, dropped frames
+  fell from 83 % to 9.5 %.
+- Moving the playhead no longer redraws the whole timeline. This cut redraws during
+  playback from about 30 per second to none, and CPU use by 20–37 %.
+- Decoded frames are shared with the viewer instead of copied.
+- Proxies:
+  - They are made only for footage that is on the timeline.
+  - They are encoded on the graphics chip when it can (VA-API), falling back to the
+    processor.
+  - They now carry the clip's sound, so playback reads one small file.
+- At start-up Tempo checks whether hardware decoding and encoding really work. If saved
+  settings ask for something the machine can't do, those settings are switched off and
+  you are told once.
+- Titles are beige on the timeline, and clips with adjustments are a darker shade, as in
+  Resolve.
+- Choosing 9:16 on a landscape timeline defaults to Fill.
+- Track header buttons are smaller and left-aligned.
+
+### Fixed
+
+- A failed undo could leave the undo history out of step with the timeline.
+- A project whose clip settings could not be read opened with those settings reset, and
+  the next save made the loss permanent. Such a project now refuses to open and points to
+  its backups.
+- A proxy marked ready whose file was gone was never rebuilt.
+- Playback could show a frame from before a clip's In point. The frame grid also no
+  longer drifts at 29.97 and 59.94 fps.
+
+### Removed
+
+- Three files in `tempo-audio` that were never compiled.
+
 ## [0.1.1] - 2026-10-06
 
 Alpha. Fixes for the problems found in the first hands-on test of 0.1.0, and for more of
