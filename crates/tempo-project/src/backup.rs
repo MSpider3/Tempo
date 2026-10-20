@@ -5,13 +5,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use tempo_timeline::Project;
 
 use crate::error::{ProjectError, Result};
 use crate::project::{load_project, save_project};
 
-const NAME_FORMAT: &str = "%Y%m%d-%H%M%S";
+/// Backup files are named by the time in UTC, so the hour repeated when daylight saving
+/// ends can't make a newer backup look older. They are shown and kept by local time.
+const NAME_FORMAT: &str = "%Y%m%d-%H%M%SZ";
 const EXTENSION: &str = "tempo";
 
 /// How often to back up and how many to keep. The defaults are Resolve's.
@@ -42,7 +44,7 @@ pub struct BackupEntry {
 /// longer keeps. Blocking: call from a worker thread.
 pub fn write_backup(project: &Project, dir: &Path, now: DateTime<Local>, policy: &BackupPolicy) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let name = format!("{}.{EXTENSION}", now.format(NAME_FORMAT));
+    let name = format!("{}.{EXTENSION}", now.with_timezone(&Utc).format(NAME_FORMAT));
     let target = dir.join(&name);
     // Hidden while unfinished, so a half-written file is never listed as a backup.
     let partial = dir.join(format!(".{name}.part"));
@@ -97,9 +99,8 @@ pub fn list_backups(dir: &Path) -> Result<Vec<BackupEntry>> {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        let taken = NaiveDateTime::parse_from_str(stem, NAME_FORMAT).ok().and_then(|t| Local.from_local_datetime(&t).earliest());
-        if let Some(taken) = taken {
-            entries.push(BackupEntry { path, taken });
+        if let Ok(utc) = NaiveDateTime::parse_from_str(stem, NAME_FORMAT) {
+            entries.push(BackupEntry { path, taken: Utc.from_utc_datetime(&utc).with_timezone(&Local) });
         }
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.taken));
@@ -218,6 +219,8 @@ mod tests {
         let listed = list_backups(dir.path()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, path);
+        assert_eq!(listed[0].taken, at("2026-10-20 10:00"), "the time read back from the name is the time taken");
+        assert!(path.to_string_lossy().ends_with("Z.tempo"), "named in UTC");
         // Only the finished backup remains: no partial file or SQLite sidecars.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
