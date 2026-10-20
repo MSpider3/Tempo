@@ -13,6 +13,17 @@ pub enum H264Encoder {
     OpenH264,
 }
 
+/// H.264 held to `kbps`, for exports that must fit a file size.
+/// shortcut: one pass can overshoot on noisy footage; switch to two passes if the size check after export ever fails on real projects.
+pub fn h264_capped_args(kbps: u32) -> Vec<String> {
+    match h264_encoder() {
+        H264Encoder::X264 => ["-c:v", "libx264", "-preset", "veryfast", "-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k"), "-bufsize", &format!("{}k", kbps * 2)]
+            .map(String::from)
+            .to_vec(),
+        H264Encoder::OpenH264 => ["-c:v", "libopenh264", "-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k")].map(String::from).to_vec(),
+    }
+}
+
 /// The render node VA-API encoding uses.
 pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 

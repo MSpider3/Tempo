@@ -41,6 +41,20 @@ pub struct TimelineExport {
     /// Try the graphics chip's H.264 encoder (VA-API) first. If it cannot be
     /// used, the export is done again with the software encoder.
     pub hardware: bool,
+    /// Cap the picture at this many kb/s instead of using `crf`, to make a file fit a
+    /// size limit (see `bitrate_for_size`). Always encoded on the processor.
+    pub max_video_kbps: Option<u32>,
+}
+
+/// The picture bitrate that keeps `duration_us` of video plus `audio_kbps` of sound
+/// under `target_bytes`, leaving 5 % for the container and the encoder's overshoot.
+/// `None` when that would be under 200 kb/s, too little to watch.
+pub fn bitrate_for_size(target_bytes: u64, duration_us: i64, audio_kbps: u32) -> Option<u32> {
+    if duration_us <= 0 {
+        return None;
+    }
+    let total_kbps = (target_bytes as f64 * 8.0 * 0.95 / 1000.0 / (duration_us as f64 / 1e6)).floor() as i64;
+    u32::try_from(total_kbps - audio_kbps as i64).ok().filter(|kbps| *kbps >= 200)
 }
 
 fn secs(us: i64) -> String {
@@ -431,11 +445,11 @@ fn build_args(
     } else if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
-    if e.hardware {
+    match (e.max_video_kbps, e.hardware) {
+        (Some(kbps), _) => args.extend(crate::ffmpeg::h264_capped_args(kbps)),
         // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
-        args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]);
-    } else {
-        args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
+        (None, true) => args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]),
+        (None, false) => args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false)),
     }
     if section.is_some() {
         args.extend(["-f".into(), "matroska".into()]);
@@ -507,7 +521,7 @@ fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
 /// and removes the partial file. Blocking: call from a worker thread.
 pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<()> {
-    if e.hardware {
+    if e.hardware && e.max_video_kbps.is_none() {
         match run_ffmpeg(project, e, cancel, &mut progress) {
             Ok(()) => return Ok(()),
             Err(_) if cancel.load(Ordering::Relaxed) => return Err(ExportError::Ffmpeg("Cancelled".into())),
@@ -706,7 +720,54 @@ mod tests {
     }
 
     fn settings(output: PathBuf) -> TimelineExport {
-        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false }
+        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false, max_video_kbps: None }
+    }
+
+    #[test]
+    fn bitrate_fits_the_size_with_headroom() {
+        // 10 MB over 60 s: 1266 kb/s in all, less 96 for sound.
+        assert_eq!(bitrate_for_size(10_000_000, 60_000_000, 96), Some(1170));
+        assert_eq!(bitrate_for_size(10_000_000, 10_000_000, 96), Some(7504));
+        // Too long to look like anything at 10 MB.
+        assert_eq!(bitrate_for_size(10_000_000, 300_000_000, 96), None);
+        assert_eq!(bitrate_for_size(10_000_000, 0, 96), None);
+    }
+
+    #[test]
+    fn size_capped_export_stays_under_ten_megabytes() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        // Moving grain is the hardest thing to squeeze; a test pattern would pass too easily.
+        let dir = std::env::temp_dir().join(format!("tempo-discord-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("grain.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=40", "-f", "lavfi", "-i", "sine=duration=40"])
+            .args(["-vf", "noise=alls=20:allf=t", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-c:a", "aac", "-shortest"])
+            .arg(&input)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no x264 here
+        }
+        let mut project = Project::new("t", 1280, 720, RationalFps::FPS_30);
+        let mut source = MediaSource::new(input, MediaType::Video, 40_000_000);
+        source.audio_channels = Some(1);
+        let v = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).unwrap();
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        for (track, kind) in [(v, ClipType::Video), (a, ClipType::Audio)] {
+            project.timeline.find_track_mut(track).unwrap().clips.push(Clip::new(track, source.id, kind, "c", 0, 40_000_000, 0, 40_000_000));
+        }
+        project.sources.insert(source.id, source);
+        let output = dir.join("discord.mp4");
+        let kbps = bitrate_for_size(10_000_000, 40_000_000, 96).unwrap();
+        let e = TimelineExport { width: 1280, height: 720, max_video_kbps: Some(kbps), ..settings(output.clone()) };
+        export_timeline(&project, &e, &AtomicBool::new(false), |_| {}).expect("export");
+        let size = std::fs::metadata(&output).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(size <= 10_000_000, "{size} bytes");
+        assert!(size >= 6_000_000, "{size} bytes: the cap, not the quality setting, should decide the size");
     }
 
     #[test]
