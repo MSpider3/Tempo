@@ -26,6 +26,26 @@ jobs:
             gtk4-devel libadwaita-devel glib2-devel pipewire-devel \
             ffmpeg-free ffmpeg-free-devel
 
+      # Fedora's FFmpeg encodes H.264 with Cisco's OpenH264, from a separate repository
+      # (codecs.fedoraproject.org). When that repository doesn't answer, dnf quietly
+      # installs "noopenh264", a stand-in that can't encode, and making the test clips
+      # fails. Swap in the real one, retrying, and stop with a clear message if we can't.
+      - name: Make sure the real OpenH264 is installed
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if rpm -q noopenh264 >/dev/null 2>&1; then
+              dnf swap -y --refresh noopenh264 openh264 || true
+            fi
+            if ffmpeg -v error -f lavfi -i testsrc2=size=64x64:duration=0.1 -c:v libopenh264 -f null -; then
+              echo "OpenH264 works ($(rpm -q openh264))"
+              exit 0
+            fi
+            echo "OpenH264 can't encode yet (attempt $attempt); waiting for Cisco's repository"
+            sleep 30
+          done
+          echo "::error::Could not install Cisco's OpenH264 (codecs.fedoraproject.org did not answer). This is a download problem, not a Tempo problem: re-run the job later."
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/cache@v4
