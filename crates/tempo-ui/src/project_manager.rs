@@ -97,6 +97,8 @@ fn duplicate_project(path: &Path) -> Result<(), String> {
     std::fs::copy(path, &copy).map_err(|e| e.to_string())?;
     let mut project = tempo_project::load_project(&copy).map_err(|e| e.to_string())?;
     project.name = format!("{} copy", project.name);
+    // A new project of its own, with its own backups.
+    project.id = uuid::Uuid::new_v4();
     tempo_project::save_project(&project, &copy).map_err(|e| e.to_string())?;
     remember(&project.name, &copy);
     Ok(())
@@ -114,6 +116,8 @@ fn restore_backup(backup: &Path, taken: &str, original: &Path) -> Result<(PathBu
     std::fs::copy(backup, &copy).map_err(|e| e.to_string())?;
     let mut project = tempo_project::load_project(&copy).map_err(|e| e.to_string())?;
     project.name = format!("{} (backup {taken})", project.name);
+    // Its own id, so its backups don't mix with (and prune) the original's.
+    project.id = uuid::Uuid::new_v4();
     tempo_project::save_project(&project, &copy).map_err(|e| e.to_string())?;
     Ok((copy, project.name))
 }
@@ -572,7 +576,9 @@ mod tests {
         let (copy, name) = super::restore_backup(&backup, "2026-10-20 10.00", &original).expect("restore");
         assert_eq!(copy, dir.join("Film (backup 2026-10-20 10.00).tempo"));
         assert_eq!(name, "Film (backup 2026-10-20 10.00)");
-        assert_eq!(tempo_project::load_project(&copy).expect("load").name, name);
+        let restored = tempo_project::load_project(&copy).expect("load");
+        assert_eq!(restored.name, name);
+        assert_ne!(restored.id, tempo_project::read_project_id(&backup).expect("id"), "the copy is a project of its own");
         assert_eq!(std::fs::read(&original).expect("read"), before);
         // A second restore of the same backup does not overwrite the first copy.
         assert!(super::restore_backup(&backup, "2026-10-20 10.00", &original).is_err());

@@ -69,6 +69,10 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         ],
     )?;
 
+    // A file holds one project: a copy saved under a new id must not keep the old row,
+    // or loading could read it instead.
+    tx.execute("DELETE FROM project_meta WHERE id <> ?1", params![project.id.to_string()])?;
+
     // 2. Clear dynamic tables to overwrite with current project state in transaction
     tx.execute("DELETE FROM media_sources", [])?;
     tx.execute("DELETE FROM tracks", [])?;
@@ -1035,6 +1039,19 @@ mod tests {
     fn files_without_speed_load_at_normal_speed() {
         let (file, _) = tampered(r#"UPDATE clips SET properties = '{"opacity":1.0}';"#);
         assert_eq!(load_project(file.path()).unwrap().timeline.tracks[0].clips[0].properties.speed, 1.0);
+    }
+
+    #[test]
+    fn a_copy_saved_under_a_new_id_loads_as_that_project() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Original", 1920, 1080, RationalFps::FPS_30);
+        save_project(&project, file.path()).unwrap();
+        project.id = Uuid::new_v4();
+        project.name = "Copy".into();
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!((loaded.id, loaded.name.as_str()), (project.id, "Copy"));
+        assert_eq!(crate::read_project_id(file.path()).unwrap(), project.id);
     }
 
     #[test]
