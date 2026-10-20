@@ -208,6 +208,8 @@ fn build_args(
     metadata_file: Option<&PathBuf>,
     section: Option<bool>,
 ) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
+    // A size limit always uses the processor's encoder, which keeps to a bitrate.
+    let hardware = e.hardware && e.max_video_kbps.is_none();
     let mut text_files: Vec<(PathBuf, String)> = Vec::new();
     let sx = ((e.width.max(16) + 1) & !1) as f32 / project.width.max(1) as f32;
     let sy = ((e.height.max(16) + 1) & !1) as f32 / project.height.max(1) as f32;
@@ -358,7 +360,7 @@ fn build_args(
         graph.push(format!("[{base}][{label}]overlay=eof_action=pass:format=auto[{next}]"));
         base = next;
     }
-    if e.hardware {
+    if hardware {
         graph.push(format!("[{base}]format=nv12,hwupload[vout]"));
     } else {
         graph.push(format!("[{base}]format=yuv420p[vout]"));
@@ -437,7 +439,7 @@ fn build_args(
 
     // ---- Command line.
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-nostats".into(), "-progress".into(), "pipe:1".into()];
-    if e.hardware {
+    if hardware {
         args.extend(["-vaapi_device".into(), crate::ffmpeg::VAAPI_DEVICE.into()]);
     }
     args.extend(inputs);
@@ -451,7 +453,7 @@ fn build_args(
     } else if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
-    match (e.max_video_kbps, e.hardware) {
+    match (e.max_video_kbps, hardware) {
         (Some(kbps), _) => args.extend(crate::ffmpeg::h264_capped_args(kbps)),
         // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
         (None, true) => args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]),
@@ -860,6 +862,35 @@ mod tests {
         let _ = std::fs::remove_file(&out);
         assert!((duration - 1.5).abs() < 0.1, "duration was {duration}");
         assert!((click_at - 0.5).abs() < 0.02, "click at {click_at} s");
+    }
+
+    #[test]
+    fn hardware_export_runs_on_the_graphics_chip() {
+        let Some(path) = sample() else { return };
+        if !crate::ffmpeg::vaapi_h264_available() {
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("tempo-hw-export-{}.mp4", std::process::id()));
+        let e = TimelineExport { hardware: true, ..settings(out.clone()) };
+        // run_ffmpeg, not export_timeline: no quiet fallback to the processor here.
+        let result = run_ffmpeg(&project_with_clip(path), &e, &AtomicBool::new(false), &mut |_| {});
+        let exists = out.exists();
+        let _ = std::fs::remove_file(&out);
+        result.expect("hardware export");
+        assert!(exists);
+    }
+
+    #[test]
+    fn size_cap_wins_over_the_hardware_setting() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("tempo-capped-hw-{}.mp4", std::process::id()));
+        let e = TimelineExport { hardware: true, max_video_kbps: Some(2_000), ..settings(out.clone()) };
+        let result = run_ffmpeg(&project_with_clip(path), &e, &AtomicBool::new(false), &mut |_| {});
+        let _ = std::fs::remove_file(&out);
+        result.expect("a size-capped export uses the processor's encoder, whatever the hardware setting");
     }
 
     #[test]
