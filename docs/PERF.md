@@ -65,3 +65,22 @@ Observations:
 | 2026-10-20 | P1-T3 playhead on its own overlay layer; the canvas is redrawn only when clips, scroll or zoom change | canvas draws in 10 s playback: 1080p30 295 → 2, 1080p60 448 → 2; CPU 38 → 37 %, 59 → 59 % (within noise on this short timeline; the saving grows with clip count) | kept |
 | 2026-10-20 | P1-T4 decoded frames shared (`Arc`) instead of copied into the repeat cache and again into GTK | median of 5 vs previous commit: 1080p30 Full CPU 49 → 43 %, RSS 304 → 296 MB; 2160p30 at 540p 80 → 78 % (noise: 2 MB frames) | kept |
 | 2026-10-20 | P1-T6 proxies made only for footage on the timeline; VA-API encode when the start-up check passes (not on this machine), software otherwise; AAC sound inside the proxy, read by the audio feeder with the original as fallback | 2160p60_grain from a proxy: 0 dropped, CPU 34 % with sound from the proxy vs 36 % with sound from the 80 Mb/s original (both 0 dropped; median of 5). Proxy vs original file: 240 % → 34 % CPU, 82.9 % → 0 % dropped. Sound stays within ±1 ms (test). The HDD case it is meant for could not be measured here | kept |
+| 2026-10-20 | P1-T7 DMA-BUF zero-copy display (spike) | not measurable here: it only applies with hardware decoding, and this machine lacks the `iHD` VA-API driver. Not implemented. To run it: `sudo dnf install intel-media-driver` (RPM Fusion nonfree), confirm `vainfo` lists H.264 decode, then measure `HW=true ./scripts/bench_playback.sh` before and after; keep only if CPU falls ≥ 30 % and colours match within 3/255 | blocked |
+
+## After Phase 1 — 2026-10-20
+
+| case | preview | hw decode | played s | dropped | dropped % | peak RSS MB | CPU % | canvas draws |
+|---|---|---|---|---|---|---|---|---|
+| 1080p30 | 540p | false | 10.0 | 0 | 0.0 | 274 | 29 | 2 |
+| 1080p60 | 540p | false | 10.0 | 0 | 0.0 | 273 | 44 | 2 |
+| 2160p30 | 540p | false | 9.9 | 0 | 0.0 | 443 | 67 | 2 |
+| 2160p30_hevc | 540p | false | 10.0 | 0 | 0.0 | 452 | 96 | 2 |
+| 1080p30_full | Full | false | 10.0 | 0 | 0.0 | 308 | 33 | 2 |
+| 2160p60_grain | 540p | false | 9.6 | 55 | 9.5 | 462 | 165 | 2 |
+| 2160p60_grain_proxy | 540p | false | 10.0 | 0 | 0.0 | 245 | 23 | 2 |
+
+Against the baseline:
+
+- CPU is 20–37 % lower in every ordinary case, mostly because the timeline is no longer redrawn every frame.
+- The 4K60 stress case drops 83 % → 9.5 % of frames from the original, and 0 % from its proxy.
+- Peak memory stays under 0.5 GB.
