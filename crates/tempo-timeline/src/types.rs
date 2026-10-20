@@ -376,7 +376,7 @@ impl Clip {
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
     pub fn dissolve_lead(&self) -> Option<Clip> {
-        let d = self.properties.dissolve_in_us.min(self.to_timeline_us(self.source_in));
+        let d = self.properties.dissolve_in_us.min(self.to_timeline_floor_us(self.source_in));
         if d <= 0 {
             return None;
         }

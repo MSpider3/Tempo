@@ -290,8 +290,8 @@ impl Inspector {
         self.number_row(&grid, 1, "Fade Out s", p.fade_out_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_out());
         // Shown only once a dissolve exists; it is added from the Effects panel or with Ctrl+T.
         if p.dissolve_in_us > 0 {
-            let dissolve = edit("Cross Dissolve", |v, c| c.properties.dissolve_in_us = ((v * 1e6) as i64).min(c.to_timeline_us(c.source_in)));
-            self.number_row(&grid, 2, "Dissolve s", p.dissolve_in_us as f64 / 1e6, (0.0, clip.to_timeline_us(clip.source_in) as f64 / 1e6, 0.1, 1), clip, dissolve);
+            let dissolve = edit("Cross Dissolve", |v, c| c.properties.dissolve_in_us = ((v * 1e6) as i64).min(c.to_timeline_floor_us(c.source_in)));
+            self.number_row(&grid, 2, "Dissolve s", p.dissolve_in_us as f64 / 1e6, (0.0, clip.to_timeline_floor_us(clip.source_in) as f64 / 1e6, 0.1, 1), clip, dissolve);
         }
     }
 

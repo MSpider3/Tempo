@@ -2744,6 +2744,26 @@ mod tests {
         assert_eq!(timeline, before);
     }
 
+    #[test]
+    fn trimming_to_the_start_of_the_footage_works_at_any_speed() {
+        for speed in [0.75, 1.5, 3.0] {
+            let mut timeline = Timeline::new_default();
+            let track = timeline.tracks[0].id;
+            let mut clip = Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 2_000_000, 4_000_000, 1_000_000, 4_000_000);
+            clip.properties.speed = speed;
+            let id = clip.id;
+            timeline.tracks[0].clips.push(clip.clone());
+            // The furthest the start can go back: all the footage before the In point.
+            let head = clip.to_timeline_floor_us(clip.source_in);
+            TrimClipCommand::new(id, TrimEdge::In, -head).execute(&mut timeline).unwrap_or_else(|e| panic!("speed {speed}: {e}"));
+            assert!(timeline.find_clip(id).unwrap().1.source_in >= 0);
+            // And a dissolve as long as the footage allows never reaches before the file.
+            let mut c = clip.clone();
+            c.properties.dissolve_in_us = 60_000_000; // longer than the footage: the lead-in limits itself
+            assert!(c.dissolve_lead().unwrap().source_in >= 0, "speed {speed}");
+        }
+    }
+
     /// Changes nothing; its undo fails when asked to.
     #[derive(Debug)]
     struct FailingCommand {

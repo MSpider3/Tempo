@@ -761,8 +761,8 @@ impl TimelineCanvas {
                         let before = track.clips.iter().map(|o| o.timeline_out).filter(|o| *o <= c.timeline_in).max().unwrap_or(0);
                         let after = track.clips.iter().map(|o| o.timeline_in).filter(|o| *o >= c.timeline_out).min();
                         // Unused footage before and after the clip, in timeline time at its speed.
-                        let head = c.to_timeline_us(c.source_in);
-                        let tail = footage.map(|d| c.to_timeline_us((d - c.source_out).max(0)));
+                        let head = c.to_timeline_floor_us(c.source_in);
+                        let tail = footage.map(|d| c.to_timeline_floor_us((d - c.source_out).max(0)));
                         Some((c.timeline_in, c.timeline_out, head, tail, still, before, after))
                     })
                     .flatten();
@@ -1041,7 +1041,7 @@ impl TimelineCanvas {
                 s.pop();
                 // A cross dissolve is marked by a box reaching back over the previous clip.
                 if clip.properties.dissolve_in_us > 0 && track.has_clip_ending_at(clip.timeline_in) {
-                    let lead = (clip.properties.dissolve_in_us.min(clip.to_timeline_us(clip.source_in)) as f64 / 1_000_000.0 * self.pps()) as f32;
+                    let lead = (clip.properties.dissolve_in_us.min(clip.to_timeline_floor_us(clip.source_in)) as f64 / 1_000_000.0 * self.pps()) as f32;
                     let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
                     s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
                     s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);

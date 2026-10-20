@@ -358,7 +358,7 @@ pub fn cross_dissolve(state: &Rc<AppState>, seconds: f64) {
             reason = Some("A cross dissolve needs a clip touching the start of the selected one.");
             continue;
         };
-        let length = if wanted == 0 { 0 } else { wanted.min(clip.to_timeline_us(clip.source_in)).min(previous / 2) };
+        let length = if wanted == 0 { 0 } else { wanted.min(clip.to_timeline_floor_us(clip.source_in)).min(previous / 2) };
         if wanted > 0 && length < frame {
             reason = Some("This clip starts at the very beginning of its footage, so there is nothing to dissolve from. Trim its start a little first.");
             continue;
