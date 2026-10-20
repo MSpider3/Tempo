@@ -3,6 +3,7 @@ use uuid::Uuid;
 use crate::error::{Result, TimelineError};
 use crate::types::{Clip, ClipType, Marker, Timeline};
 
+/// `execute` and `undo` either succeed or leave the timeline as it was.
 pub trait Command: Send + Sync + Debug {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()>;
     fn undo(&mut self, timeline: &mut Timeline) -> Result<()>;
@@ -59,8 +60,11 @@ impl CommandLog {
         if !self.can_undo() {
             return Err(TimelineError::NothingToUndo);
         }
-        self.cursor -= 1;
-        self.history[self.cursor].undo(timeline)
+        // Move the cursor only once the undo has worked, so a failure changes nothing.
+        let idx = self.cursor - 1;
+        self.history[idx].undo(timeline)?;
+        self.cursor = idx;
+        Ok(())
     }
 
     pub fn redo(&mut self, timeline: &mut Timeline) -> Result<()> {
@@ -1335,8 +1339,14 @@ impl Command for CompositeCommand {
     }
 
     fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
-        for cmd in self.commands.iter_mut().rev() {
-            cmd.undo(timeline)?;
+        for i in (0..self.commands.len()).rev() {
+            if let Err(e) = self.commands[i].undo(timeline) {
+                // Redo the part already undone so a failure changes nothing.
+                for done in &mut self.commands[i + 1..] {
+                    let _ = done.execute(timeline);
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -2399,5 +2409,59 @@ mod tests {
         assert_eq!(timeline, before);
         log.redo(&mut timeline).unwrap();
         assert_eq!(timeline, other);
+    }
+
+    /// Changes nothing; its undo fails when asked to.
+    #[derive(Debug)]
+    struct FailingCommand {
+        fail_undo: bool,
+    }
+
+    impl Command for FailingCommand {
+        fn execute(&mut self, _: &mut Timeline) -> Result<()> {
+            Ok(())
+        }
+        fn undo(&mut self, _: &mut Timeline) -> Result<()> {
+            if self.fail_undo {
+                return Err(TimelineError::CommandFailed("injected".into()));
+            }
+            Ok(())
+        }
+        fn description(&self) -> &str {
+            "failing"
+        }
+    }
+
+    fn faded(timeline: &mut Timeline) -> Box<dyn Command> {
+        let mut clip = Clip::new(timeline.tracks[0].id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 0, 2_000_000);
+        timeline.tracks[0].clips.push(clip.clone());
+        clip.properties.fade_in_us = 500_000;
+        Box::new(EditClipCommand::new("Fade", clip))
+    }
+
+    #[test]
+    fn undo_failure_keeps_cursor() {
+        let mut timeline = Timeline::new_default();
+        let mut log = CommandLog::new();
+        let fade = faded(&mut timeline);
+        log.execute(fade, &mut timeline).unwrap();
+        log.execute(Box::new(FailingCommand { fail_undo: true }), &mut timeline).unwrap();
+        assert!(log.undo(&mut timeline).is_err());
+        assert_eq!(log.cursor(), 2);
+        assert!(!log.can_redo());
+    }
+
+    #[test]
+    fn composite_undo_failure_restores_children_already_undone() {
+        let mut timeline = Timeline::new_default();
+        let fade = faded(&mut timeline);
+        let mut log = CommandLog::new();
+        // Undo runs in reverse: the fade is undone first, then the failing command fails.
+        let composite = CompositeCommand::new("both", vec![Box::new(FailingCommand { fail_undo: true }), fade]);
+        log.execute(Box::new(composite), &mut timeline).unwrap();
+        let after = timeline.clone();
+        assert!(log.undo(&mut timeline).is_err());
+        assert_eq!(timeline, after);
+        assert_eq!(log.cursor(), 1);
     }
 }
