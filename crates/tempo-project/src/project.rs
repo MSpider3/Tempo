@@ -1055,6 +1055,20 @@ mod tests {
     }
 
     #[test]
+    fn a_retimed_clip_saves_and_loads() {
+        // At double speed a clip covers twice as much source as timeline.
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Speed", 1920, 1080, RationalFps::FPS_30);
+        let track = project.timeline.tracks[0].id;
+        let mut clip = Clip::new(track, Uuid::new_v4(), ClipType::Video, "fast", 0, 2_000_000, 1_000_000, 5_000_000);
+        clip.properties.speed = 2.0;
+        project.timeline.tracks[0].clips.push(clip.clone());
+        save_project(&project, file.path()).expect("save a retimed clip");
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].clips[0], clip);
+    }
+
+    #[test]
     fn titles_with_missing_fields_still_load() {
         let (file, _) = tampered(r#"UPDATE clips SET title_data = '{"text":"Hello"}';"#);
         let loaded = load_project(file.path()).unwrap();

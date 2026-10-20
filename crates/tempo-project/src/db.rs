@@ -59,6 +59,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_schema_1_project_upgrades_keeping_its_clips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.tempo");
+        {
+            // A file as 0.1.x wrote it: schema 1 only, with one clip.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(crate::migration::MIGRATIONS[0].sql).unwrap();
+            conn.execute_batch(
+                "INSERT INTO schema_version VALUES (1, 0, 'Initial schema');
+                 INSERT INTO clips (id, track_id, source_id, clip_type, name, timeline_in, timeline_out, source_in, source_out)
+                 VALUES ('c1', 't1', 's1', 0, 'kept', 0, 1000000, 0, 1000000);",
+            )
+            .unwrap();
+        }
+        let conn = open_connection(&path).unwrap();
+        let name: String = conn.query_row("SELECT name FROM clips WHERE id = 'c1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(name, "kept");
+        let version: u32 = conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(dir.path().join("old.tempo.v1.bak").exists(), "copied before upgrading");
+        // A retimed clip (2 s of source in 1 s of timeline) is now allowed.
+        conn.execute(
+            "INSERT INTO clips (id, track_id, source_id, clip_type, name, timeline_in, timeline_out, source_in, source_out)
+             VALUES ('c2', 't1', 's1', 0, 'fast', 1000000, 2000000, 0, 2000000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn opening_old_schema_backs_up_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.tempo");
