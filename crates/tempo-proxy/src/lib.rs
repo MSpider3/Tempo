@@ -90,7 +90,10 @@ fn run_ffmpeg(
     let mut command = Command::new("ffmpeg");
     command.args(["-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]);
     if let Some(device) = device {
-        command.args(["-vaapi_device", device]);
+        // Decode, scale and encode all on the graphics chip: measured 5x faster than
+        // decoding on the processor and uploading full-size frames, at a third of the CPU.
+        // Footage the chip can't decode makes this fail, and the caller retries in software.
+        command.args(["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]);
     }
     // One thread to decode, one to scale, one to encode: about a third of a
     // four-thread processor, measured, instead of nearly all of it.
@@ -99,7 +102,7 @@ fn run_ffmpeg(
     command.args(["-map", "0:v:0", "-map", "0:a:0?", "-filter_threads", "1"]);
     match device {
         Some(_) => {
-            command.args(["-vf", &format!("format=nv12,hwupload,scale_vaapi=w=-2:h={PROXY_HEIGHT}"), "-c:v", "h264_vaapi", "-qp", "28"]);
+            command.args(["-vf", &format!("scale_vaapi=w=-2:h={PROXY_HEIGHT}"), "-c:v", "h264_vaapi", "-qp", "28"]);
         }
         None => {
             command
@@ -280,6 +283,29 @@ mod tests {
         let _ = std::fs::remove_file(&output);
         result.expect("software fallback");
         assert!(made);
+    }
+
+    #[test]
+    fn footage_the_graphics_chip_cannot_decode_still_gets_a_proxy() {
+        // MPEG-4 Part 2 has no VA-API decoder on Intel: the GPU attempt fails and the
+        // processor makes the proxy instead.
+        let dir = std::env::temp_dir().join(format!("tempo-proxy-mpeg4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("old.avi");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=2", "-c:v", "mpeg4"])
+            .arg(&input)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        let output = dir.join("proxy.mp4");
+        let result = make_proxy(&input, &output, 2_000_000, &AtomicBool::new(false), &AtomicBool::new(false), &mut |_| {}, Some(tempo_export::ffmpeg::VAAPI_DEVICE));
+        let made_proxy = output.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("proxy");
+        assert!(made_proxy);
     }
 
     #[test]
