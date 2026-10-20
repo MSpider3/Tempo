@@ -100,6 +100,9 @@ mod imp {
         pub fit_pending: Cell<bool>,
         /// The right-click menu while it is open.
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The playhead, drawn on its own layer above the canvas so moving it does
+        /// not redraw every clip.
+        pub playhead_layer: RefCell<Option<super::PlayheadLayer>>,
     }
 
     impl Default for TimelineCanvas {
@@ -120,6 +123,7 @@ mod imp {
                 zoom_listener: RefCell::new(None),
                 fit_pending: Cell::new(false),
                 menu: RefCell::new(None),
+                playhead_layer: RefCell::new(None),
             }
         }
     }
@@ -183,15 +187,15 @@ impl TimelineCanvas {
                     Change::Project => {
                         c.imp().scroll.set(0.0);
                         c.update_adjustment();
-                        c.queue_draw();
+                        c.redraw();
                     }
                     Change::Timeline => {
                         // An edit may have moved the playhead (after an insert, say).
                         c.imp().playhead.set(c.state().playhead_us());
                         c.update_adjustment();
-                        c.queue_draw();
+                        c.redraw();
                     }
-                    Change::Selection | Change::Options | Change::Waveform => c.queue_draw(),
+                    Change::Selection | Change::Options | Change::Waveform => c.redraw(),
                     _ => {}
                 }
             }
@@ -210,7 +214,7 @@ impl TimelineCanvas {
             if let Some(c) = c.upgrade() {
                 if (c.imp().scroll.get() - adj.value()).abs() > 0.5 {
                     c.imp().scroll.set(adj.value());
-                    c.queue_draw();
+                    c.redraw();
                 }
             }
         });
@@ -256,7 +260,7 @@ impl TimelineCanvas {
     fn set_scroll(&self, px: f64) {
         self.imp().scroll.set(px.max(0.0));
         self.update_adjustment();
-        self.queue_draw();
+        self.redraw();
     }
 
     /// Change zoom keeping the time under `anchor_x` in place.
@@ -306,7 +310,8 @@ impl TimelineCanvas {
             self.set_scroll(us as f64 / 1_000_000.0 * self.pps() - w * lead);
             return;
         }
-        self.queue_draw();
+        // Only the playhead moved: the clips need not be drawn again.
+        self.redraw_playhead();
     }
 
     fn row_at(&self, y: f64) -> Option<Row> {
@@ -715,7 +720,7 @@ impl TimelineCanvas {
             _ => return,
         }
         drop(drag);
-        self.queue_draw();
+        self.redraw();
     }
 
     fn on_release(&self) {
@@ -752,7 +757,7 @@ impl TimelineCanvas {
             }
             _ => {}
         }
-        self.queue_draw();
+        self.redraw();
     }
 
     // ---- Drawing -------------------------------------------------------------
@@ -996,17 +1001,76 @@ impl TimelineCanvas {
             }
         }
 
-        // Snap guide and playhead.
+        // Snap guide. The playhead is drawn by `PlayheadLayer`.
         if let Some(us) = imp.snap_line.get() {
             s.append_color(&white, &rect(self.x_of(us) as f32, RULER_H, 1.0, h - RULER_H));
         }
-        let px = self.x_of(imp.playhead.get()) as f32;
+    }
+
+    fn draw_playhead(&self, s: &gtk::Snapshot) {
+        let (w, h) = (self.width() as f32, self.height() as f32);
+        let accent = css_color(self, "tempo_accent");
+        let rect = |x, y, w, h| graphene::Rect::new(x, y, w, h);
+        let px = self.x_of(self.imp().playhead.get()) as f32;
         if px >= -8.0 && px <= w + 8.0 {
             s.append_color(&accent, &rect(px, 0.0, 1.0, h));
             s.append_color(&accent, &rect(px - 6.0, RULER_H - 16.0, 13.0, 10.0));
             s.append_color(&accent, &rect(px - 3.0, RULER_H - 6.0, 7.0, 3.0));
         }
     }
+
+    /// Redraw the canvas and the playhead above it.
+    fn redraw(&self) {
+        self.queue_draw();
+        self.redraw_playhead();
+    }
+
+    fn redraw_playhead(&self) {
+        if let Some(layer) = self.imp().playhead_layer.borrow().as_ref() {
+            layer.queue_draw();
+        }
+    }
+
+    /// The layer that shows this canvas's playhead; place it over the canvas.
+    pub fn playhead_layer(&self) -> PlayheadLayer {
+        let layer: PlayheadLayer = glib::Object::builder().build();
+        layer.set_can_target(false);
+        layer.set_overflow(gtk::Overflow::Hidden);
+        layer.imp().canvas.set(Some(self));
+        *self.imp().playhead_layer.borrow_mut() = Some(layer.clone());
+        layer
+    }
+}
+
+mod layer_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct PlayheadLayer {
+        pub canvas: glib::WeakRef<super::TimelineCanvas>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PlayheadLayer {
+        const NAME: &'static str = "TempoPlayheadLayer";
+        type Type = super::PlayheadLayer;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PlayheadLayer {}
+
+    impl WidgetImpl for PlayheadLayer {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(canvas) = self.canvas.upgrade() {
+                canvas.draw_playhead(snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PlayheadLayer(ObjectSubclass<layer_imp::PlayheadLayer>)
+        @extends gtk::Widget, @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 /// Canvas, scrollbar, and the column of track headers to its left.
@@ -1041,7 +1105,9 @@ impl TimelineArea {
         viewer.connect_position(move |_| timecode_label.set_text(&timecode(s.playhead_us(), s.fps())));
 
         let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        right.append(&canvas);
+        let stack = gtk::Overlay::builder().child(&canvas).build();
+        stack.add_overlay(&canvas.playhead_layer());
+        right.append(&stack);
         right.append(&gtk::Scrollbar::new(gtk::Orientation::Horizontal, Some(&canvas.hadjustment())));
 
         let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).vexpand(true).build();
