@@ -18,6 +18,7 @@ make() { # name, seconds, size, then extra output options
     local name=$1 seconds=$2 size=$3
     shift 3
     [ -f "$out/$name" ] && return 0
+    echo "making $name" >&2
     ffmpeg -v error -y \
         -f lavfi -i "testsrc2=size=$size:rate=30:duration=$seconds" \
         -f lavfi -i "sine=frequency=440:beep_factor=4:sample_rate=48000:duration=$seconds" \
@@ -27,6 +28,7 @@ make() { # name, seconds, size, then extra output options
 make sample_1080p_h264.mp4 5 1920x1080 -c:v "$h264" -b:v 1M -c:a aac
 make sample_10s_sync.mp4 12 1920x1080 -c:v "$h264" -b:v 1M -c:a aac
 # A short click at exactly 1.000 s, to check that proxies keep their sound in sync.
+[ -f "$out/sample_click.mp4" ] || echo "making sample_click.mp4" >&2
 [ -f "$out/sample_click.mp4" ] || ffmpeg -v error -y \
     -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=3" \
     -f lavfi -i "aevalsrc='if(between(t,1,1.001),0.9,0)':s=48000:d=3" \
