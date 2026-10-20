@@ -13,6 +13,7 @@ use tempo_timeline::{ClipType, EditClipCommand, FadeEdge, MarkerColor, MoveClipC
 use uuid::Uuid;
 
 use crate::actions::{self, Place};
+use crate::keybinds::HintZone;
 use crate::state::{timecode, AppState, Change, Tool};
 use crate::util::{css_color, label};
 use crate::viewer::Viewer;
@@ -497,6 +498,14 @@ impl TimelineCanvas {
                 if c.imp().hover.replace(hit.as_ref().map(|(_, id, _)| *id)) != hit.as_ref().map(|(_, id, _)| *id) {
                     c.redraw();
                 }
+                let zone = if y < RULER_H as f64 {
+                    Some(HintZone::Ruler)
+                } else if c.fade_hit(x, y).is_some() {
+                    Some(HintZone::FadeHandle)
+                } else {
+                    hit.as_ref().map(|(_, _, edge)| if edge.is_some() { HintZone::ClipEdge } else { HintZone::ClipBody })
+                };
+                c.state().hint(zone);
                 let cursor = match (tool, hit) {
                     (Tool::Blade, Some(_)) => Some("crosshair"),
                     (Tool::Select | Tool::Trim, _) if c.fade_hit(x, y).is_some() => Some("ew-resize"),
@@ -509,6 +518,7 @@ impl TimelineCanvas {
         let c = self.downgrade();
         motion.connect_leave(move |_| {
             if let Some(c) = c.upgrade() {
+                c.state().hint(None);
                 if c.imp().hover.take().is_some() {
                     c.redraw();
                 }

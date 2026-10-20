@@ -67,6 +67,8 @@ impl MainWindow {
         let edit = EditPage::new(&state, &viewer);
         let export = ExportPage::new(&state);
         edit.viewer_slot.append(&viewer.root);
+        hint_over(&state, &viewer.root, crate::keybinds::HintZone::Viewer);
+        hint_over(&state, &edit.media_pool.root, crate::keybinds::HintZone::MediaPool);
 
         // ---- Top bar ---------------------------------------------------------
         let media_btn = labelled_toggle("folder-symbolic", "Media Pool", "Show or hide the Media Pool");
@@ -150,10 +152,27 @@ impl MainWindow {
         left.append(&activity);
         let home = tool_button("go-home-symbolic", "Project Manager (Shift+1)");
         home.set_margin_end(8);
+        // Shortcut hints for what is under the pointer, from the keybind table.
+        let hint = label("", &["tempo-small", "tempo-dim"]);
+        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        hint.set_xalign(1.0);
+        // Takes the free space beside the page switcher without pushing it off centre.
+        hint.set_max_width_chars(8);
+        hint.set_hexpand(true);
+        let right = gtk::Box::builder().spacing(14).margin_start(24).build();
+        right.append(&hint);
+        right.append(&home);
+        let binds = crate::keybinds::load();
+        let shown = Cell::new(None);
+        *state.show_hint.borrow_mut() = Some(Rc::new(move |zone| {
+            if shown.replace(zone) != zone {
+                hint.set_text(&zone.map(|z| crate::keybinds::hint(z, &binds, crate::keybinds::display)).unwrap_or_default());
+            }
+        }));
         let page_bar = gtk::CenterBox::builder().css_classes(["page-bar"]).build();
         page_bar.set_start_widget(Some(&left));
         page_bar.set_center_widget(Some(&page_box));
-        page_bar.set_end_widget(Some(&home));
+        page_bar.set_end_widget(Some(&right));
 
         let project_view = adw::ToolbarView::builder().content(&pages).build();
         project_view.add_top_bar(&header);
@@ -761,6 +780,7 @@ impl MainWindow {
             player.set_max_height(self.state.settings.borrow().playback_height);
             let source = Viewer::new_source(&self.state, player);
             self.edit.source_slot.append(&source.root);
+            hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
             *self.source_viewer.borrow_mut() = Some(source);
         }
         self.edit.source_slot.set_visible(on);
@@ -850,6 +870,19 @@ impl MainWindow {
                     let mods = if parts.get(2) == Some(&"ctrl") { ModifierType::CONTROL_MASK } else { ModifierType::empty() };
                     canvas.simulate_drag(p, p, mods);
                 }
+            }
+            "hint" => {
+                use crate::keybinds::HintZone;
+                let zone = match parts.first().copied() {
+                    Some("clip") => Some(HintZone::ClipBody),
+                    Some("edge") => Some(HintZone::ClipEdge),
+                    Some("fade") => Some(HintZone::FadeHandle),
+                    Some("ruler") => Some(HintZone::Ruler),
+                    Some("viewer") => Some(HintZone::Viewer),
+                    Some("media") => Some(HintZone::MediaPool),
+                    _ => None,
+                };
+                self.state.hint(zone);
             }
             "fadedrag" => {
                 let track = parts.get(1).copied().unwrap_or("V1");
@@ -1230,6 +1263,16 @@ impl MainWindow {
 /// A file whose presence means the first-use hint was dismissed.
 fn hint_marker() -> PathBuf {
     glib::user_config_dir().join("tempo").join("first-use-hint-seen")
+}
+
+/// Show `zone`'s shortcut hints while the pointer is over `widget`.
+fn hint_over(state: &Rc<AppState>, widget: &impl IsA<gtk::Widget>, zone: crate::keybinds::HintZone) {
+    let motion = gtk::EventControllerMotion::new();
+    let s = state.clone();
+    motion.connect_enter(move |_, _, _| s.hint(Some(zone)));
+    let s = state.clone();
+    motion.connect_leave(move |_| s.hint(None));
+    widget.add_controller(motion);
 }
 
 fn loading_view(status: &gtk::Label) -> gtk::Box {

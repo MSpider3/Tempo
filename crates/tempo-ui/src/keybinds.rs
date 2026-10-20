@@ -47,6 +47,46 @@ const NAVIGATION: [&str; 10] = ["Up", "Down", "Left", "Right", "space", "Return"
 /// Whether a key press belongs to the widget that has the focus and not to
 /// the editor: the user is typing, or a dialog or menu is open, or the focus is
 /// in a list and the key moves around in it.
+/// Where the pointer is, for the shortcut hints in the bottom bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintZone {
+    ClipBody,
+    ClipEdge,
+    FadeHandle,
+    Ruler,
+    Viewer,
+    MediaPool,
+}
+
+/// What the mouse does in a zone, then the keys worth knowing there (action, short name).
+fn hint_actions(zone: HintZone) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    match zone {
+        HintZone::ClipBody => (
+            "Drag to move",
+            &[("win.tool-blade", "Blade"), ("win.split-clip", "Split"), ("win.delete", "Delete"), ("win.ripple-delete", "Delete and close gap")],
+        ),
+        HintZone::ClipEdge => ("Drag to trim · Shift+drag in Trim mode rolls", &[("win.tool-trim", "Trim mode (ripples)"), ("win.tool-select", "Selection mode"), ("win.snap-toggle", "Snapping")]),
+        HintZone::FadeHandle => ("Drag toward the middle to fade", &[("win.fade-in-to-playhead", "Fade in to playhead"), ("win.fade-out-to-playhead", "Fade out to playhead")]),
+        HintZone::Ruler => ("Click or drag to move the playhead", &[("win.mark-in", "Mark In"), ("win.mark-out", "Mark Out"), ("win.marker-add", "Marker")]),
+        HintZone::Viewer => ("", &[("win.play-toggle", "Play"), ("win.play-reverse", "Reverse"), ("win.stop", "Stop"), ("win.play-forward", "Forward"), ("win.viewer-toggle", "Source / timeline")]),
+        HintZone::MediaPool => (
+            "Drag to the timeline",
+            &[("win.edit-insert", "Insert"), ("win.edit-overwrite", "Overwrite"), ("win.edit-place-on-top", "Place on top"), ("win.edit-append", "Append")],
+        ),
+    }
+}
+
+/// The hint line for a zone. Keys come from the keybind table, written by `show`
+/// (normally `display`), so a hint can never name a key that does something else.
+pub fn hint(zone: HintZone, binds: &[Keybind], show: impl Fn(&str) -> String) -> String {
+    let (mouse, actions) = hint_actions(zone);
+    let keys = actions.iter().filter_map(|(action, name)| {
+        let key = binds.iter().find(|b| b.action == *action)?.keys.first()?;
+        Some(format!("{} {name}", show(key)))
+    });
+    std::iter::once(mouse.to_string()).filter(|m| !m.is_empty()).chain(keys).collect::<Vec<_>>().join(" · ")
+}
+
 fn belongs_to_focus(focus: &gtk::Widget, accel: &str) -> bool {
     if focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.is::<gtk::Editable>() {
         return true;
@@ -100,6 +140,25 @@ mod tests {
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
     const RESERVED: &[&str] = &["r", "w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>n", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+
+    #[test]
+    fn every_hint_names_a_bound_action() {
+        let binds = load();
+        for zone in [HintZone::ClipBody, HintZone::ClipEdge, HintZone::FadeHandle, HintZone::Ruler, HintZone::Viewer, HintZone::MediaPool] {
+            for (action, _) in hint_actions(zone).1 {
+                assert!(binds.iter().any(|b| b.action == *action && !b.keys.is_empty()), "{action} has no key");
+            }
+        }
+    }
+
+    #[test]
+    fn hints_show_the_registry_keys() {
+        let text = hint(HintZone::ClipBody, &load(), |k| format!("[{k}]"));
+        assert!(text.starts_with("Drag to move"), "{text}");
+        // Resolve's split is Ctrl+\, not Ctrl+B; the hint must say what the key really is.
+        assert!(text.contains("[<Primary>backslash] Split"), "{text}");
+        assert!(text.contains("[<Shift>BackSpace] Delete and close gap"), "{text}");
+    }
 
     #[test]
     fn no_key_is_used_twice_and_reserved_keys_stay_free() {

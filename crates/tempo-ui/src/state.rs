@@ -91,6 +91,8 @@ pub struct AppState {
     pub uploaders: RefCell<Vec<crate::plugins::Uploader>>,
     /// Opens a Media Pool clip in whichever viewer shows source clips.
     pub open_source: RefCell<Option<Rc<dyn Fn(Option<Uuid>)>>>,
+    /// Shows the shortcut hints for where the pointer is (bottom bar).
+    pub show_hint: RefCell<Option<Rc<dyn Fn(Option<crate::keybinds::HintZone>)>>>,
     /// Loudness of each source, 50 values a second, for drawing waveforms.
     pub waveforms: RefCell<std::collections::HashMap<Uuid, Rc<Vec<u8>>>>,
     pub player: Player,
@@ -126,6 +128,7 @@ impl AppState {
             filters: RefCell::new(Vec::new()),
             uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
+            show_hint: RefCell::new(None),
             waveforms: RefCell::new(Default::default()),
             player: Player::new(),
             listeners: RefCell::new(Vec::new()),
@@ -259,6 +262,14 @@ impl AppState {
         }
         self.set_dirty(true);
         self.emit(Change::Timeline);
+    }
+
+    /// Show the shortcut hints for a part of the window, or none.
+    pub fn hint(&self, zone: Option<crate::keybinds::HintZone>) {
+        let show = self.show_hint.borrow().clone();
+        if let Some(show) = show {
+            show(zone);
+        }
     }
 
     pub fn set_dirty(&self, dirty: bool) {
