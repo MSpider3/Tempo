@@ -418,6 +418,11 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         c(&|s| s.hardware_decode = row.is_active());
         tempo_media::set_hardware_decode(row.is_active());
     });
+    let (can_decode, can_encode) = state.hardware.get();
+    if !can_decode {
+        hardware.set_sensitive(false);
+        hardware.set_subtitle("Not available: the graphics driver can't decode video on this computer");
+    }
     playback.add(&hardware);
     let encode = adw::SwitchRow::builder()
         .title("Hardware encoding for export (experimental)")
@@ -426,6 +431,10 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         .build();
     let c = change.clone();
     encode.connect_active_notify(move |row| c(&|s| s.hardware_encode = row.is_active()));
+    if !can_encode {
+        encode.set_sensitive(false);
+        encode.set_subtitle("Not available: the graphics driver can't encode video on this computer");
+    }
     playback.add(&encode);
 
     let storage = adw::PreferencesGroup::builder().title("Storage").build();

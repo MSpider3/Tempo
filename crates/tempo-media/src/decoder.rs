@@ -49,6 +49,12 @@ fn hw_device() -> Option<&'static HwDevice> {
         .as_ref()
 }
 
+/// Whether the graphics driver can decode video here (VA-API opens). Blocking the first
+/// time; the answer is kept for the life of the process.
+pub fn hardware_decode_available() -> bool {
+    hw_device().is_some()
+}
+
 /// Called by FFmpeg to choose the output format. Takes the VA-API surface format
 /// when it is offered; otherwise the first format, which is ordinary software decoding.
 unsafe extern "C" fn pick_format(_ctx: *mut ffi::AVCodecContext, formats: *const ffi::AVPixelFormat) -> ffi::AVPixelFormat {

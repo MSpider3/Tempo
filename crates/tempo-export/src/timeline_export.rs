@@ -418,7 +418,7 @@ fn build_args(
     // ---- Command line.
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-nostats".into(), "-progress".into(), "pipe:1".into()];
     if e.hardware {
-        args.extend(["-vaapi_device".into(), "/dev/dri/renderD128".into()]);
+        args.extend(["-vaapi_device".into(), crate::ffmpeg::VAAPI_DEVICE.into()]);
     }
     args.extend(inputs);
     if let Some(meta) = metadata_file {

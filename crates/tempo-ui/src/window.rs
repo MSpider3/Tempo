@@ -401,12 +401,28 @@ impl MainWindow {
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
             w.loading_status.set_text("STARTING MEDIA ENGINE");
-            let settings = gio::spawn_blocking(|| {
+            let (settings, hardware, turned_off) = gio::spawn_blocking(|| {
                 tempo_media::ensure_ffmpeg_init();
-                crate::settings::Settings::load()
+                let mut settings = crate::settings::Settings::load();
+                let hardware = (tempo_media::hardware_decode_available(), tempo_export::ffmpeg::vaapi_h264_available());
+                // A saved setting the machine can't do is switched off, as Resolve resets
+                // an invalid GPU configuration, and the user is told once.
+                let turned_off = (settings.hardware_decode && !hardware.0) || (settings.hardware_encode && !hardware.1);
+                if turned_off {
+                    settings.hardware_decode &= hardware.0;
+                    settings.hardware_encode &= hardware.1;
+                    if let Err(e) = settings.save() {
+                        tracing::warn!("could not save settings: {e}");
+                    }
+                }
+                (settings, hardware, turned_off)
             })
             .await
             .unwrap_or_default();
+            w.state.hardware.set(hardware);
+            if turned_off {
+                w.state.message("Hardware video acceleration isn't available on this computer, so it was turned off.");
+            }
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
             *w.state.settings.borrow_mut() = settings;

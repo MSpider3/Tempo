@@ -13,6 +13,27 @@ pub enum H264Encoder {
     OpenH264,
 }
 
+/// The render node VA-API encoding uses.
+pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
+/// Whether the graphics chip's H.264 encoder really works here. Listing it is not
+/// enough (a driver may be missing), so one tiny frame is encoded, once. Blocking.
+pub fn vaapi_h264_available() -> bool {
+    static FOUND: OnceLock<bool> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let mut probe = Command::new("ffmpeg");
+        probe
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1", "-vaapi_device", VAAPI_DEVICE])
+            .args(["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-frames:v", "1", "-f", "null", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let works = probe.status().is_ok_and(|s| s.success());
+        tracing::info!("hardware H.264 encoding (VA-API) {}", if works { "works" } else { "is not available" });
+        works
+    })
+}
+
 /// Which encoder to use, found once by asking `ffmpeg -encoders`.
 pub fn h264_encoder() -> H264Encoder {
     static FOUND: OnceLock<H264Encoder> = OnceLock::new();
@@ -71,5 +92,15 @@ pub fn die_with_parent(command: &mut Command) {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hardware_probe_answers_without_a_gpu() {
+        // On a machine without a working driver this is false; it must never hang or panic.
+        let first = super::vaapi_h264_available();
+        assert_eq!(first, super::vaapi_h264_available());
     }
 }

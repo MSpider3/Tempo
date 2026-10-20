@@ -63,6 +63,8 @@ pub struct AppState {
     pub dirty: Cell<bool>,
     /// Set by every change; cleared when a rolling backup is taken.
     pub changed_since_backup: Cell<bool>,
+    /// Whether hardware decoding and hardware encoding work here, found at start-up.
+    pub hardware: Cell<(bool, bool)>,
     pub mark_in: Cell<Option<i64>>,
     pub mark_out: Cell<Option<i64>>,
     /// `kind_index` of the video / audio track that receives the next edit.
@@ -108,6 +110,7 @@ impl AppState {
             linked_selection: Cell::new(true),
             dirty: Cell::new(false),
             changed_since_backup: Cell::new(false),
+            hardware: Cell::new((false, false)),
             mark_in: Cell::new(None),
             mark_out: Cell::new(None),
             dest_video: Cell::new(1),
