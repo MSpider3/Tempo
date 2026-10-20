@@ -61,6 +61,8 @@ pub struct AppState {
     /// When on, selecting a clip also selects the clips linked to it.
     pub linked_selection: Cell<bool>,
     pub dirty: Cell<bool>,
+    /// Set by every change; cleared when a rolling backup is taken.
+    pub changed_since_backup: Cell<bool>,
     pub mark_in: Cell<Option<i64>>,
     pub mark_out: Cell<Option<i64>>,
     /// `kind_index` of the video / audio track that receives the next edit.
@@ -105,6 +107,7 @@ impl AppState {
             snapping: Cell::new(true),
             linked_selection: Cell::new(true),
             dirty: Cell::new(false),
+            changed_since_backup: Cell::new(false),
             mark_in: Cell::new(None),
             mark_out: Cell::new(None),
             dest_video: Cell::new(1),
@@ -256,6 +259,9 @@ impl AppState {
     }
 
     pub fn set_dirty(&self, dirty: bool) {
+        if dirty {
+            self.changed_since_backup.set(true);
+        }
         if self.dirty.replace(dirty) != dirty {
             self.emit(Change::Dirty);
         }

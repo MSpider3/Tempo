@@ -54,6 +54,9 @@ pub struct MainWindow {
     edit_only: gtk::Box,
     speed: Cell<f64>,
     cinema: Cell<bool>,
+    /// When the last rolling backup was started, and whether a failure was already reported.
+    last_backup: Cell<std::time::Instant>,
+    backup_warned: Cell<bool>,
     loading_status: gtk::Label,
 }
 
@@ -229,6 +232,8 @@ impl MainWindow {
             edit_only,
             speed: Cell::new(0.0),
             cinema: Cell::new(false),
+            last_backup: Cell::new(std::time::Instant::now()),
+            backup_warned: Cell::new(false),
             loading_status,
         });
 
@@ -311,6 +316,7 @@ impl MainWindow {
                 waited.set(0);
                 w.autosave();
             }
+            w.backup_if_due();
             glib::ControlFlow::Continue
         });
 
@@ -613,6 +619,36 @@ impl MainWindow {
                 Ok(Ok(_)) => w.flash_activity("Autosaved"),
                 Ok(Err(e)) => tracing::warn!("autosave failed: {e}"),
                 Err(_) => {}
+            }
+        });
+    }
+
+    /// Every few minutes of editing, keep a checked copy of the project (Resolve's
+    /// Project Backups). Runs on a worker; a failure is reported once and never blocks.
+    fn backup_if_due(self: &Rc<Self>) {
+        let every = std::time::Duration::from_secs(tempo_project::BackupPolicy::default().every_min as u64 * 60);
+        if self.last_backup.get().elapsed() < every || !self.state.changed_since_backup.get() {
+            return;
+        }
+        let Some(project) = self.state.project.borrow().clone() else { return };
+        self.last_backup.set(std::time::Instant::now());
+        self.state.changed_since_backup.set(false);
+        let dir = crate::project_manager::backup_dir(project.id);
+        let w = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gio::spawn_blocking(move || tempo_project::backup_now(&project, &dir)).await;
+            let problem = match result {
+                Ok(Ok(path)) => {
+                    tracing::debug!("project backup written to {}", path.display());
+                    return;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "the backup stopped unexpectedly".to_string(),
+            };
+            tracing::warn!("project backup failed: {problem}");
+            w.state.changed_since_backup.set(true);
+            if !w.backup_warned.replace(true) {
+                w.state.message(format!("Could not write a project backup: {problem}"));
             }
         });
     }

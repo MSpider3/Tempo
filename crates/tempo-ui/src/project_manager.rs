@@ -26,6 +26,11 @@ fn list_path() -> PathBuf {
     glib::user_data_dir().join("tempo").join("projects.json")
 }
 
+/// Where a project's rolling backups live: user data, never beside the user's media.
+pub fn backup_dir(project_id: uuid::Uuid) -> PathBuf {
+    glib::user_data_dir().join("tempo").join("backups").join(project_id.to_string())
+}
+
 /// Read the project list. Blocking: call from a worker.
 pub fn load_list() -> Vec<Entry> {
     let mut entries: Vec<Entry> = std::fs::read_to_string(list_path())
