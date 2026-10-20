@@ -241,6 +241,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root (as in CI containers) can write to a read-only folder, so nothing can fail here.
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let result = write_backup(&sample_project(), dir.path(), at("2026-10-20 10:00"), &BackupPolicy::default());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
