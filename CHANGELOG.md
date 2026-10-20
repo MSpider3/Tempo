@@ -6,6 +6,15 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
+Alpha. Built for slower computers first:
+- playback copes with heavy footage;
+- proxies are faster and include sound;
+- backups are kept the way Resolve keeps them;
+- a set of Resolve Edit page tools beginners reach for: clip speed, fade handles, Solo,
+  matching the project to the first clip, and a 10 MB export for Discord.
+
 ### Added
 
 - **Change Clip Speed** on `R`, as in DaVinci Resolve. You set a speed from 25 % to 400 %.
@@ -32,7 +41,11 @@ All notable changes to Tempo are recorded here. The format follows
   needed) so the file fits, and is greyed out when the export is too long to fit watchably.
 - Shortcut hints in the bottom bar for what is under the pointer, read from the keybind
   table.
-- `scripts/bench_playback.sh` and `docs/PERF.md`: a playback benchmark and its results.
+- `scripts/bench_playback.sh` and `docs/PERF.md`: a playback benchmark and its results,
+  including hardware (VA-API) playback, proxies and export.
+- `CONTRIBUTING.md`: what Tempo accepts and how to contribute. Weak computers and beginners
+  come first, the layout and keys stay DaVinci Resolve's, and effects and titles come as
+  plugins.
 
 ### Changed
 
@@ -215,5 +228,7 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
 - The wgpu renderer, the WebAssembly plugin host and the Python helper, none of which the
   editor used any more.
 
-[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MSpider3/Tempo/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/MSpider3/Tempo/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MSpider3/Tempo/releases/tag/v0.1.0
