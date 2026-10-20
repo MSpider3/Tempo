@@ -64,11 +64,7 @@ impl Snapshot {
                 (*id, path)
             })
             .collect();
-        let audio = project
-            .timeline
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Audio && t.enabled)
+        let audio = audible_tracks(&project.timeline)
             .flat_map(|t| {
                 // For sound, the outgoing clip fades out while the incoming one fades in.
                 let leads = t.dissolve_leads();
@@ -785,6 +781,14 @@ fn reader_for<'a>(readers: &'a mut Vec<(Uuid, PathBuf, AudioReader)>, id: Uuid, 
     readers.last_mut().map(|(_, _, r)| r)
 }
 
+/// The audio tracks playback hears: those not muted, and only the soloed ones when any
+/// track is soloed. Solo is for listening only; export does not look at it.
+fn audible_tracks(timeline: &tempo_timeline::Timeline) -> impl Iterator<Item = &tempo_timeline::Track> {
+    let audio = || timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled);
+    let any_solo = audio().any(|t| t.solo);
+    audio().filter(move |t| !any_solo || t.solo)
+}
+
 /// Source time to decode for the picture shown at timeline position `pos`: the start of
 /// the project frame that holds `pos`, mapped into the clip and never before its In point.
 /// The same timeline frame always asks for the same source time, so it is decoded once.
@@ -835,6 +839,19 @@ mod tests {
         for _ in 0..10 {
             assert!(!o.record(FRAME * 6 / 5, FRAME)); // 1.2x is within 1.25x
         }
+    }
+
+    #[test]
+    fn solo_plays_only_soloed_audio_tracks() {
+        let mut timeline = tempo_timeline::Timeline::new_default();
+        let names = |t: &tempo_timeline::Timeline| audible_tracks(t).map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&timeline), ["Audio 1", "Audio 2"]);
+        let a2 = timeline.tracks.iter_mut().find(|t| t.name == "Audio 2").unwrap();
+        a2.solo = true;
+        assert_eq!(names(&timeline), ["Audio 2"]);
+        // A muted track stays silent even when soloed.
+        timeline.tracks.iter_mut().find(|t| t.name == "Audio 2").unwrap().enabled = false;
+        assert_eq!(names(&timeline), ["Audio 1"]);
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub struct Row {
     pub h: f32,
     pub locked: bool,
     pub enabled: bool,
+    pub solo: bool,
 }
 
 /// How many times the timeline canvas has been redrawn; reported by `stats` for benchmarks.
@@ -62,7 +63,7 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
     let mut y = RULER_H;
     for (list, h) in [(video, VIDEO_H), (audio, AUDIO_H)] {
         for t in list {
-            out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled });
+            out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled, solo: t.solo });
             y += h;
         }
         if h == VIDEO_H {
@@ -1273,7 +1274,6 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.emit(Change::Options);
         });
         header.append(&name);
-        header.append(&gtk::Box::builder().hexpand(true).build());
 
         let lock = gtk::ToggleButton::builder()
             .icon_name(if row.locked { "changes-prevent-symbolic" } else { "changes-allow-symbolic" })
@@ -1287,6 +1287,22 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Locked, b.is_active())));
         });
         header.append(&lock);
+
+        // Resolve has Solo on audio tracks only: while any is on, playback hears just those.
+        if row.kind == TrackKind::Audio {
+            let solo = gtk::ToggleButton::builder()
+                .label("S")
+                .tooltip_text("Solo: hear only this track while playing. Export is not affected")
+                .active(row.solo)
+                .css_classes(["tool", "track-solo"])
+                .valign(gtk::Align::Center)
+                .build();
+            let s = state.clone();
+            solo.connect_toggled(move |b| {
+                s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Solo, b.is_active())));
+            });
+            header.append(&solo);
+        }
 
         let (icon_on, icon_off, tip) = match row.kind {
             TrackKind::Video => ("view-reveal-symbolic", "view-conceal-symbolic", "Show or hide this video track"),
@@ -1304,6 +1320,8 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Enabled, b.is_active())));
         });
         header.append(&enable);
+        // Controls sit left, as in Resolve, so Lock lines up on every row.
+        header.append(&gtk::Box::builder().hexpand(true).build());
 
         container.append(&header);
     }

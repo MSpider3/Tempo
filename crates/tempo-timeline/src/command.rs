@@ -1357,13 +1357,15 @@ impl Command for CompositeCommand {
 }
 
 // ----------------------------------------------------------------------------
-// SetTrackFlagCommand — lock / enable a track
+// SetTrackFlagCommand — lock / enable / solo a track
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackFlag {
     Locked,
     Enabled,
+    /// Hear only soloed audio tracks while playing. Export ignores it.
+    Solo,
 }
 
 #[derive(Debug)]
@@ -1391,6 +1393,7 @@ impl SetTrackFlagCommand {
         let slot = match self.flag {
             TrackFlag::Locked => &mut track.locked,
             TrackFlag::Enabled => &mut track.enabled,
+            TrackFlag::Solo => &mut track.solo,
         };
         Ok(std::mem::replace(slot, value))
     }
@@ -1411,6 +1414,7 @@ impl Command for SetTrackFlagCommand {
         match self.flag {
             TrackFlag::Locked => "Lock track",
             TrackFlag::Enabled => "Enable track",
+            TrackFlag::Solo => "Solo track",
         }
     }
 }
@@ -2409,6 +2413,17 @@ mod tests {
         assert_eq!(timeline, before);
         log.redo(&mut timeline).unwrap();
         assert_eq!(timeline, other);
+    }
+
+    #[test]
+    fn solo_is_an_undoable_track_flag() {
+        let mut timeline = Timeline::new_default();
+        let audio = timeline.tracks.iter().find(|t| t.kind == crate::TrackKind::Audio).unwrap().id;
+        let mut log = CommandLog::new();
+        log.execute(Box::new(SetTrackFlagCommand::new(audio, TrackFlag::Solo, true)), &mut timeline).unwrap();
+        assert!(timeline.find_track(audio).unwrap().solo);
+        log.undo(&mut timeline).unwrap();
+        assert!(!timeline.find_track(audio).unwrap().solo);
     }
 
     /// Changes nothing; its undo fails when asked to.
