@@ -309,19 +309,23 @@ struct Worker {
 /// Notices playback that keeps missing its frame time, so decoding can get cheaper.
 #[derive(Default)]
 struct Overload {
-    streak: u8,
+    /// One bit per recent frame, newest lowest: set when it took too long.
+    recent: u8,
     degraded: bool,
 }
 
 impl Overload {
     /// Record how long one frame took. True when playback should switch to cheaper
-    /// decoding now: three frames in a row took over 1.25 times their time.
+    /// decoding now: three of the last six frames took over 1.25 times their time.
+    /// (Not "three in a row": with 30 fps footage in a 60 fps project every other
+    /// frame only repeats a picture, which is cheap.)
     fn record(&mut self, spent: Duration, frame: Duration) -> bool {
         if self.degraded {
             return false;
         }
-        self.streak = if spent.as_secs_f64() > frame.as_secs_f64() * 1.25 { self.streak + 1 } else { 0 };
-        self.degraded = self.streak >= 3;
+        let slow = spent.as_secs_f64() > frame.as_secs_f64() * 1.25;
+        self.recent = (self.recent << 1) | slow as u8;
+        self.degraded = (self.recent & 0b11_1111).count_ones() >= 3;
         self.degraded
     }
 }
@@ -863,14 +867,22 @@ mod tests {
     }
 
     #[test]
-    fn one_fast_frame_resets_the_streak() {
+    fn occasional_slow_frames_are_tolerated() {
         let mut o = Overload::default();
-        o.record(FRAME * 2, FRAME);
-        o.record(FRAME * 2, FRAME);
-        o.record(FRAME, FRAME);
-        assert!(!o.record(FRAME * 2, FRAME));
-        assert!(!o.record(FRAME * 2, FRAME));
-        assert!(o.record(FRAME * 2, FRAME));
+        // One slow frame in every three never makes three in six.
+        for _ in 0..20 {
+            assert!(!o.record(FRAME * 2, FRAME));
+            assert!(!o.record(FRAME, FRAME));
+            assert!(!o.record(FRAME, FRAME));
+        }
+    }
+
+    #[test]
+    fn every_other_frame_slow_is_an_overload() {
+        // 30 fps footage in a 60 fps project: the repeated pictures are cheap.
+        let mut o = Overload::default();
+        let entered = (0..6).map(|i| o.record(if i % 2 == 0 { FRAME * 2 } else { FRAME / 10 }, FRAME)).any(|e| e);
+        assert!(entered);
     }
 
     #[test]
