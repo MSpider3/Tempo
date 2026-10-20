@@ -881,7 +881,7 @@ mod tests {
     fn every_other_frame_slow_is_an_overload() {
         // 30 fps footage in a 60 fps project: the repeated pictures are cheap.
         let mut o = Overload::default();
-        let entered = (0..6).map(|i| o.record(if i % 2 == 0 { FRAME * 2 } else { FRAME / 10 }, FRAME)).any(|e| e);
+        let entered = (0..6).any(|i| o.record(if i % 2 == 0 { FRAME * 2 } else { FRAME / 10 }, FRAME));
         assert!(entered);
     }
 
