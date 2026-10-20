@@ -19,6 +19,12 @@
 > - **Default tracks** are named `V1`, `V2`, `A1`, `A2`.
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
+>
+> **Updated 2026-10-21 (0.2.0 alpha).** The schema is now **version 2**. Migration 2 rebuilds
+> `clips` without the rule that source and timeline lengths are equal, because a retimed clip
+> (speed ≠ 1.0) covers `speed ×` its timeline length of source (§8, §15). New in this release:
+> clip `speed` in `properties` (§8.1), stricter loading
+> (§8.3), the copy made before an upgrade (§15.2) and rolling backups (§18).
 
 **Version:** 1.0  
 **Engine:** SQLite 3.40+ (bundled via rusqlite)  
@@ -83,7 +89,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **1**
+Current schema version: **2**
 
 ---
 
@@ -108,6 +114,9 @@ CREATE TABLE project_meta (
     ui_state      TEXT NOT NULL DEFAULT '{}'  -- JSON blob
 );
 ```
+
+A file holds one project. `save_project` deletes every `project_meta` row whose `id` is not
+the project being saved, so a copy saved under a new id never keeps the old row.
 
 **ui_state JSON structure:**
 ```json
@@ -162,6 +171,9 @@ CREATE TABLE media_sources (
     thumbnail_data  BLOB                    -- 160×90 RGBA, stored inline for small overhead
 );
 ```
+
+On load, `proxy_ready` is treated as false when no file exists at `proxy_path`, so the
+proxy is made again.
 
 ---
 
@@ -240,10 +252,10 @@ CREATE TABLE clips (
     -- Title data (NULL unless clip_type = 3)
     title_data      TEXT,   -- JSON, see §8.2
 
-    -- Constraints
+    -- Constraints. Schema 1 also required equal source and timeline lengths; schema 2
+    -- dropped that so retimed clips can be saved.
     CHECK (timeline_out > timeline_in),
-    CHECK (source_out > source_in),
-    CHECK ((source_out - source_in) = (timeline_out - timeline_in))
+    CHECK (source_out > source_in)
 );
 
 CREATE INDEX idx_clips_track ON clips (track_id, timeline_in);
@@ -277,9 +289,29 @@ CREATE INDEX idx_clips_source ON clips (source_id);
             "property": "opacity",
             "value": 1.0
         }
-    ]
+    ],
+    "enabled": true,
+    "fade_in_us": 0,
+    "fade_out_us": 0,
+    "dissolve_in_us": 0,
+    "link": null,
+    "effects": [],
+    "speed": 1.0
 }
 ```
+
+- `enabled`: a disabled clip stays on the timeline but is not shown, heard or exported.
+- `fade_in_us` / `fade_out_us`: fade lengths. `dissolve_in_us`: cross dissolve over the clip
+  before.
+- `link`: clips that share a link id (a picture and its sound) move together.
+- `effects`: filters on the clip, applied in order.
+- `speed`: 1.0 is normal, 0.5 half speed, 2.0 double (commands keep it within 0.25–4.0).
+  Source time = timeline time × speed, so `source_out - source_in` is `speed ×` the
+  timeline length.
+
+The struct is `ClipProperties` in `tempo-timeline` (`#[serde(default)]`): a missing field
+takes its default and an unknown field is ignored, so files from older and newer versions
+load. Files saved before 0.2.0 have no `speed` and load at 1.0.
 
 ### 8.2 Title Data JSON
 
@@ -298,6 +330,21 @@ CREATE INDEX idx_clips_source ON clips (source_id);
     "custom_position": null
 }
 ```
+
+`TitleData` is also `#[serde(default)]`: missing fields take their defaults, unknown fields
+are ignored.
+
+### 8.3 Loading clips
+
+`load_project` refuses a clip it cannot read rather than replacing it with defaults, which
+the next save would make permanent. It stops with `ProjectError::CorruptClip { clip_id,
+field, reason }` when:
+
+- `properties` is not valid JSON for `ClipProperties` (`field = "properties"`);
+- `title_data` is not valid JSON for `TitleData` (`field = "title"`);
+- the clip's `track_id` names no track (`field = "track"`).
+
+The interface then points the user to the project's backups (§18).
 
 ---
 
@@ -459,18 +506,28 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "Initial schema",
         sql: include_str!("migrations/001_initial.sql"),
     },
-    // Future migrations added here:
-    // Migration { version: 2, description: "Add subtitle tracks", sql: include_str!("...") },
+    Migration {
+        version: 2,
+        description: "Clip speed: source and timeline lengths may differ",
+        sql: include_str!("migrations/002_clip_speed.sql"),
+    },
 ];
 ```
 
 ### 15.2 Migration Policy
 
-- Migrations are always additive in 1.x (add columns/tables, never remove).
+- Migrations are always additive in 1.x (add columns/tables, never remove). Relaxing a rule
+  that removes no data is allowed: migration 2 rebuilds `clips` without its equal-lengths
+  CHECK (SQLite can't drop a CHECK in place, so the table is copied, swapped and re-indexed
+  inside the migration's transaction).
 - Removal requires a major version bump (2.0).
 - Every migration runs inside a transaction — if it fails, the database is left unchanged.
-- A project opened with a newer schema version than the running app version shows a warning:
-  "This project was created with a newer version of Tempo. Some features may not work correctly."
+- Before migrating a file with an older schema, `open_connection` copies it to
+  `<file>.v<N>.bak` (N = its old version) with `VACUUM INTO`, which also takes in changes
+  still in the WAL (`db.rs::backup_before_upgrade`). An existing `.bak` of that name is not
+  overwritten. New files and files already at the current version are not copied.
+- A project with a newer schema version than the running app does not open:
+  `apply_migrations` returns `ProjectError::UnsupportedSchemaVersion`.
 
 ---
 
@@ -748,3 +805,34 @@ The Export Page (`[Cut] | [Edit] | [Export]`) and its Render Queue operate with 
    - A video export job references transient file handles and ephemeral encoder state. Persisting incomplete encodes across reboots leads to orphan files, invalid GPU contexts, and stale progress counters.
    - Preserves SQLite database portability: moving a `.tempo` file to another computer does not carry broken absolute output paths.
 4. **User Presets:** Export preset configurations (e.g. custom bitrates, platform resolutions) are saved to application-level JSON configuration (`~/.config/tempo/export_presets.json`), never in the project SQLite database.
+
+---
+
+## 18. Rolling Backups
+
+Kept the way DaVinci Resolve keeps project backups (`tempo-project/src/backup.rs`).
+
+- **When:** every 10 minutes, and only if the project changed since the last backup. Written
+  on a worker thread.
+- **Where:** `~/.local/share/tempo/backups/<project id>/`, never beside the user's media.
+- **Name:** the time in UTC, `YYYYMMDD-HHMMSSZ.tempo`, so the hour repeated when daylight
+  saving ends cannot make a newer backup sort as older. They are shown and kept by local
+  time.
+- **Format:** each backup is a complete project file, written by `save_project`.
+- **Checked before it is kept:** the file is written as a hidden `.<name>.part`, then must
+  pass `PRAGMA integrity_check` and a full `load_project` before it is renamed into place.
+  A failed backup leaves nothing behind.
+- **Kept** (`BackupPolicy::default()`):
+  - up to 6 from the last hour;
+  - the newest of each hour today, up to 8;
+  - the newest of each day, up to 5 days.
+
+  At most 19 files. The rest are deleted after each new backup.
+
+Right-clicking a project in the Project Manager and choosing **Project Backups…** lists them.
+**Open as Copy** writes `<name> (backup <time>).tempo` next to the original and opens it; the
+original is not changed. Backups are found by the project id, read on its own
+(`read_project_id`), so a project that no longer loads still finds them.
+
+A duplicated project and a copy opened from a backup get a new project id, so their backups
+never mix with, or prune, the original's.

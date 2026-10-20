@@ -1,6 +1,6 @@
 # Visual Design — Tempo
 
-**Version:** 3.1 (2026-10-05)
+**Version:** 3.2 (2026-10-21)
 **Reference:** DaVinci Resolve 20, from the screenshots in `EX/DVR_UI/` taken on the project
 owner's own system. Colours in §2 were sampled from those images.
 **Companion documents:** `UI_SPEC.md` (widgets and behaviour), `KEYBINDS.md` (shortcuts).
@@ -58,12 +58,12 @@ social-media videos.
 | Transport | First frame, reverse, stop, play, last frame, loop; In/Out buttons at the right | **Same** |
 | Timeline toolbar | About 22 controls | 10 controls, same order |
 | Timecode box | Large, top-left of the timeline | **Same** |
-| Track header | Two rows: destination box and name; lock, auto-select, enable (or S, M and level) | One row: destination box, lock, enable (video) or mute (audio) |
+| Track header | Two rows: destination box and name; lock, auto-select, enable (or S, M and level) | One row, controls left-aligned: destination box, lock, enable (video) or Solo and mute (audio) |
 | Track edge colour | Blue strip for video, green for audio | **Same** |
-| Clips | Blue video with filmstrip and a name bar; green audio with waveform and a name bar | **Same** colours and name bar; **no thumbnails on video clips** |
+| Clips | Blue video with filmstrip and a name bar; green audio with waveform and a name bar; beige titles; adjusted clips a darker shade | **Same** colours, shading and name bar; **no thumbnails on video clips** |
 | Playhead | Red-orange line with a head in the ruler | **Same** |
 | Inspector | Six tabs; each section has an on/off dot, keyframe diamond, reset | Sections only (no tabs); each section has a reset |
-| Page bar | Bottom; logo left, seven page icons centre, Home and Settings right | **Same position and shape**, two pages: Edit, Export |
+| Page bar | Bottom; logo left, seven page icons centre, Home and Settings right | **Same position and shape**, two pages: Edit, Export. Adds shortcut hints at the right (§5.9) |
 | Deliver page | Settings left, viewer and timeline centre, queue right | **Same** |
 | Project Manager | Thumbnail grid; Export/Import bottom-left; New Project/Open bottom-right | **Same**, without the Local/Network/Cloud tabs |
 | Buttons | Outlined pills | **Same** |
@@ -117,10 +117,11 @@ Hex values marked ● were sampled from the Resolve 20 screenshots.
 @define-color tempo_error        #e64b3d;
 
 /* Timeline */
-@define-color tempo_clip_video       #4376a1;  /* ● video clip */
+@define-color tempo_clip_video       #4376a1;  /* ● video clip, name bar */
+@define-color tempo_clip_video_top   #3b688e;  /*   video clip, top band (88 % of the name bar) */
 @define-color tempo_clip_audio       #448f64;  /* ● audio clip, name bar */
 @define-color tempo_clip_audio_wave  #397955;  /* ● audio clip, behind the waveform */
-@define-color tempo_clip_title       #8a6fb0;  /*   title clip */
+@define-color tempo_clip_title       #9c8a68;  /*   title clip: Resolve's beige for text */
 @define-color tempo_track_edge_video #345b7b;  /* ● strip at the left edge of video tracks */
 @define-color tempo_track_edge_audio #356d4d;  /* ● strip at the left edge of audio tracks */
 @define-color tempo_clip_text        #ffffff;
@@ -128,6 +129,12 @@ Hex values marked ● were sampled from the Resolve 20 screenshots.
 @define-color tempo_clip_off         alpha(#28282e, 0.60);  /* wash over a disabled clip */
 @define-color tempo_in_out           alpha(#ffffff, 0.08);
 ```
+
+The video and audio clip colours match Resolve's rendered clips exactly. A clip with
+adjustments (filters, keyframes, a changed speed, or any Transform, Composite, Audio or colour
+value off its default) is drawn with every clip colour at 82 % brightness, as Resolve shades
+such clips (`ClipProperties::is_modified`). Fades, dissolves and links do not count; they show
+on the clip already. Solo uses `tempo_warn`.
 
 Contrast: `tempo_text` on `tempo_bg_panel` is about 10:1; `tempo_text_dim` on
 `tempo_bg_panel` is about 5.3:1; white on the video and audio clip fills is about 4.6:1 and
@@ -294,8 +301,8 @@ Reference: `Edit page with files in just single screen mode.png` and
 │ Dissolve    ⌃ │▌[V1] 🔒 ▣  │ ▛▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▜▛▀▀▀▀▀▀▀▀▀▀▀▀▀▜▛▀▀▀▀▀▀▀▜              │
 │ ┌───────────┐ │▌           │ ▙ 🔗 Vik_BlackSand▟▙ 🔗 Glacier   ▟▙ Sunset ▟              │
 │ │▣ Cross Dis│ ├────────────┼─────────────────────────────────────────────────────────┤
-│ └───────────┘ │▌[A1] 🔒 M  │ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿▜              │
-│ ┌───────────┐ │▌ A2  🔒 M  │ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿ Music ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜             │
+│ └───────────┘ │▌[A1] 🔒 S M│ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿▜              │
+│ ┌───────────┐ │▌ A2  🔒 S M│ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿ Music ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜             │
 │ │▣ Dip to Co│ │            │                                                         │
 ├───────────────┴────────────┴─────────────────────────────────────────────────────────┤
 │ ▶║ Tempo    ◔ Proxy 42 %                   ✎        🚀                         ⌂   ⚙ │
@@ -419,7 +426,10 @@ dynamic trim, position lock, flags, the two extra zoom presets, DIM.
     the tracks that will receive the next edit (Resolve's destination control); other tracks
     show the name with no outline;
   - a lock icon;
-  - an enable icon for video tracks, or an `M` button for audio tracks.
+  - an enable (eye) icon for video tracks; for audio tracks an `S` (Solo) button, then a mute
+    (speaker) icon. A soloed track's `S` is drawn in `tempo_bg_deep` on a `tempo_warn` (amber)
+    fill.
+  - The controls are compact (24 px wide) and left-aligned, so Lock lines up on every row.
 - **Order:** video tracks stack upward and audio tracks downward from a 2 px `tempo_line_soft`
   divider, as in Resolve.
 - **Track body:** `tempo_bg_surface`; 1 px `tempo_line` between tracks. A locked track is
@@ -451,14 +461,17 @@ Tempo does the same.
 - **Trim:** near an edge the pointer changes and the edge shows a 3 px white bar.
 - **Transition:** a rounded box across the cut on the video track, 60 % white outline on a
   40 %-black fill, with the transition's name when there is room.
-- **Fade:** a small white handle in each top corner on hover; dragging it draws the fade as a
-  darkened triangle over the clip.
+- **Fade:** on hover, an 8 px white square handle with a dark outline at each top corner, or
+  where the fade ends. Every fade is drawn as a 1.5 px white ramp from the bottom corner to
+  where the fade ends at the top, with the faded part shaded 35 % black. No handles on a
+  locked track.
+- **Speed:** a retimed clip shows its speed after its name, for example `Glacier  200%`.
 - **Link icon** is dimmed when linked selection is off.
 
 ### 5.8 Playhead, markers, ranges
 
 - **Playhead:** 1 px `tempo_accent` line through all tracks with a 13 px pointed head in the
-  ruler.
+  ruler. It is drawn on its own layer above the clips, so moving it never redraws them.
 - **Marker:** a small flag-shaped tab hanging from the top of the ruler in its marker colour.
   A named marker shows its name in a tooltip.
 - **In–Out range:** `tempo_in_out` band across the ruler and tracks.
@@ -477,7 +490,9 @@ Tempo does the same.
   rocket for Export — Resolve's own symbols). The **active** page has a `tempo_bg_active`
   (black) background, a `tempo_text_bright` icon, and a 2 px `tempo_accent` line along its
   **bottom** edge. The other icon is `tempo_text_dim`. Tooltips give the page name and key.
-- **Right:** Home (Project Manager) and Settings icons.
+- **Right:** shortcut hints for what is under the pointer, in `.tempo-small` `tempo_text_dim`,
+  right-aligned and cut with `…`; then Home (Project Manager) and Settings icons. The hints are
+  a Tempo addition: Resolve has no such line.
 
 ### 5.10 Vertical projects
 
@@ -497,8 +512,8 @@ change. The Export page does the same.
 ├────────────┬─────────────────────────────────────────────┤ │               │ │
 │ 00:00:12:04│ 00:00:00:00    00:00:10:00    00:00:20:00   │ │               │ │
 │▌[V1] 🔒 ▣  │ ▛▀▀▀▀▀▀▀▀▜▛▀▀▀▀▀▀▀▀▀▀▀▜▛▀▀▀▀▀▜              │ └───────────────┘ │
-│▌[A1] 🔒 M  │ ▛∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿▜              │ ├───────▼───────┤ │
-│▌ A2  🔒 M  │ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜               │  ⏮ ◀ ■ ▶ ⏭ ⟲     │
+│▌[A1] 🔒 S M│ ▛∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿∿∿∿∿∿∿▜▛∿∿∿∿∿▜              │ ├───────▼───────┤ │
+│▌ A2  🔒 S M│ ▛∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿▜               │  ⏮ ◀ ■ ▶ ⏭ ⟲     │
 ├────────────┴─────────────────────────────────────────────┴───────────────────┤
 │ ▶║ Tempo                          ✎        🚀                          ⌂   ⚙ │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -559,12 +574,16 @@ buttons are left out.)
   | tall rectangle | 9:16 | 1080 × 1920 | TikTok, Reels, Shorts |
   | square | 1:1 | 1080 × 1080 | Instagram feed |
   | slightly tall rectangle | 4:5 | 1080 × 1350 | Instagram portrait |
+  | wide rectangle | ≤ 10 MB | 720p or 1080p | Discord, email |
   | dashed rectangle | — | as set below | Custom |
+
+  The ≤ 10 MB item is greyed out, with a tooltip saying why, when the export is too long to
+  fit in 10 MB and still look good.
 
   The selected item's outline and text are `tempo_text_bright` with a 2 px `tempo_accent`
   line under it; the rest are `tempo_text_dim`. A thin rounded scroll indicator sits under
   the strip. If the chosen ratio differs from the project's, a **Fit / Fill** choice appears
-  (black bars, or crop to the centre).
+  (black bars, or crop to the centre). A tall format on a landscape timeline starts on Fill.
 - **File Name** and **Location** rows: label right-aligned in `tempo_text_dim`, field on
   `tempo_bg_field`, and a `Browse` pill button after Location. Free space is shown under
   Location in `.tempo-small`; it turns `tempo_warn` with a warning icon when the estimate
@@ -634,7 +653,8 @@ have a small chevron at the right. Focus: border becomes `tempo_accent`. Check b
 
 `tempo_bg_panel`, radius 10, 16 px padding, title top-left in `.tempo-heading`, pill buttons
 bottom-right with the default action last. Dialogs are for decisions only: New Project, Quick
-Export, Missing Media, Project Settings, Preferences, Plugins, Marker, Keyboard Shortcuts.
+Export, Missing Media, Project Settings, Preferences, Plugins, Marker, Keyboard Shortcuts,
+Change Clip Speed, Change Project Frame Rate?, Project Backups.
 
 ### 7.4 Messages
 

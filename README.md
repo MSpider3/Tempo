@@ -121,7 +121,8 @@ The full list is in [docs/KEYBINDS.md](docs/KEYBINDS.md).
 
 - **Hardware (VA-API) decoding is off by default.** On the test laptop it halves CPU use,
   but drops more frames than the processor on 4K footage (see [docs/PERF.md](docs/PERF.md)).
-  Hardware proxy making and export encoding are used when a start-up check finds they work.
+  Proxies are made on the graphics chip when a start-up check finds it works. Hardware
+  export encoding is a switch in Preferences, off by default.
 - Change Clip Speed has no Reverse, Freeze Frame or Pitch Correction yet.
 - Transitions other than Cross Dissolve, and title styles, are planned as plugins; those
   plugin types are not built yet.

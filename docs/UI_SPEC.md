@@ -1,6 +1,6 @@
 # UI Specification — Tempo
 
-**Version:** 2.1 (2026-10-05)
+**Version:** 2.2 (2026-10-21)
 **Reference:** DaVinci Resolve 20 (screenshots in `EX/DVR_UI/`, key export in `EX/DaVinci Resolve Keys.txt`)
 **Toolkit:** GTK 4.14+ and libadwaita 1.6+
 **Replaces:** version 1.0 (Cut page, Edit page, Export page with a top switcher).
@@ -76,6 +76,9 @@ AdwApplicationWindow
 - A fatal error (no usable graphics device) shows the message and a **Quit** button.
 - A non-fatal error (no audio device, hardware decode unavailable) does not stop loading. It
   is reported as a toast after the Project Manager appears.
+- Start-up checks whether hardware decoding and hardware encoding really work on this
+  machine. If saved settings ask for something it can't do, those settings are switched off
+  and saved, and a message says so once.
 
 ---
 
@@ -102,8 +105,11 @@ GtkBox (vertical)
 - **Export:** saves a copy of the selected project file to a chosen folder.
 - When a project is already open, **Open** reads **Close** and returns to it, as in Resolve.
 - The size slider changes the thumbnail size (160–320 px wide).
-- **Context menu:** Open, Rename, Duplicate, Show in Files, Move to Trash. Move to Trash uses
-  `gio::File::trash` and offers Undo in a toast.
+- **Context menu:** Open, Rename…, Duplicate, Show in Files, Project Backups…, Move to Trash,
+  Remove from List. Move to Trash uses `gio::File::trash`, so the file can be restored from the
+  system trash. Remove from List leaves the file where it is.
+- **Project Backups…** opens the Project Backups dialog (§8.7).
+- A project that fails to open says why and points to **Project Backups…** for an earlier copy.
 - **Autosave recovery:** if a newer autosave exists for a project, opening it asks
   "Restore unsaved changes from {time}?" with **Restore** and **Discard**.
 
@@ -176,6 +182,8 @@ GtkBox (vertical)
 - **Drag to timeline:** inserts the clip (§5.6).
 - **Context menu:** Open in Viewer, Insert, Append to End, Relink…, Remove from Project.
 - **Missing media** shows the offline look and offers Relink….
+- **First video:** when the first video comes into an empty Media Pool and the timeline is
+  empty, Tempo asks "Change Project Frame Rate?" (§8.1).
 - **Thumbnails** are cached on disk under `~/.cache/tempo/thumbs/`, keyed by path, size and
   modification time. They are not stored in the project file.
 
@@ -216,6 +224,10 @@ GtkBox (vertical)
   source on the left, timeline on the right, as in Resolve's default.
 - **Viewer menu:** Playback Quality (Full, Half, Quarter), Safe Area, Dual Viewer.
 - **Transport** buttons call the same actions as the keys.
+- **Cheaper decoding while overloaded:** when three of the last six frames took over 1.25 times
+  their time, playback skips the deblocking filter and decodes at half height. It returns to
+  full quality, and redraws the frame sharp, when playback stops, starts again or seeks. There
+  is no setting for this.
 - **Timecode** updates from a tick callback while playing; it is not polled by a timer.
 - **Cinema viewer** (`P` or `Ctrl+F`): the window goes full-screen and shows only the
   picture. `Escape` returns.
@@ -262,9 +274,15 @@ It is not built from buttons and boxes.
   kinetic scrolling for free.
 - It draws only what is visible.
 - It keeps a retained layout (clip rectangles) rebuilt only when the timeline, zoom or size
-  changes. Moving the playhead redraws only the playhead.
-- Track header controls (lock, enable/mute) are real `GtkToggleButton` children placed by the
-  widget, so they are keyboard- and screen-reader-accessible.
+  changes.
+- The playhead is drawn by a separate layer widget over the canvas, so moving it redraws only
+  the playhead, not the clips.
+- Track header controls are real `GtkToggleButton`s in a column of header rows beside the
+  canvas, so they are keyboard- and screen-reader-accessible. They sit left-aligned and compact:
+  name box, Lock, then Show/Hide on video tracks, or Solo (`S`) and Mute on audio tracks.
+- **Solo** is on audio tracks only. While any audio track is soloed, playback hears only the
+  soloed tracks; a muted track stays silent. Solo is for listening only: export includes every
+  enabled track. It is an undoable track flag.
 
 **Destination.** The outlined name box on a track header marks where `F9`–`F12` edits and
 pastes go. Click a track's name box to make it the destination. One video and one audio
@@ -280,7 +298,7 @@ Add or delete a track from the track header's context menu, as in Resolve.
 | Selection (`A`) | Click a clip | Select it. `Ctrl+click` adds; drag on empty space draws a selection box |
 | | Drag a clip | Move it; another track if dragged up or down. Overwrites what it lands on |
 | | Drag a clip edge | Trim that edge; leaves a gap |
-| | Drag a fade handle | Set fade in or fade out length |
+| | Drag a fade handle toward the middle | Set the fade in or fade out length, in whole frames |
 | | `Alt+drag` a clip | Duplicate it |
 | Trim (`T`) | Drag a clip edge | Ripple trim: later clips move to close or make room |
 | | Drag a cut between two clips | Roll: move the cut, total length unchanged |
@@ -298,9 +316,14 @@ Add or delete a track from the track header's context menu, as in Resolve.
   with sound places a linked video clip and audio clip.
 - **Drop files from the file manager** onto the timeline: import, then place.
 - **Locked track:** nothing on it can be selected or changed.
+- **Fade handles:** hovering a clip shows a handle at each top corner, or where its fade ends.
+  Dragging toward the middle sets the fade; it snaps to whole frames and never overlaps the
+  other fade. The drag is one undo step. Locked tracks show no handles.
+- **Retimed clips** show their speed after their name, for example "Glacier  200%".
 
-**Clip context menu:** Cut, Copy, Paste, Delete, Ripple Delete, Split at Playhead,
-Enable Clip, Link Clips, plus any plugin commands.
+**Clip context menu:** Cut, Copy, Paste at Playhead · Split at Playhead, Delete, Delete and
+Close Gap · Unlink Picture and Sound (or Link Selected Clips), Turn Clip Off/On · Fade In,
+Fade Out, Cross Dissolve · Change Clip Speed… (§8.1b).
 
 ### 5.7 Audio meter
 
@@ -315,7 +338,7 @@ tick callback only while audio is playing.
 GtkCenterBox
 ├── [start]  Tempo icon and name · ActivityButton (one-line status; opens a GtkPopover of running jobs)
 ├── [center] GtkBox:   GtkToggleButton Edit · GtkToggleButton Export      (icon-only, 150 px each)
-└── [end]    GtkButton Home (Project Manager) · GtkButton Settings
+└── [end]    shortcut hint (GtkLabel) · GtkButton Home (Project Manager) · GtkButton Settings
 ```
 
 - The two page buttons are one toggle group.
@@ -324,6 +347,12 @@ GtkCenterBox
 - The popover lists each job with a progress bar and a cancel button.
 - **Home** saves the project, closes it and returns to the Project Manager. If an export is
   running it asks first.
+- **Shortcut hint:** a dim one-line hint for what is under the pointer: clip body, clip edge,
+  fade handle, ruler, viewer or Media Pool. It says what the mouse does there, then a few keys;
+  over the ruler: "Click or drag to move the playhead · I Mark In · O Mark Out · M Marker".
+  Keys are read from the keybind table
+  (`keybinds.rs::hint`), so a hint never names a key that does something else. This is a Tempo
+  addition; Resolve has no such bar.
 
 ---
 
@@ -364,11 +393,20 @@ libadwaita preferences list.
 | 9:16 | 1080 × 1920 | TikTok, Reels, Shorts | H.264, high quality | AAC 192k | MP4 |
 | 1:1 | 1080 × 1080 | Instagram feed | H.264, high quality | AAC 192k | MP4 |
 | 4:5 | 1080 × 1350 | Instagram portrait | H.264, high quality | AAC 192k | MP4 |
+| ≤ 10 MB | 720p or 1080p | Discord, email | H.264 at a bitrate that fits 10 MB | AAC 96k | MP4 |
 | Custom | as set | — | as set | as set | as set |
 
+- **≤ 10 MB** works out the picture bitrate from the length being exported (the timeline, or
+  the In–Out range), leaving 5 % spare. Below 1.5 Mb/s it exports at 720p, otherwise 1080p;
+  a vertical project gets the portrait size. If the picture would get under 200 kb/s, the
+  card is greyed out with a tooltip that suggests setting In and Out around a shorter part.
+  It always uses the processor's encoder, which keeps to a bitrate exactly.
+
 - If a preset's shape differs from the project's (for example Vertical on a 16:9 project), a
-  row appears: **Fit** (black bars) or **Fill** (crop to centre).
-- The hardware encoder is used when available; the user does not choose it.
+  row appears: **Fit** (black bars) or **Fill** (crop to centre). Picking a tall format (9:16,
+  4:5) on a landscape timeline sets it to **Fill**.
+- The hardware encoder is used only when **Hardware encoding for export** is on in Preferences
+  (§8.4); if it fails, the export continues on the processor.
 - User presets are saved to `~/.config/tempo/export_presets.json`.
 
 ### 7.2 Render queue
@@ -445,8 +483,34 @@ All are `AdwDialog` unless noted.
 | Resolution | `AdwComboRow` | 1080p |
 | Frame rate | `AdwComboRow` | 30 |
 
-Buttons: **Cancel**, **Create**. If the first imported clip has a different size or frame
-rate, a banner asks "Match project to this clip?" — the same question Resolve asks.
+Buttons: **Cancel**, **Create**.
+
+**Change Project Frame Rate?** When the first video comes into an empty Media Pool and the
+timeline is empty, and its size or frame rate differs from the project's, an
+`AdwAlertDialog` asks this — the same question Resolve asks. It names the clip's size and
+rate and the project's. **Change** (default) sets the project to match; **Don't Change**
+keeps it. Odd rates snap to the nearest standard one (23.976 to 60), frame sizes to even
+numbers, and a portrait clip gives a vertical project. It is asked once per import and is
+not undoable, as in Resolve; the timeline is empty, so nothing is lost.
+
+### 8.1b Change Clip Speed (`R`)
+
+An `AdwAlertDialog` for the selected video or sound clip, also in the clip context menu.
+Titles and images have no speed; `R` on them, or with nothing selected, shows a message.
+
+| Row | Widget | Default |
+|---|---|---|
+| Speed % | `GtkSpinButton`, 25–400, step 5 | the clip's speed |
+| Ripple Sequence | `GtkSwitch` | on |
+| New length | label | updates live |
+
+- **New length** runs the real change on a copy of the timeline, so it shows exactly what
+  **Change** will do, or why it can't.
+- With Ripple Sequence on, the clip keeps its footage and changes length; later clips on the
+  affected tracks move to make room or close up. With it off, the clip keeps its length and
+  never covers the next clip; if a faster speed runs out of footage, it ends early.
+- Linked sound changes with the picture. Lengths are whole frames. One undo step.
+- Buttons: **Cancel**, **Change** (default).
 
 ### 8.1a Marker
 
@@ -468,8 +532,11 @@ Resolution, frame rate (locked once the timeline has clips), proxy folder.
 | Page | Settings |
 |---|---|
 | General | Font scale, autosave interval (1, 2, 5, 10 minutes), reset first-use hints |
-| Playback | Default quality, hardware decoding on/off, automatic proxies on/off |
+| Playback | Default quality, automatic proxies on/off, hardware decoding on/off, hardware encoding for export on/off |
 | Storage | Frame cache size, cache folder, **Clear cache** with size shown |
+
+The hardware switches are greyed out, with the reason in their subtitle, when the start-up
+check (§3) found that the graphics driver can't decode or encode video on this computer.
 
 ### 8.5 Plugins (`AdwPreferencesDialog`)
 
@@ -481,6 +548,17 @@ files; dropping a file on the dialog also installs it.
 
 Built from `keybinds.json`. Groups follow `KEYBINDS.md`. Tempo-only keys are under their own
 heading.
+
+### 8.7 Project Backups
+
+From the Project Manager's context menu. An `AdwAlertDialog` titled "Backups of "{name}"" with
+one row per backup, newest first: the time taken and the size, an **Open as Copy** button and a
+delete button.
+
+- **Open as Copy** makes a new project next to the original and opens it. The original is not
+  changed.
+- Delete removes that backup file.
+- With no backups yet, it says one is kept every 10 minutes while you edit.
 
 ---
 

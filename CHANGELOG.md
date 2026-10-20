@@ -49,6 +49,9 @@ Alpha. Built for slower computers first:
 
 ### Changed
 
+- **Project files move to schema 2**, so clips with a changed speed can be saved. A project
+  from 0.1.x is copied to `<file>.v1.bak` the first time 0.2.0 opens it. Tempo 0.1.x can't
+  open a project once 0.2.0 has saved it; keep the `.v1.bak` if you need to go back.
 - Playback decodes more cheaply (no deblocking, half height) while it can't keep up, and
   returns to full quality when it stops or seeks. On a 4K60 stress clip, dropped frames
   fell from 83 % to 9.5 %.
@@ -66,7 +69,7 @@ Alpha. Built for slower computers first:
   you are told once.
 - Titles are beige on the timeline, and clips with adjustments are a darker shade, as in
   Resolve.
-- Choosing 9:16 on a landscape timeline defaults to Fill.
+- Choosing a tall format (9:16 or 4:5) on a landscape timeline defaults to Fill.
 - Track header buttons are smaller and left-aligned.
 
 ### Fixed
