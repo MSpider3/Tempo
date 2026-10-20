@@ -14,7 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `TEMPO_DEMO_VERTICAL=1` makes a 9:16 project, to check the vertical layout.
     let (w, h) = if std::env::var_os("TEMPO_DEMO_VERTICAL").is_some() { (1080, 1920) } else { (1920, 1080) };
-    let mut project = Project::new("Demo Project", w, h, RationalFps::FPS_30);
+    // `TEMPO_DEMO_FPS=60` makes a 60 fps project, for the playback benchmark.
+    let fps = if std::env::var("TEMPO_DEMO_FPS").as_deref() == Ok("60") { RationalFps::FPS_60 } else { RationalFps::FPS_30 };
+    let mut project = Project::new("Demo Project", w, h, fps);
     let track = |p: &Project, kind: TrackKind, index: u32| {
         p.timeline.tracks.iter().find(|t| t.kind == kind && t.kind_index == index).map(|t| t.id)
     };

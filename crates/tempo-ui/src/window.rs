@@ -916,7 +916,7 @@ impl MainWindow {
     /// Playback figures for automated checks.
     pub fn stats(&self) -> String {
         let p = &self.state.player;
-        format!("position_us={} dropped_frames={} playing={}", p.position_us(), p.dropped_frames(), p.is_playing())
+        format!("position_us={} dropped_frames={} playing={} canvas_draws={}", p.position_us(), p.dropped_frames(), p.is_playing(), crate::timeline::draw_count())
     }
 
     fn in_project(&self) -> bool {

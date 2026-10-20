@@ -41,6 +41,13 @@ pub struct Row {
     pub enabled: bool,
 }
 
+/// How many times the timeline canvas has been redrawn; reported by `stats` for benchmarks.
+static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn draw_count() -> u64 {
+    DRAWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Video tracks stack upward and audio tracks downward from the divider, as in Resolve.
 pub fn rows(timeline: &Timeline) -> Vec<Row> {
     let mut video: Vec<_> = timeline.tracks.iter().filter(|t| t.kind == TrackKind::Video).collect();
@@ -792,6 +799,7 @@ impl TimelineCanvas {
     }
 
     fn draw(&self, s: &gtk::Snapshot) {
+        DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (w, h) = (self.width() as f32, self.height() as f32);
         let state = self.state();
         let imp = self.imp();
