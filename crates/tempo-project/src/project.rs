@@ -1032,6 +1032,12 @@ mod tests {
     }
 
     #[test]
+    fn files_without_speed_load_at_normal_speed() {
+        let (file, _) = tampered(r#"UPDATE clips SET properties = '{"opacity":1.0}';"#);
+        assert_eq!(load_project(file.path()).unwrap().timeline.tracks[0].clips[0].properties.speed, 1.0);
+    }
+
+    #[test]
     fn load_rejects_corrupt_clip_properties() {
         let (file, clip_id) = tampered("UPDATE clips SET properties = '{bad';");
         match load_project(file.path()) {

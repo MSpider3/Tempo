@@ -84,7 +84,7 @@ fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Pi
         .filter(|c| c.properties.enabled && kinds.contains(&c.clip_type) && c.timeline_out > r0 && c.timeline_in < r1)
         .map(|c| {
             let start = c.timeline_in.max(r0);
-            Piece { clip: c, start: start - r0, end: c.timeline_out.min(r1) - r0, source_in: c.source_in + (start - c.timeline_in) }
+            Piece { clip: c, start: start - r0, end: c.timeline_out.min(r1) - r0, source_in: c.source_offset_at(start) }
         })
         .collect();
     out.sort_by_key(|p| p.start);

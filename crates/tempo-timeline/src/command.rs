@@ -180,7 +180,7 @@ impl Command for InsertClipCommand {
                     let mut left = old.clone();
                     let left_dur = insert_in - old.timeline_in;
                     left.timeline_out = insert_in;
-                    left.source_out = left.source_in + left_dur;
+                    left.source_out = left.source_in + old.to_source_us(left_dur);
                     // As with a split, each fade stays at its own end.
                     left.properties.fade_out_us = 0;
                     new_clips.push(left);
@@ -191,7 +191,7 @@ impl Command for InsertClipCommand {
                     right.properties.dissolve_in_us = 0;
                     right.timeline_in = insert_in + insert_dur;
                     right.timeline_out = old.timeline_out + insert_dur;
-                    right.source_in = old.source_in + left_dur;
+                    right.source_in = old.source_in + old.to_source_us(left_dur);
                     new_clips.push(right);
                 }
             }
@@ -484,7 +484,7 @@ impl TrimClipCommand {
 
 impl Command for TrimClipCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
-        let (track_id, (tin, tout, sin, sout), still) = {
+        let (track_id, (tin, tout, sin, sout), still, orig) = {
             let (track, clip) = timeline
                 .find_clip(self.clip_id)
                 .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
@@ -493,7 +493,7 @@ impl Command for TrimClipCommand {
             }
             // Titles and still pictures have no footage to run out of.
             let still = matches!(clip.clip_type, ClipType::Title | ClipType::Image);
-            (track.id, (clip.timeline_in, clip.timeline_out, clip.source_in, clip.source_out), still)
+            (track.id, (clip.timeline_in, clip.timeline_out, clip.source_in, clip.source_out), still, clip.clone())
         };
         self.saved_timeline_in = tin;
         self.saved_timeline_out = tout;
@@ -503,7 +503,7 @@ impl Command for TrimClipCommand {
         let (new_tin, new_tout, new_sin, new_sout) = match self.edge {
             TrimEdge::In => {
                 let n_tin = tin + self.delta_us;
-                let n_sin = sin + self.delta_us;
+                let n_sin = sin + orig.to_source_us(self.delta_us);
                 if n_tin >= tout || n_tin < 0 || (n_sin < 0 && !still) {
                     return Err(TimelineError::InvalidTimeRange(n_tin, tout));
                 }
@@ -515,7 +515,7 @@ impl Command for TrimClipCommand {
             }
             TrimEdge::Out => {
                 let n_tout = tout + self.delta_us;
-                let n_sout = sout + self.delta_us;
+                let n_sout = sout + orig.to_source_us(self.delta_us);
                 if n_tout <= tin || (n_sout <= sin && !still) {
                     return Err(TimelineError::InvalidTimeRange(tin, n_tout));
                 }
@@ -648,7 +648,7 @@ impl Command for SplitClipCommand {
         self.original_source_out = clip.source_out;
 
         let delta = self.split_time_us - clip.timeline_in;
-        let split_source = clip.source_in + delta;
+        let split_source = clip.source_in + clip.to_source_us(delta);
 
         // A fade belongs to the end of the clip it was put on: the fade in stays
         // with the first part and the fade out goes with the second.
@@ -1074,7 +1074,7 @@ impl Command for OverwriteClipCommand {
                 let mut left = old.clone();
                 let left_dur = new_in - old.timeline_in;
                 left.timeline_out = new_in;
-                left.source_out = left.source_in + left_dur;
+                left.source_out = left.source_in + old.to_source_us(left_dur);
                 left.properties.fade_out_us = 0;
                 new_track_clips.push(left);
 
@@ -1084,21 +1084,21 @@ impl Command for OverwriteClipCommand {
                 right.properties.dissolve_in_us = 0;
                 let cut_offset = new_out - old.timeline_in;
                 right.timeline_in = new_out;
-                right.source_in = old.source_in + cut_offset;
+                right.source_in = old.source_in + old.to_source_us(cut_offset);
                 new_track_clips.push(right);
             } else if old.timeline_in < new_in && old.timeline_out > new_in {
                 // Overlaps start -> trim end
                 let mut left = old.clone();
                 let left_dur = new_in - old.timeline_in;
                 left.timeline_out = new_in;
-                left.source_out = left.source_in + left_dur;
+                left.source_out = left.source_in + old.to_source_us(left_dur);
                 new_track_clips.push(left);
             } else if old.timeline_in < new_out && old.timeline_out > new_out {
                 // Overlaps end -> trim start
                 let mut right = old.clone();
                 let cut_offset = new_out - old.timeline_in;
                 right.timeline_in = new_out;
-                right.source_in = old.source_in + cut_offset;
+                right.source_in = old.source_in + old.to_source_us(cut_offset);
                 new_track_clips.push(right);
             }
         }
@@ -1188,7 +1188,7 @@ impl Command for ReplaceClipCommand {
         let duration = clip.duration_us();
         clip.source_id = self.new_source_id;
         clip.source_in = self.new_source_in;
-        clip.source_out = self.new_source_in + duration;
+        clip.source_out = self.new_source_in + clip.to_source_us(duration);
         clip.name = self.new_name.clone();
 
         Ok(())
@@ -1274,7 +1274,7 @@ impl Command for AppendClipCommand {
         }
 
         let track_end = track.clips.last().map(|c| c.timeline_out).unwrap_or(0);
-        let duration = self.clip.source_out - self.clip.source_in;
+        let duration = self.clip.to_timeline_us(self.clip.source_out - self.clip.source_in);
         self.clip.timeline_in = track_end;
         self.clip.timeline_out = track_end + duration;
 
@@ -1453,7 +1453,7 @@ impl Command for RippleTrimCommand {
         // The clip keeps its start on the timeline; only its length changes.
         let shift = match self.edge {
             TrimEdge::In => {
-                let new_source_in = clip.source_in + self.delta_us;
+                let new_source_in = clip.source_in + clip.to_source_us(self.delta_us);
                 if new_source_in < 0 || new_source_in >= clip.source_out {
                     return Err(TimelineError::InvalidTimeRange(new_source_in, clip.source_out));
                 }
@@ -1467,7 +1467,7 @@ impl Command for RippleTrimCommand {
                     return Err(TimelineError::InvalidTimeRange(clip.timeline_in, new_out));
                 }
                 clip.timeline_out = new_out;
-                clip.source_out += self.delta_us;
+                clip.source_out += clip.to_source_us(self.delta_us);
                 self.delta_us
             }
         };
@@ -2424,6 +2424,50 @@ mod tests {
         assert!(timeline.find_track(audio).unwrap().solo);
         log.undo(&mut timeline).unwrap();
         assert!(!timeline.find_track(audio).unwrap().solo);
+    }
+
+    /// One clip on V1: 0–4 s on the timeline, from 10 s into the source, at `speed`.
+    fn retimed(speed: f64) -> (Timeline, Uuid, Uuid) {
+        let mut timeline = Timeline::new_default();
+        let track = timeline.tracks[0].id;
+        let mut clip = Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 0, 4_000_000, 10_000_000, 10_000_000 + (4_000_000_f64 * speed) as i64);
+        clip.properties.speed = speed;
+        let id = clip.id;
+        timeline.tracks[0].clips.push(clip);
+        (timeline, track, id)
+    }
+
+    #[test]
+    fn split_at_half_speed_maps_source_correctly() {
+        let (mut timeline, track, id) = retimed(0.5);
+        let mut split = SplitClipCommand::new(track, id, 2_000_000);
+        split.execute(&mut timeline).unwrap();
+        let first = timeline.find_clip(id).unwrap().1.clone();
+        let second = timeline.find_clip(split.second_clip_id()).unwrap().1.clone();
+        // 2 s of timeline at half speed is 1 s of source.
+        assert_eq!((first.source_in, first.source_out), (10_000_000, 11_000_000));
+        assert_eq!((second.source_in, second.source_out), (11_000_000, 12_000_000));
+        assert_eq!(second.properties.speed, 0.5);
+    }
+
+    #[test]
+    fn trim_at_double_speed_moves_source_twice_as_far() {
+        let (mut timeline, _, id) = retimed(2.0);
+        TrimClipCommand::new(id, TrimEdge::In, 1_000_000).execute(&mut timeline).unwrap();
+        let clip = timeline.find_clip(id).unwrap().1.clone();
+        assert_eq!((clip.timeline_in, clip.source_in), (1_000_000, 12_000_000));
+        assert_eq!(clip.source_offset_at(2_000_000), 14_000_000);
+    }
+
+    #[test]
+    fn overwrite_inside_a_retimed_clip_keeps_both_sides_in_step() {
+        let (mut timeline, track, id) = retimed(2.0);
+        let middle = Clip::new(track, Uuid::new_v4(), ClipType::Video, "m", 1_000_000, 2_000_000, 0, 1_000_000);
+        OverwriteClipCommand::new(middle).execute(&mut timeline).unwrap();
+        let left = timeline.find_clip(id).unwrap().1.clone();
+        assert_eq!(left.source_out, 12_000_000);
+        let right = timeline.tracks[0].clips.iter().find(|c| c.timeline_in == 2_000_000).unwrap();
+        assert_eq!((right.source_in, right.source_out), (14_000_000, 18_000_000));
     }
 
     /// Changes nothing; its undo fails when asked to.

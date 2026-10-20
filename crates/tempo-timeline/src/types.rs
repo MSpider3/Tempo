@@ -122,6 +122,9 @@ pub struct ClipProperties {
     /// Filters on this clip, applied in order.
     #[serde(default)]
     pub effects: Vec<crate::effects::ClipEffect>,
+    /// Playback speed: 1.0 is normal, 0.5 half speed (slow motion), 2.0 double.
+    /// Source time = timeline time × speed. Kept within 0.25–4.0 by the commands.
+    pub speed: f64,
 }
 
 fn enabled_by_default() -> bool {
@@ -150,6 +153,7 @@ impl Default for ClipProperties {
             dissolve_in_us: 0,
             link: None,
             effects: Vec::new(),
+            speed: 1.0,
         }
     }
 }
@@ -164,6 +168,7 @@ impl ClipProperties {
         let sound = (self.volume, self.pan);
         !self.effects.is_empty()
             || !self.keyframes.is_empty()
+            || self.speed != 1.0
             || picture != (d.opacity, d.position_x, d.position_y, d.scale_x, d.scale_y, d.rotation)
             || sound != (d.volume, d.pan)
             || (self.lift, self.gamma, self.gain) != (d.lift, d.gamma, d.gain)
@@ -340,21 +345,33 @@ impl Clip {
         time_us >= self.timeline_in && time_us < self.timeline_out
     }
 
+    /// Source time that `timeline_time_us` of this clip shows.
     pub fn source_offset_at(&self, timeline_time_us: i64) -> i64 {
-        self.source_in + (timeline_time_us - self.timeline_in)
+        self.source_in + self.to_source_us(timeline_time_us - self.timeline_in)
+    }
+
+    /// How much source a stretch of this clip's timeline covers, at its speed.
+    /// Every edit that turns timeline time into source time goes through here.
+    pub fn to_source_us(&self, timeline_us: i64) -> i64 {
+        scale_us(timeline_us, self.properties.speed)
+    }
+
+    /// How much timeline a stretch of this clip's source takes, at its speed.
+    pub fn to_timeline_us(&self, source_us: i64) -> i64 {
+        scale_us(source_us, 1.0 / self.properties.speed)
     }
 
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
     pub fn dissolve_lead(&self) -> Option<Clip> {
-        let d = self.properties.dissolve_in_us.min(self.source_in);
+        let d = self.properties.dissolve_in_us.min(self.to_timeline_us(self.source_in));
         if d <= 0 {
             return None;
         }
         let mut lead = self.clone();
         lead.timeline_in = self.timeline_in - d;
         lead.timeline_out = self.timeline_in;
-        lead.source_in = self.source_in - d;
+        lead.source_in = self.source_in - self.to_source_us(d);
         lead.source_out = self.source_in;
         lead.properties.fade_in_us = d;
         lead.properties.fade_out_us = 0;
@@ -868,6 +885,16 @@ impl Project {
 }
 
 /// The start or end of a clip, where its fade handles sit.
+/// `us × factor`, rounded. Exactly `us` at normal speed (and for a nonsense factor), so
+/// clips that are not retimed keep their exact times.
+fn scale_us(us: i64, factor: f64) -> i64 {
+    if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
+        us
+    } else {
+        (us as f64 * factor).round() as i64
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FadeEdge {
     In,

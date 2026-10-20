@@ -759,10 +759,13 @@ impl TimelineCanvas {
                         let footage = p.sources.get(&c.source_id).map(|s| s.duration_us).filter(|d| !still && *d > 0);
                         let before = track.clips.iter().map(|o| o.timeline_out).filter(|o| *o <= c.timeline_in).max().unwrap_or(0);
                         let after = track.clips.iter().map(|o| o.timeline_in).filter(|o| *o >= c.timeline_out).min();
-                        Some((c.timeline_in, c.timeline_out, c.source_in, c.source_out, still, footage, before, after))
+                        // Unused footage before and after the clip, in timeline time at its speed.
+                        let head = c.to_timeline_us(c.source_in);
+                        let tail = footage.map(|d| c.to_timeline_us((d - c.source_out).max(0)));
+                        Some((c.timeline_in, c.timeline_out, head, tail, still, before, after))
                     })
                     .flatten();
-                let Some((tin, tout, source_in, source_out, still, footage, before, after)) = facts else { return };
+                let Some((tin, tout, head, tail, still, before, after)) = facts else { return };
                 let base = if *edge == TrimEdge::In { tin } else { tout };
                 let moving = self.moving_with(*clip);
                 let (target, hit) = self.snap(base + delta_us, &moving);
@@ -775,11 +778,11 @@ impl TimelineCanvas {
                 let makes_room = state.tool.get() == Tool::Trim && !*roll;
                 let (low, high) = match edge {
                     TrimEdge::In => {
-                        let footage_low = if still { 0 } else { tin - source_in };
+                        let footage_low = if still { 0 } else { tin - head };
                         (footage_low.max(if makes_room { 0 } else { before }), tout - frame)
                     }
                     TrimEdge::Out => {
-                        let footage_high = footage.map_or(i64::MAX, |d| tout + (d - source_out).max(0));
+                        let footage_high = tail.map_or(i64::MAX, |room| tout + room);
                         (tin + frame, footage_high.min(if makes_room { i64::MAX } else { after.unwrap_or(i64::MAX) }))
                     }
                 };
@@ -857,12 +860,13 @@ impl TimelineCanvas {
 
     /// Draw the loudness of a clip as vertical bars, one every two pixels, only
     /// for the part of the clip that is on screen.
+    /// `speed` is the clip's: each pixel of timeline covers that much more (or less) sound.
     #[allow(clippy::too_many_arguments)]
-    fn draw_waveform(&self, s: &gtk::Snapshot, peaks: &[u8], source_start_us: i64, x: f32, y: f32, width: f32, height: f32, view_w: f32) {
+    fn draw_waveform(&self, s: &gtk::Snapshot, peaks: &[u8], source_start_us: i64, speed: f64, x: f32, y: f32, width: f32, height: f32, view_w: f32) {
         const PEAKS_PER_SECOND: f64 = 50.0;
         let color = css_color(self, "tempo_clip_text");
         let color = gdk::RGBA::new(color.red(), color.green(), color.blue(), 0.85);
-        let us_per_px = 1_000_000.0 / self.pps();
+        let us_per_px = 1_000_000.0 / self.pps() * speed;
         let mid = y + height / 2.0;
         let mut px = (-x).max(0.0);
         let end = width.min(view_w - x);
@@ -1004,7 +1008,7 @@ impl TimelineCanvas {
                 let bar_y = body.y() + body.height() - NAME_BAR_H;
                 if clip.clip_type == ClipType::Audio {
                     if let Some(peaks) = state.waveforms.borrow().get(&clip.source_id) {
-                        self.draw_waveform(s, peaks, clip.source_in + (tin - clip.timeline_in), x0, body.y(), x1 - x0, bar_y - body.y(), w);
+                        self.draw_waveform(s, peaks, clip.source_offset_at(tin), clip.properties.speed, x0, body.y(), x1 - x0, bar_y - body.y(), w);
                     }
                 }
                 s.append_color(&shaded(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
@@ -1031,7 +1035,7 @@ impl TimelineCanvas {
                 s.pop();
                 // A cross dissolve is marked by a box reaching back over the previous clip.
                 if clip.properties.dissolve_in_us > 0 && track.has_clip_ending_at(clip.timeline_in) {
-                    let lead = (clip.properties.dissolve_in_us.min(clip.source_in) as f64 / 1_000_000.0 * self.pps()) as f32;
+                    let lead = (clip.properties.dissolve_in_us.min(clip.to_timeline_us(clip.source_in)) as f64 / 1_000_000.0 * self.pps()) as f32;
                     let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
                     s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
                     s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);
