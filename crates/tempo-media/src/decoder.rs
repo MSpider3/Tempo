@@ -68,12 +68,12 @@ unsafe extern "C" fn pick_format(_ctx: *mut ffi::AVCodecContext, formats: *const
 /// A forward jump shorter than this is decoded through; longer jumps seek.
 pub const SEEK_THRESHOLD_US: i64 = 2_000_000;
 
-/// One RGBA picture.
+/// One RGBA picture. Cloning shares the pixels instead of copying them.
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub data: std::sync::Arc<Vec<u8>>,
     pub pts_us: i64,
 }
 
@@ -252,7 +252,7 @@ impl FfmpegDecoder {
                 }
             }
         }
-        Ok(VideoFrame { width, height, data: buffer, pts_us })
+        Ok(VideoFrame { width, height, data: buffer.into(), pts_us })
     }
 
     /// Exact frame at or after `target_pts_us` (microseconds from the start of the file).
@@ -382,6 +382,8 @@ mod tests {
         let b = d.decode_video_frame(1_000_000).expect("frame");
         assert_eq!(a.pts_us, b.pts_us);
         assert!(a.pts_us >= 1_000_000 && a.pts_us < 1_100_000);
+        // The repeat shares the picture instead of copying it.
+        assert!(std::sync::Arc::ptr_eq(&a.data, &b.data));
     }
 
     #[test]

@@ -63,3 +63,4 @@ Observations:
 | 2026-10-20 | baseline | — | recorded |
 | 2026-10-20 | P1-T2 adaptive decode: after 3 frames over 1.25× their time, skip the deblocking filter and halve the decode height until playback stops or seeks | 2160p60_grain: 473 → 49 dropped (82.9 % → 8.5 %), CPU 240 → 174 %; 2160p30 and 1080p60 unchanged (0 dropped, never triggered) | kept |
 | 2026-10-20 | P1-T3 playhead on its own overlay layer; the canvas is redrawn only when clips, scroll or zoom change | canvas draws in 10 s playback: 1080p30 295 → 2, 1080p60 448 → 2; CPU 38 → 37 %, 59 → 59 % (within noise on this short timeline; the saving grows with clip count) | kept |
+| 2026-10-20 | P1-T4 decoded frames shared (`Arc`) instead of copied into the repeat cache and again into GTK | median of 5 vs previous commit: 1080p30 Full CPU 49 → 43 %, RSS 304 → 296 MB; 2160p30 at 540p 80 → 78 % (noise: 2 MB frames) | kept |

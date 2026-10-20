@@ -178,7 +178,7 @@ impl VideoSurface {
                 let texture = l.frame.map(|frame| {
                     let stride = frame.width as usize * 4;
                     let (w, h) = (frame.width as i32, frame.height as i32);
-                    let bytes = glib::Bytes::from_owned(frame.data);
+                    let bytes = glib::Bytes::from_owned(SharedPixels(frame.data));
                     gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::R8g8b8a8, &bytes, stride).upcast::<gdk::Texture>()
                 });
                 Drawn { texture, title: l.title, props: l.props }
@@ -186,5 +186,14 @@ impl VideoSurface {
             .collect();
         *self.imp().layers.borrow_mut() = drawn;
         self.queue_draw();
+    }
+}
+
+/// Hands a decoded picture to GTK without copying it.
+struct SharedPixels(std::sync::Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedPixels {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
