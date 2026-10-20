@@ -34,7 +34,8 @@ pub struct Snapshot {
     audio: Vec<(Vec<Clip>, f32)>,
     /// What the picture is decoded from: the proxy when there is one.
     sources: HashMap<Uuid, PathBuf>,
-    /// What the sound is decoded from: always the original file.
+    /// The original files. Sound is read from the proxy in `sources` when it has a sound
+    /// track (one file to read), and from here otherwise.
     audio_sources: HashMap<Uuid, PathBuf>,
     pub duration_us: i64,
     /// The frame grid playback steps on.
@@ -698,7 +699,7 @@ const MAX_OPEN_READERS: usize = 4;
 
 /// Mixes the audio tracks and keeps the output queue topped up while playing.
 fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
-    let mut readers: Vec<(Uuid, AudioReader)> = Vec::new();
+    let mut readers: Vec<(Uuid, PathBuf, AudioReader)> = Vec::new();
     let mut job: Option<(Arc<Snapshot>, i64)> = None;
     let mut mix = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
     let mut part = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
@@ -718,7 +719,8 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         };
         match cmd {
             Some(Feed::Start { snapshot, pos_us }) => {
-                readers.retain(|(id, _)| snapshot.audio_sources.contains_key(id));
+                // Keep readers of the file each source should now be read from.
+                readers.retain(|(id, path, _)| snapshot.sources.get(id).or(snapshot.audio_sources.get(id)) == Some(path));
                 job = Some((snapshot, pos_us));
                 continue;
             }
@@ -741,8 +743,9 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             if clip.properties.muted || !clip.properties.enabled {
                 continue;
             }
-            let Some(path) = snapshot.audio_sources.get(&clip.source_id) else { continue };
-            let Some(reader) = reader_for(&mut readers, clip.source_id, path) else { continue };
+            let original = snapshot.audio_sources.get(&clip.source_id);
+            let Some(preferred) = snapshot.sources.get(&clip.source_id).or(original) else { continue };
+            let Some(reader) = reader_for(&mut readers, clip.source_id, preferred, original) else { continue };
             reader.read(clip.source_offset_at(*pos_us), &mut part);
             let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us);
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
@@ -760,25 +763,26 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
     }
 }
 
-fn reader_for<'a>(readers: &'a mut Vec<(Uuid, AudioReader)>, id: Uuid, path: &PathBuf) -> Option<&'a mut AudioReader> {
-    if let Some(idx) = readers.iter().position(|(r, _)| *r == id) {
+/// The open reader for a source, opening `preferred` (or, if it has no sound, `fallback`).
+fn reader_for<'a>(readers: &'a mut Vec<(Uuid, PathBuf, AudioReader)>, id: Uuid, preferred: &PathBuf, fallback: Option<&PathBuf>) -> Option<&'a mut AudioReader> {
+    if let Some(idx) = readers.iter().position(|(r, _, _)| *r == id) {
         let entry = readers.remove(idx);
         readers.push(entry);
     } else {
-        match AudioReader::open(path) {
-            Ok(r) => {
-                if readers.len() >= MAX_OPEN_READERS {
-                    readers.remove(0);
-                }
-                readers.push((id, r));
-            }
+        let opened = std::iter::once(preferred).chain(fallback.filter(|f| *f != preferred)).find_map(|path| match AudioReader::open(path) {
+            Ok(r) => Some((path.clone(), r)),
             Err(e) => {
                 tracing::debug!("no sound from {}: {e}", path.display());
-                return None;
+                None
             }
+        });
+        let (path, reader) = opened?;
+        if readers.len() >= MAX_OPEN_READERS {
+            readers.remove(0);
         }
+        readers.push((id, path, reader));
     }
-    readers.last_mut().map(|(_, r)| r)
+    readers.last_mut().map(|(_, _, r)| r)
 }
 
 /// Source time to decode for the picture shown at timeline position `pos`: the start of

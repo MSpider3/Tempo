@@ -34,15 +34,18 @@ fixture 2160p30_hevc 3840x2160 30 libx265
 # Moving grain at a phone camera's 80 Mb/s makes every frame expensive to decode.
 fixture 2160p60_grain 3840x2160 60 libx264 "noise=alls=16:allf=t" "-b:v 80M -maxrate 80M -bufsize 160M"
 
-# case -> media file, project fps, preview height (0 = full size from the original)
+# case -> media file, project fps, preview height (0 = full size from the original),
+# proxy (none, audio = proxy with sound, silent = proxy without, so sound comes from the original)
 spec() {
     case $1 in
-        1080p30) echo "1080p30 30 540" ;;
-        1080p60) echo "1080p60 60 540" ;;
-        2160p30) echo "2160p30 30 540" ;;
-        2160p30_hevc) echo "2160p30_hevc 30 540" ;;
-        1080p30_full) echo "1080p30 30 0" ;;
-        2160p60_grain) echo "2160p60_grain 60 540" ;;
+        1080p30) echo "1080p30 30 540 none" ;;
+        1080p60) echo "1080p60 60 540 none" ;;
+        2160p30) echo "2160p30 30 540 none" ;;
+        2160p30_hevc) echo "2160p30_hevc 30 540 none" ;;
+        1080p30_full) echo "1080p30 30 0 none" ;;
+        2160p60_grain) echo "2160p60_grain 60 540 none" ;;
+        2160p60_grain_proxy) echo "2160p60_grain 60 540 audio" ;;
+        2160p60_grain_proxy_silent) echo "2160p60_grain 60 540 silent" ;;
         *) echo "unknown case $1" >&2; exit 1 ;;
     esac
 }
@@ -53,10 +56,14 @@ waits=$(printf 'dump;%.0s' $(seq 20)) # 3 s for the project to open
 printf '| case | preview | hw decode | played s | dropped (median) | dropped %% | peak RSS MB | CPU %% | canvas draws |\n'
 printf '|---|---|---|---|---|---|---|---|---|\n'
 for name in $CASES; do
-    read -r file fps height < <(spec "$name")
+    read -r file fps height proxy < <(spec "$name")
     project="$work/$name.tempo"
     rm -f "$project"
-    TEMPO_DEMO_FPS=$fps cargo run -q -p tempo-app --example make_demo_project -- "$project" "$media/$file.mp4" >/dev/null
+    if [ "$proxy" = none ]; then
+        TEMPO_DEMO_FPS=$fps cargo run -q -p tempo-app --example make_demo_project -- "$project" "$media/$file.mp4" >/dev/null
+    else
+        TEMPO_DEMO_PROXY=$proxy TEMPO_DEMO_FPS=$fps cargo run -q -p tempo-app --example make_demo_project -- "$project" "$media/$file.mp4" >/dev/null
+    fi
     drops=() rss=() cpu=() played=() draws=()
     for _ in $(seq "$RUNS"); do
         xdg="$work/xdg"

@@ -57,6 +57,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let clip = Clip::new(v2, source.id, ClipType::Video, "overlay", at + 500_000, at + 2_000_000, 0, 1_500_000);
             project.timeline.find_track_mut(v2).ok_or("track")?.clips.push(clip);
         }
+        // `TEMPO_DEMO_PROXY=audio` gives each file a ready proxy made by Tempo's own code
+        // (kept beside the file); `=silent` uses a copy of it without sound. For benchmarks.
+        if let Ok(kind) = std::env::var("TEMPO_DEMO_PROXY") {
+            let with_sound = path.with_extension("proxy.mp4");
+            if !with_sound.exists() {
+                tempo_proxy::ProxyEngine::generate_proxy_sync(path, &with_sound)?;
+            }
+            let proxy = if kind == "silent" { path.with_extension("proxy-silent.mp4") } else { with_sound.clone() };
+            if !proxy.exists() {
+                let status = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&with_sound).args(["-an", "-c", "copy"]).arg(&proxy).status()?;
+                if !status.success() {
+                    return Err("could not make the silent proxy".into());
+                }
+            }
+            source.proxy_path = Some(proxy);
+            source.proxy_ready = true;
+        }
         project.sources.insert(source.id, source);
         at += len;
     }
