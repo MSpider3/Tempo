@@ -154,6 +154,8 @@ struct Shared {
     playing: AtomicBool,
     serial: AtomicU64,
     dropped: AtomicU32,
+    /// Playback has switched to cheaper decoding because it could not keep up.
+    degraded: AtomicBool,
     layers: Mutex<Option<Vec<Layer>>>,
 }
 
@@ -261,6 +263,11 @@ impl Player {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// True while playback decodes at reduced quality to keep up.
+    pub fn is_degraded(&self) -> bool {
+        self.shared.degraded.load(Ordering::Relaxed)
+    }
+
     /// Changes every time a new picture is ready.
     pub fn serial(&self) -> u64 {
         self.shared.serial.load(Ordering::Acquire)
@@ -299,6 +306,27 @@ struct Worker {
     audio_clock: bool,
     /// Last frame count seen and when, to notice a stalled sound device.
     audio_seen: (u64, Instant),
+    overload: Overload,
+}
+
+/// Notices playback that keeps missing its frame time, so decoding can get cheaper.
+#[derive(Default)]
+struct Overload {
+    streak: u8,
+    degraded: bool,
+}
+
+impl Overload {
+    /// Record how long one frame took. True when playback should switch to cheaper
+    /// decoding now: three frames in a row took over 1.25 times their time.
+    fn record(&mut self, spent: Duration, frame: Duration) -> bool {
+        if self.degraded {
+            return false;
+        }
+        self.streak = if spent.as_secs_f64() > frame.as_secs_f64() * 1.25 { self.streak + 1 } else { 0 };
+        self.degraded = self.streak >= 3;
+        self.degraded
+    }
 }
 
 impl Worker {
@@ -319,6 +347,7 @@ impl Worker {
             feeder,
             audio_clock: false,
             audio_seen: (0, Instant::now()),
+            overload: Overload::default(),
             rx,
             shared,
             timeline: Arc::new(Snapshot::empty()),
@@ -347,9 +376,44 @@ impl Worker {
     }
 
     fn set_playing(&mut self, playing: bool) {
+        // Every start and stop of playback returns to full quality.
+        self.set_degraded(false);
         self.playing = playing;
         self.shared.playing.store(playing, Ordering::Release);
         self.restart_clock();
+    }
+
+    /// Height pictures are decoded at: the preview quality, halved while degraded.
+    fn output_height(&self) -> u32 {
+        match (self.overload.degraded, self.max_height) {
+            (false, h) => h,
+            (true, 0) => 540,
+            (true, h) => (h / 2).max(270),
+        }
+    }
+
+    /// Switch cheaper decoding on or off for every open decoder. Turning it off redraws
+    /// the current picture at full quality.
+    fn set_degraded(&mut self, on: bool) {
+        if !on {
+            self.overload = Overload::default();
+        }
+        // `overload` says what is wanted; the shared flag says what the decoders were told.
+        if self.shared.degraded.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        let height = self.output_height();
+        for (_, _, d) in &mut self.decoders {
+            d.set_fast_decode(on);
+            d.set_max_output_height(height);
+        }
+        if on {
+            tracing::info!("playback can't keep up; decoding at reduced quality until it stops");
+        } else {
+            self.exact = true;
+            self.dirty = true;
+            self.last_shown.clear();
+        }
     }
 
     /// Start or stop sound to match the transport. Sound plays only at normal
@@ -406,6 +470,9 @@ impl Worker {
                 self.last_shown.clear();
             }
             Cmd::Seek { us, exact } => {
+                if exact {
+                    self.set_degraded(false);
+                }
                 self.pos_us = us;
                 self.exact = exact;
                 self.dirty = true;
@@ -435,8 +502,9 @@ impl Worker {
             }
             Cmd::MaxHeight(h) => {
                 self.max_height = h;
+                let height = self.output_height();
                 for (_, _, d) in &mut self.decoders {
-                    d.set_max_output_height(h);
+                    d.set_max_output_height(height);
                 }
                 self.dirty = true;
                 self.last_shown.clear();
@@ -523,6 +591,9 @@ impl Worker {
             if self.playing {
                 let frame = Duration::from_micros((snap.fps.frame_duration_us().max(1) as f64 / self.speed.abs().max(1.0)) as u64);
                 let spent = started.elapsed();
+                if self.overload.record(spent, frame) {
+                    self.set_degraded(true);
+                }
                 if spent > frame {
                     self.shared.dropped.fetch_add((spent.as_micros() / frame.as_micros().max(1)) as u32, Ordering::Relaxed);
                 } else {
@@ -594,7 +665,8 @@ impl Worker {
         } else {
             match FfmpegDecoder::open(path) {
                 Ok(mut d) => {
-                    d.set_max_output_height(self.max_height);
+                    d.set_max_output_height(self.output_height());
+                    d.set_fast_decode(self.overload.degraded);
                     if self.decoders.len() >= MAX_OPEN_DECODERS {
                         self.decoders.remove(0);
                     }
@@ -726,6 +798,39 @@ mod tests {
 
     fn clip(timeline_in: i64, source_in: i64) -> Clip {
         Clip::new(Uuid::nil(), Uuid::nil(), ClipType::Video, "c", timeline_in, timeline_in + 5_000_000, source_in, source_in + 5_000_000)
+    }
+
+    const FRAME: Duration = Duration::from_millis(33);
+
+    #[test]
+    fn overload_enters_after_three_consecutive_slow_frames() {
+        let mut o = Overload::default();
+        let slow = FRAME * 2;
+        assert!(!o.record(slow, FRAME));
+        assert!(!o.record(slow, FRAME));
+        assert!(o.record(slow, FRAME));
+        // Entered once; further slow frames don't ask again.
+        assert!(!o.record(slow, FRAME));
+        assert!(o.degraded);
+    }
+
+    #[test]
+    fn one_fast_frame_resets_the_streak() {
+        let mut o = Overload::default();
+        o.record(FRAME * 2, FRAME);
+        o.record(FRAME * 2, FRAME);
+        o.record(FRAME, FRAME);
+        assert!(!o.record(FRAME * 2, FRAME));
+        assert!(!o.record(FRAME * 2, FRAME));
+        assert!(o.record(FRAME * 2, FRAME));
+    }
+
+    #[test]
+    fn slightly_slow_frames_are_tolerated() {
+        let mut o = Overload::default();
+        for _ in 0..10 {
+            assert!(!o.record(FRAME * 6 / 5, FRAME)); // 1.2x is within 1.25x
+        }
     }
 
     #[test]

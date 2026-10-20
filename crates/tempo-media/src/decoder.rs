@@ -194,6 +194,23 @@ impl FfmpegDecoder {
         }
     }
 
+    /// Cheaper, slightly softer decoding for when playback can't keep up: skips the
+    /// deblocking filter. Takes effect on the next frame. Decoders that ignore it
+    /// (OpenH264, VA-API) are simply unaffected.
+    pub fn set_fast_decode(&mut self, on: bool) {
+        // SAFETY: the context belongs to this decoder and is only used from this thread.
+        unsafe {
+            let ctx = self.decoder.as_mut_ptr();
+            (*ctx).skip_loop_filter = if on { ffi::AVDiscard::AVDISCARD_ALL } else { ffi::AVDiscard::AVDISCARD_DEFAULT };
+            if on {
+                (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST;
+            } else {
+                (*ctx).flags2 &= !(ffi::AV_CODEC_FLAG2_FAST);
+            }
+        }
+        self.last_exact = None;
+    }
+
     fn scale_frame(&mut self, decoded: &ffmpeg_next::frame::Video, pts_us: i64) -> Result<VideoFrame> {
         // A hardware frame lives in graphics memory: copy it down first.
         let mut downloaded = ffmpeg_next::frame::Video::empty();
@@ -390,6 +407,18 @@ mod tests {
         set_hardware_decode(false);
         let frame = result.expect("frame");
         assert_eq!((frame.width, frame.height), (1920, 1080));
+    }
+
+    #[test]
+    fn fast_decode_still_returns_the_requested_frame() {
+        let Some(path) = sample("sample_1080p_h264.mp4") else { return };
+        let mut d = FfmpegDecoder::open(path).expect("open");
+        d.set_fast_decode(true);
+        let fast = d.decode_video_frame(1_500_000).expect("frame");
+        assert!(fast.pts_us >= 1_500_000 && fast.pts_us < 1_600_000);
+        d.set_fast_decode(false);
+        let exact = d.decode_video_frame(2_000_000).expect("frame");
+        assert!(exact.pts_us >= 2_000_000 && exact.pts_us < 2_100_000);
     }
 
     #[test]
