@@ -11,7 +11,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tempo_audio::AudioOutput;
 use tempo_media::{AudioReader, FfmpegDecoder, VideoFrame, OUT_CHANNELS, OUT_RATE};
-use tempo_timeline::{Clip, ClipProperties, ClipType, Project, TitleData, TrackKind};
+use tempo_timeline::{frame_to_us, Clip, ClipProperties, ClipType, Project, RationalFps, TitleData, TrackKind};
 use uuid::Uuid;
 
 /// How many container files may be open for decoding at once.
@@ -37,7 +37,8 @@ pub struct Snapshot {
     /// What the sound is decoded from: always the original file.
     audio_sources: HashMap<Uuid, PathBuf>,
     pub duration_us: i64,
-    pub frame_us: i64,
+    /// The frame grid playback steps on.
+    pub fps: RationalFps,
 }
 
 impl Snapshot {
@@ -106,16 +107,16 @@ impl Snapshot {
                 .map(|t| t.duration_us())
                 .max()
                 .unwrap_or(0),
-            frame_us: project.fps.frame_duration_us().max(1),
+            fps: project.fps,
         }
     }
 
     pub fn empty() -> Self {
-        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, frame_us: 33_333 }
+        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, fps: RationalFps::default() }
     }
 
     /// A one-clip snapshot used to preview a Media Pool item.
-    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, frame_us: i64, has_video: bool, has_audio: bool) -> Self {
+    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, fps: RationalFps, has_video: bool, has_audio: bool) -> Self {
         let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
         Self {
             tracks: if has_video { vec![vec![clip(ClipType::Video)]] } else { Vec::new() },
@@ -123,7 +124,7 @@ impl Snapshot {
             audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
             duration_us,
-            frame_us: frame_us.max(1),
+            fps,
         }
     }
 }
@@ -320,14 +321,7 @@ impl Worker {
             audio_seen: (0, Instant::now()),
             rx,
             shared,
-            timeline: Arc::new(Snapshot {
-                tracks: Vec::new(),
-                audio: Vec::new(),
-                sources: HashMap::new(),
-                audio_sources: HashMap::new(),
-                duration_us: 0,
-                frame_us: 33_333,
-            }),
+            timeline: Arc::new(Snapshot::empty()),
             source: None,
             timeline_pos: 0,
             decoders: Vec::new(),
@@ -527,7 +521,7 @@ impl Worker {
             self.dirty = false;
 
             if self.playing {
-                let frame = Duration::from_micros((snap.frame_us as f64 / self.speed.abs().max(1.0)) as u64);
+                let frame = Duration::from_micros((snap.fps.frame_duration_us().max(1) as f64 / self.speed.abs().max(1.0)) as u64);
                 let spent = started.elapsed();
                 if spent > frame {
                     self.shared.dropped.fetch_add((spent.as_micros() / frame.as_micros().max(1)) as u32, Ordering::Relaxed);
@@ -553,10 +547,7 @@ impl Worker {
             .iter()
             .filter_map(|clips| clips.iter().find(|c| c.contains_point(pos)))
             .filter(|c| c.properties.enabled)
-            .map(|c| {
-                let offset = c.source_offset_at(pos);
-                (c, offset - offset % snap.frame_us)
-            })
+            .map(|c| (c, source_request_us(c, pos, snap.fps)))
             .collect();
 
         // Skip the work if this exact picture is already on screen. A title's key
@@ -716,4 +707,52 @@ fn reader_for<'a>(readers: &'a mut Vec<(Uuid, AudioReader)>, id: Uuid, path: &Pa
         }
     }
     readers.last_mut().map(|(_, r)| r)
+}
+
+/// Source time to decode for the picture shown at timeline position `pos`: the start of
+/// the project frame that holds `pos`, mapped into the clip and never before its In point.
+/// The same timeline frame always asks for the same source time, so it is decoded once.
+fn source_request_us(clip: &Clip, pos: i64, fps: RationalFps) -> i64 {
+    if fps.num == 0 || fps.den == 0 {
+        return clip.source_offset_at(pos);
+    }
+    let frame = (pos.max(0) as i128 * fps.num as i128 / (1_000_000 * fps.den as i128)) as i64;
+    clip.source_offset_at(frame_to_us(frame, fps).max(clip.timeline_in))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(timeline_in: i64, source_in: i64) -> Clip {
+        Clip::new(Uuid::nil(), Uuid::nil(), ClipType::Video, "c", timeline_in, timeline_in + 5_000_000, source_in, source_in + 5_000_000)
+    }
+
+    #[test]
+    fn first_timeline_frame_never_requests_before_source_in() {
+        // Rounding the source offset on the project grid used to ask for 33 333 here.
+        let c = clip(0, 50_000);
+        assert_eq!(source_request_us(&c, 0, RationalFps::FPS_30), 50_000);
+        assert_eq!(source_request_us(&c, 40_000, RationalFps::FPS_30), 50_000 + 33_333);
+    }
+
+    #[test]
+    fn clip_starting_between_frames_starts_at_its_in_point() {
+        let c = clip(110_000, 2_000_000);
+        for fps in [RationalFps::FPS_24, RationalFps::FPS_30, RationalFps::FPS_60] {
+            assert_eq!(source_request_us(&c, 110_000, fps), 2_000_000);
+        }
+    }
+
+    #[test]
+    fn ntsc_rates_stay_on_the_rational_grid_after_an_hour() {
+        let fps = RationalFps::FPS_29_97;
+        let c = clip(0, 0);
+        let pos = 3_600_000_000;
+        let frame = (pos as i128 * 30_000 / 1_001_000_000) as i64;
+        assert_eq!(source_request_us(&c, pos, fps), frame_to_us(frame, fps));
+        // Every position inside one frame asks for the same time.
+        let start = frame_to_us(frame, fps);
+        assert_eq!(source_request_us(&c, start + 20_000, fps), start);
+    }
 }

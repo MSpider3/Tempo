@@ -360,8 +360,9 @@ pub fn load_project(path: &Path) -> Result<Project> {
             audio_channels,
             audio_codec,
             audio_bit_rate,
+            // Readiness is a cache fact: a proxy file that is gone is rebuilt, not trusted.
+            proxy_ready: proxy_ready != 0 && proxy_path_str.as_deref().is_some_and(|p| Path::new(p).is_file()),
             proxy_path: proxy_path_str.map(PathBuf::from),
-            proxy_ready: proxy_ready != 0,
             thumbnail_data,
             imported_at,
             import_order,
@@ -1008,6 +1009,26 @@ mod tests {
         save_project(&project, file.path()).unwrap();
         rusqlite::Connection::open(file.path()).unwrap().execute_batch(sql).unwrap();
         (file, clip_id)
+    }
+
+    #[test]
+    fn missing_proxy_file_is_not_ready_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.tempo");
+        let present = dir.path().join("present.mp4");
+        std::fs::write(&present, b"x").unwrap();
+        let mut project = Project::new("Proxies", 1920, 1080, RationalFps::FPS_30);
+        for proxy in [present.clone(), dir.path().join("gone.mp4")] {
+            let mut source = MediaSource::new(PathBuf::from("/media/a.mp4"), MediaType::Video, 1_000_000);
+            source.proxy_path = Some(proxy);
+            source.proxy_ready = true;
+            project.sources.insert(source.id, source);
+        }
+        save_project(&project, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        for source in loaded.sources.values() {
+            assert_eq!(source.proxy_ready, source.proxy_path.as_deref() == Some(present.as_path()));
+        }
     }
 
     #[test]

@@ -458,6 +458,8 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
                 }
             }
             state.waveforms.borrow_mut().clear();
+            // Saved readiness must change too, or the next launch trusts files that are gone.
+            state.set_dirty(true);
             state.sync_player();
             state.emit(crate::state::Change::Media);
             state.emit(crate::state::Change::Waveform);
