@@ -16,10 +16,10 @@ Every attempt is logged below, including the ones that were reverted.
 The development laptop: Intel Core i3-1005G1 (2 cores / 4 threads, 1.2 GHz base), Intel Iris
 Plus G1 (Ice Lake) graphics, 19 GB RAM, Fedora 44, Tempo's `dev` profile (optimised + debug info).
 
-**Hardware decoding is not available on this machine as set up.** Only the old `i965` VA-API
-driver is installed, and it does not support Ice Lake. The `iHD` driver (`intel-media-driver`,
-RPM Fusion nonfree) is missing, so Tempo falls back to the processor. Rows marked "hw decode
-true" below are therefore software decoding too; they only confirm the fallback works.
+Until 2026-10-20 evening only the old `i965` VA-API driver was installed, which does not
+support Ice Lake, so the "hw decode true" rows in the baseline are really software decoding.
+The `iHD` driver (`intel-media-driver` 26.1.5) was then installed; see
+[Hardware acceleration](#hardware-acceleration--2026-10-20-iHD-driver).
 
 ## Footage
 
@@ -110,3 +110,61 @@ this short three-clip timeline. Compare runs taken back to back only.
 A/B, run back to back with the same cases: the end of Phase 1 (`03856db`) gives 58 / 79 / 44 %
 CPU for 1080p60 / 2160p30 / 1080p30 Full, and this branch gives 59 / 79 / 45 %. Phases 2–3
 did not slow playback.
+
+## Hardware acceleration — 2026-10-20, iHD driver
+
+All runs are back to back on the same build (`1c2e292` + later fixes); medians of 3.
+
+### Playback: software vs VA-API decoding (preview 540p)
+
+| case | software CPU / dropped | VA-API CPU / dropped |
+|---|---|---|
+| 1080p60 | 58 % / 0 | 46 % / 0 |
+| 2160p30 H.264 | 79 % / 0 | 51 % / 4 (1.3 %) |
+| 2160p30 HEVC | 113 % / 0 | 52 % / 15 (5.0 %) |
+| 2160p60 grain | 174 % / 39 (6.8 %) | 85 % / 356 (61.9 %) |
+
+Peak memory also falls, by 70–90 MB on the 4K cases.
+
+**Verdict:** hardware decoding halves the processor's work but drops *more* frames at 4K.
+CPU falls while drops rise, so playback is waiting rather than computing. The likely
+cause is copying every full 4K picture back from graphics memory before shrinking it on the
+processor; decode-time skipping (adaptive decode) can't help that.
+
+The setting stays off by default and marked experimental. It suits 1080p, where it saves
+CPU with no drops. The DMA-BUF zero-copy spike (P1-T7) is what would remove the copy back,
+and it can now be measured on this machine.
+
+### Proxies: 20 s 4K60 grain clip to a 540p proxy with sound
+
+| path | time | CPU | peak RSS |
+|---|---|---|---|
+| software (decode, scale and x264 on the processor) | 37.1 s | 130 % | 198 MB |
+| VA-API encode only (decode on the processor, upload full frames) | 38.8 s | 136 % | 240 MB |
+| **VA-API throughout (decode, scale_vaapi, h264_vaapi)** | **6.9 s** | **45 %** | **135 MB** |
+
+Tempo now uses the last one when the start-up check finds VA-API encoding works, and falls
+back to software when a file can't be decoded on the chip.
+
+### Export: 20 s 4K30 project to 1080p H.264
+
+| path | time | CPU | peak RSS |
+|---|---|---|---|
+| software x264 | 15.9 s | 346 % | 645 MB |
+| VA-API encode | 14.0 s | 304 % | 381 MB |
+
+Modest, because decoding the 4K source and compositing still run on the processor; memory
+falls by 40 %.
+
+### Bugs found by testing with the driver
+
+- Hardware decoding failed when asked for a time past the end of a file: the held frame
+  was a pixel copy that had lost its GPU surface. Fixed by keeping a reference
+  (`av_frame_ref`), which also removed a full frame copy per decoded frame in software
+  decoding.
+- A size-capped export with the hardware setting on failed. Fixed.
+
+| date | change | before → after | verdict |
+|---|---|---|---|
+| 2026-10-20 | Proxies decoded on the processor, encoded with VA-API | 37.1 → 38.8 s (no gain) | replaced |
+| 2026-10-20 | Proxies decoded, scaled and encoded with VA-API | 37.1 → 6.9 s, 130 → 45 % CPU | kept |

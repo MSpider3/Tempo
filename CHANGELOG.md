@@ -45,8 +45,8 @@ All notable changes to Tempo are recorded here. The format follows
   quality 52 → 45 %).
 - Proxies:
   - They are made only for footage that is on the timeline.
-  - They are encoded on the graphics chip when it can (VA-API), falling back to the
-    processor.
+  - They are made entirely on the graphics chip when it can (VA-API decode, scale and
+    encode: 5× faster on a 4K clip, at a third of the CPU), falling back to the processor.
   - They now carry the clip's sound, so playback reads one small file.
 - At start-up Tempo checks whether hardware decoding and encoding really work. If saved
   settings ask for something the machine can't do, those settings are switched off and
@@ -65,6 +65,8 @@ All notable changes to Tempo are recorded here. The format follows
 - A proxy marked ready whose file was gone was never rebuilt.
 - Playback could show a frame from before a clip's In point. The frame grid also no
   longer drifts at 29.97 and 59.94 fps.
+- With hardware decoding on, playing past the end of a file failed to show a picture.
+- An export with a size limit failed if hardware encoding was switched on.
 
 ### Removed
 
