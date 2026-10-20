@@ -524,7 +524,7 @@ impl MainWindow {
                     }
                 }
                 Ok(Err(e)) => {
-                    w.state.message(format!("Could not open the project: {e}"));
+                    w.state.message(format!("Could not open the project: {e}. Right-click it and choose Project Backups… to open an earlier copy."));
                     w.show_manager();
                 }
                 Err(_) => w.show_manager(),

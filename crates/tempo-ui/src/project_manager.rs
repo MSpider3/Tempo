@@ -102,6 +102,22 @@ fn duplicate_project(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Copy a backup next to `original` as "<name> (backup <time>)" and return the copy's
+/// path and project name. The original file is never touched, even if it is damaged. Blocking.
+fn restore_backup(backup: &Path, taken: &str, original: &Path) -> Result<(PathBuf, String), String> {
+    let stem = original.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Project".into());
+    let dir = original.parent().unwrap_or(Path::new("."));
+    let copy = dir.join(format!("{stem} (backup {taken}).tempo"));
+    if copy.exists() {
+        return Err(format!("{} already exists", copy.display()));
+    }
+    std::fs::copy(backup, &copy).map_err(|e| e.to_string())?;
+    let mut project = tempo_project::load_project(&copy).map_err(|e| e.to_string())?;
+    project.name = format!("{} (backup {taken})", project.name);
+    tempo_project::save_project(&project, &copy).map_err(|e| e.to_string())?;
+    Ok((copy, project.name))
+}
+
 fn relative_time(time: Option<std::time::SystemTime>) -> String {
     let Some(secs) = time.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()) else { return String::new() };
     match secs {
@@ -278,6 +294,9 @@ impl ProjectManager {
                 }),
             );
 
+            let (pm, e, cb) = (p.clone(), entry.clone(), open_cb.clone());
+            item("Project Backups…", Box::new(move || pm.show_backups(&e, cb.clone())));
+
             // The file goes to the system trash, so this can be undone from the file manager.
             let (pm, path) = (p.clone(), entry.path.clone());
             item(
@@ -335,6 +354,86 @@ impl ProjectManager {
         let dialog = adw::AlertDialog::builder().heading("Project Manager").body(text).build();
         dialog.add_responses(&[("ok", "OK")]);
         dialog.present(Some(&self.root));
+    }
+
+    /// List a project's rolling backups, newest first, to open as a copy or delete.
+    fn show_backups(self: &Rc<Self>, entry: &Entry, on_open: impl Fn(PathBuf) + Clone + 'static) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        let pm = self.clone();
+        let entry = entry.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let path = entry.path.clone();
+            let found = gio::spawn_blocking(move || -> Result<Vec<(PathBuf, String, u64)>, String> {
+                let id = tempo_project::read_project_id(&path).map_err(|e| e.to_string())?;
+                let backups = tempo_project::list_backups(&backup_dir(id)).map_err(|e| e.to_string())?;
+                Ok(backups
+                    .into_iter()
+                    .map(|b| {
+                        let size = std::fs::metadata(&b.path).map(|m| m.len()).unwrap_or(0);
+                        (b.path, b.taken.format("%Y-%m-%d %H.%M").to_string(), size)
+                    })
+                    .collect())
+            })
+            .await
+            .unwrap_or_else(|_| Err("reading the backups stopped unexpectedly".into()));
+            let backups = match found {
+                Ok(b) => b,
+                Err(e) => return pm.report(&format!("Could not read the backups of \"{}\": {e}", entry.name)),
+            };
+            let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+            let dialog = adw::AlertDialog::builder()
+                .heading(format!("Backups of \"{}\"", entry.name))
+                .body(if backups.is_empty() {
+                    "There are no backups yet. One is kept every 10 minutes while you edit."
+                } else {
+                    "Opening a backup makes a new project next to the original. The original is not changed."
+                })
+                .extra_child(&gtk::ScrolledWindow::builder().child(&list).min_content_height(if backups.is_empty() { 0 } else { 260 }).build())
+                .build();
+            dialog.add_responses(&[("close", "Close")]);
+            for (file, taken, size) in backups {
+                let row = adw::ActionRow::builder().title(&taken).subtitle(format!("{:.1} MB", size as f64 / 1_048_576.0)).build();
+                let open = gtk::Button::builder().label("Open as Copy").valign(gtk::Align::Center).build();
+                let delete = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Delete this backup").valign(gtk::Align::Center).css_classes(["flat"]).build();
+                row.add_suffix(&open);
+                row.add_suffix(&delete);
+                list.append(&row);
+
+                let (pm2, d, cb, original, file2, taken2) = (pm.clone(), dialog.clone(), on_open.clone(), entry.path.clone(), file.clone(), taken.clone());
+                open.connect_clicked(move |_| {
+                    let (pm, d, cb, original, file, taken) = (pm2.clone(), d.clone(), cb.clone(), original.clone(), file2.clone(), taken2.clone());
+                    glib::MainContext::default().spawn_local(async move {
+                        let restored = gio::spawn_blocking(move || {
+                            let (copy, name) = restore_backup(&file, &taken, &original)?;
+                            remember(&name, &copy);
+                            Ok::<_, String>(copy)
+                        });
+                        match restored.await {
+                            Ok(Ok(copy)) => {
+                                d.close();
+                                pm.reload();
+                                cb(copy);
+                            }
+                            Ok(Err(e)) => pm.report(&format!("Could not open the backup: {e}")),
+                            Err(_) => pm.report("Opening the backup stopped unexpectedly."),
+                        }
+                    });
+                });
+                let (pm2, list2, row2) = (pm.clone(), list.clone(), row.clone());
+                delete.connect_clicked(move |_| {
+                    let (pm, list, row, file) = (pm2.clone(), list2.clone(), row2.clone(), file.clone());
+                    glib::MainContext::default().spawn_local(async move {
+                        match gio::spawn_blocking(move || std::fs::remove_file(&file)).await {
+                            Ok(Ok(())) => list.remove(&row),
+                            Ok(Err(e)) => pm.report(&format!("Could not delete the backup: {e}")),
+                            Err(_) => {}
+                        }
+                    });
+                });
+            }
+            dialog.present(Some(&pm.root));
+        });
     }
 
     fn ask_rename(self: &Rc<Self>, parent: &gtk::Widget, entry: &Entry) {
@@ -455,6 +554,28 @@ mod tests {
         tempo_project::save_project(&dup, &copy).expect("save copy");
         assert_eq!(tempo_project::load_project(&copy).expect("load").name, "Two copy");
         assert_eq!(tempo_project::load_project(&path).expect("load").name, "Two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restoring_a_backup_never_touches_the_original() {
+        let dir = std::env::temp_dir().join(format!("tempo-backup-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let original = dir.join("Film.tempo");
+        tempo_project::create_new_project("Film", 1920, 1080, RationalFps::FPS_30, &original).expect("create");
+        let backup = dir.join("20261020-100000.tempo");
+        std::fs::copy(&original, &backup).expect("copy");
+        // Damage the original: the restore must still work and leave it as it is.
+        std::fs::write(&original, b"not a database").expect("damage");
+        let before = std::fs::read(&original).expect("read");
+
+        let (copy, name) = super::restore_backup(&backup, "2026-10-20 10.00", &original).expect("restore");
+        assert_eq!(copy, dir.join("Film (backup 2026-10-20 10.00).tempo"));
+        assert_eq!(name, "Film (backup 2026-10-20 10.00)");
+        assert_eq!(tempo_project::load_project(&copy).expect("load").name, name);
+        assert_eq!(std::fs::read(&original).expect("read"), before);
+        // A second restore of the same backup does not overwrite the first copy.
+        assert!(super::restore_backup(&backup, "2026-10-20 10.00", &original).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

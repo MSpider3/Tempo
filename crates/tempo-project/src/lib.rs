@@ -13,4 +13,4 @@ pub use project::{
     autosave_path, auto_save_project, check_autosave_recovery, remove_autosave,
 };
 pub use migration::{CURRENT_SCHEMA_VERSION, apply_migrations};
-pub use backup::{backup_now, list_backups, to_prune, verify_backup, write_backup, BackupEntry, BackupPolicy};
+pub use backup::{backup_now, list_backups, read_project_id, to_prune, verify_backup, write_backup, BackupEntry, BackupPolicy};

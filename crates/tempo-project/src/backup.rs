@@ -58,6 +58,14 @@ pub fn write_backup(project: &Project, dir: &Path, now: DateTime<Local>, policy:
     Ok(target)
 }
 
+/// The project id stored in a file, read without loading the rest, so it works on a
+/// project whose clips can no longer be read.
+pub fn read_project_id(path: &Path) -> Result<uuid::Uuid> {
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let id: String = conn.query_row("SELECT id FROM project_meta LIMIT 1", [], |r| r.get(0))?;
+    Ok(uuid::Uuid::parse_str(&id)?)
+}
+
 /// `write_backup` now, with Resolve's default policy.
 pub fn backup_now(project: &Project, dir: &Path) -> Result<PathBuf> {
     write_backup(project, dir, Local::now(), &BackupPolicy::default())
