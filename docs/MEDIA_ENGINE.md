@@ -1,24 +1,38 @@
 # Media Engine — Tempo 2
 
-> **Status (2026-10-03): design problems known, not yet rewritten.** The goals in §1 still
-> stand. These parts need to change before they are implemented as written:
+> **Status (2026-10-21): partly out of date.** The goals in §1 still stand. Much of the rest
+> describes the 1.0 design, which the code does not follow. Measured numbers are in
+> `PERF.md`.
 >
-> - **§4.2 cache size**: 512 MB holds about 61 RGBA 1080p frames, not 170. Keep frames in
->   YUV (about 170 frames) and convert in the shader.
-> - **§3.2 seeking**: frames decoded on the way to the target are thrown away. While
->   scrubbing, show keyframes; decode the exact frame when the pointer pauses.
-> - **§3.1 one decoder per source**: two clips from the same file, or source and timeline
->   viewer together, will seek back and forth. Use a small pool of decoders, capped in number.
->   Audio and video need separate demuxers.
-> - **§8.2 proxies**: same resolution as the source is not a proxy. Use 540p or 720p with a
->   short keyframe interval. Start one only when playback really drops frames, and pause
->   proxy encoding during playback.
+> What the code does now (read this before the sections below):
+>
+> - **Playback** runs on one worker thread (`crates/tempo-ui/src/player.rs`). There is no
+>   wgpu compositor and no frame cache (§3.3, §4). Each decoded layer is handed to GTK as
+>   a `gdk::MemoryTexture` and GTK draws it.
+> - **Decoders (§3.1)**: the worker keeps up to 3 open `FfmpegDecoder`s, least recently used
+>   closed first. Sound has its own `AudioReader`s (up to 4), each with its own demuxer.
+> - **Seeking (§3.2)**: a forward jump under 2 s (`SEEK_THRESHOLD_US`) is decoded through;
+>   anything else seeks. While the playhead is dragged, the nearest keyframe is shown
+>   (`decode_keyframe`); the exact frame is decoded when it stops. Frames passed on the way
+>   to the target are held with `av_frame_ref`, not copied.
+> - **Frame sharing**: `VideoFrame.data` is an `Arc<Vec<u8>>`. The repeat of the last exact
+>   frame and the texture handed to GTK share the same pixels.
+> - **Adaptive decode**: when playback can't keep up, decoding gets cheaper until playback
+>   stops or seeks (§3.5).
+> - **Hardware decoding (§5)** is off by default. It halves CPU but drops more frames at 4K,
+>   because every full picture is copied back from graphics memory (§5.4).
+> - **Proxies (§8)** are 540p H.264 with sound, made only for heavy footage on the timeline,
+>   on the graphics chip when it can.
+> - **Sound (§9)** is mixed by a feeder thread into a lock-free queue of 2 s; the PipeWire
+>   callback only takes samples from it.
+> - **Waveforms (§6.2)** are cached on disk under `~/.cache/tempo/waveforms/`.
+>
+> Still open:
 > - **§5.4 display path**: hand hardware-decoded frames to GTK as dmabuf textures instead of
->   downloading them to CPU memory.
-> - **§7 thumbnails and §6.2 waveforms**: cache both on disk under `~/.cache/tempo/`, not in
->   the project file and not in the frame cache.
+>   downloading them to CPU memory. Tried as a spike (`PERF.md`, P1-T7); not implemented.
+> - **§7 thumbnails**: the Media Pool thumbnail is stored in the project file, not under
+>   `~/.cache/tempo/`.
 > - **Variable-frame-rate sources** are not covered and must be.
-> - **§9.1 ring buffer** of 4096 samples is about 85 ms; use about half a second.
 
 **Version:** 1.0  
 **Crate:** `tempo-media`  
@@ -39,7 +53,7 @@ not do this. Tempo 2 follows DaVinci Resolve's model:
 
 1. **Import = probe only.** Open the container, read the stream index, close. Done in < 100ms.
 2. **Decode on demand.** Frames are decoded only when the render thread requests them.
-3. **Proxy is optional and background.** If a clip is too slow to decode in real time, a proxy
+3. **Proxy is optional and background.** If a clip on the timeline is heavy footage, a proxy
    is generated in the background. Editing continues immediately using original frames at lower
    quality, then silently switches to proxy when ready.
 4. **Export always uses originals.** Proxy files are never used for export.
@@ -193,6 +207,32 @@ Pre-fetch is cancelled immediately when:
 - A seek occurs
 - The source clip ends
 
+The code has no pre-fetch. The playback worker decodes the frame under the playhead, then
+sleeps until the next frame is due.
+
+### 3.5 Adaptive Decode
+
+While playing, the worker times each frame (`Overload` in `player.rs`). When 3 of the last 6
+frames took more than 1.25 times their frame time, it switches every open decoder to
+cheaper decoding:
+
+- `FfmpegDecoder::set_fast_decode(true)`: skip the deblocking filter (`skip_loop_filter`)
+  and set FFmpeg's fast flag. VA-API and OpenH264 ignore this.
+- Decode height halved (never below 270; 540 when the preview is Full).
+
+"3 of the last 6", not "3 in a row": with 30 fps footage in a 60 fps project every other
+frame only repeats a picture and is cheap. Playback returns to full quality on play, stop,
+or an exact seek. On the 4K60 stress clip this cut dropped frames from 83 % to under 10 %
+(`PERF.md`).
+
+### 3.6 Which Source Frame Is Shown
+
+`source_request_us` in `player.rs` picks the source time for a timeline position: the start
+of the project frame that holds the position, on the project's rational frame grid (so
+29.97 and 59.94 fps don't drift), mapped into the clip at its speed with
+`Clip::source_offset_at`, and never before the clip's In point. The same timeline frame
+always asks for the same source time, so it is decoded once.
+
 ---
 
 ## 4. Frame Cache
@@ -281,8 +321,31 @@ VAAPI (Video Acceleration API) is the Linux standard for GPU-accelerated video d
 Intel iGPUs (supported from Ivy Bridge, 2012+) support H.264 decode. Broadwell+ supports HEVC.
 AMD and newer Intel support AV1.
 
-Enabling VAAPI reduces CPU usage for H.264 decode from ~30-60% to ~5-10% on a Core i3.
-This is the primary reason 4K H.264 footage can play on low-end hardware.
+Measured on the reference machine (Core i3-1005G1, Ice Lake, `iHD` driver; `PERF.md`),
+hardware decoding roughly halves the processor's work but drops *more* frames at 4K:
+
+| case (540p preview) | software CPU / dropped | VA-API CPU / dropped |
+|---|---|---|
+| 1080p60 | 58 % / 0 | 46 % / 0 |
+| 2160p30 H.264 | 79 % / 0 | 51 % / 4 (1.3 %) |
+| 2160p60 grain | 174 % / 39 (6.8 %) | 85 % / 356 (61.9 %) |
+
+The likely cause is copying every full 4K picture back from graphics memory before it is
+shrunk on the processor (§5.4). So the **Hardware decoding** setting is off by default and
+marked experimental; it suits 1080p.
+
+### 5.1a What the Code Does
+
+- `tempo_media::set_hardware_decode(on)` sets the app-wide switch for decoders opened from
+  then on. `FfmpegDecoder::open_with(path, hardware)` chooses per decoder (tests use it).
+- The VA-API device is opened once with `av_hwdevice_ctx_create` on the default device and
+  shared by every decoder. `hardware_decode_available()` says whether it opened.
+- If the switch is on but the device can't be used, decoding stays on the processor.
+- **Start-up check** (`window.rs`): on a worker, Tempo calls `hardware_decode_available()`
+  and `tempo_export::ffmpeg::vaapi_h264_available()`, which encodes one tiny frame with
+  `h264_vaapi` (a listed encoder may lack its driver). A saved hardware setting the machine
+  can't honour is switched off and saved, and the user is told once. Preferences shows those
+  switches greyed out.
 
 ### 5.2 VAAPI Initialization
 
@@ -353,7 +416,12 @@ VAAPI frames are stored in GPU memory. To use in wgpu compositor, either:
 1. **DRM export** (zero-copy): Export VAAPI surface as DRM PRIME fd → import into wgpu as
    external texture. Complex but zero-copy. Implement in Phase 2.
 2. **CPU download** (simple): `av_hwframe_transfer_data()` → CPU buffer → upload to wgpu.
-   Simpler, used in Phase 1. Still much faster than software decode.
+   Simpler, used in Phase 1.
+
+The code does the CPU download: `scale_frame` copies a VA-API frame down with
+`av_hwframe_transfer_data`, then `swscale` converts it to RGBA at the preview size. At 4K
+this copy is why hardware decoding drops frames (§5.1). The zero-copy path (dmabuf
+textures in GTK) was tried as a spike and is not implemented (`PERF.md`, P1-T7).
 
 ### 5.5 Codec Hardware Support Table
 
@@ -455,6 +523,31 @@ Generated after import completes, on Decode Thread Pool at low priority.
 
 ## 8. Proxy Generation
 
+> **What the code does now** (`crates/tempo-proxy/src/lib.rs`, `crates/tempo-ui/src/proxies.rs`).
+> §8.1–8.4 below are the 1.0 design.
+>
+> - **Which footage**: a source gets a proxy when it is on the timeline, has no ready proxy,
+>   and `needs_proxy` says it is heavy: video taller than 720 px, or a codec other than
+>   H.264, MPEG-4, MPEG-2 or MJPEG. Footage only in the Media Pool is never transcoded.
+>   There is no decode-speed test. One proxy is made at a time, first imported first.
+>   Proxies can be switched off in Preferences.
+> - **Format**: 540p H.264, a keyframe every 15 frames, no B-frames, with the first sound
+>   track as AAC 128 kb/s stereo 48 kHz. Written to `{proxy_dir}/{source_id}.mp4` through a
+>   `.part.mp4` file that is renamed at the end, so a crash never leaves a file that looks
+>   finished. A proxy left by an earlier session is reused.
+> - **Graphics chip**: when `vaapi_h264_available()` passes, the whole proxy is made on the
+>   chip (`-hwaccel vaapi`, `scale_vaapi`, `h264_vaapi`). If that fails, for example on
+>   footage the chip can't decode, it is made again on the processor (`libx264` or
+>   OpenH264). On a 20 s 4K60 clip: 37.1 s → 6.9 s, 130 % → 45 % CPU (`PERF.md`).
+> - **Staying out of the way**: the `ffmpeg` program runs at the lowest priority (nice 19) on
+>   one thread each for decoding, scaling and encoding. While the timeline plays or an export
+>   runs it is stopped (`SIGSTOP`) and continued afterwards.
+> - **Readiness**: on load, a source's proxy counts as ready only if its file still exists;
+>   a missing proxy is made again. Playback uses the proxy unless the preview quality is
+>   Full, which reads the originals.
+> - **Sound**: the audio feeder reads sound from the proxy when it has a sound track, and
+>   from the original otherwise (§9).
+
 ### 8.1 When to Generate Proxy
 
 The proxy engine measures decode throughput on first clip play:
@@ -535,6 +628,28 @@ When `AppMessage::ProxyComplete` is received by the UI thread:
 ---
 
 ## 9. Audio Decode and Mix
+
+> **What the code does now** (`feed_audio` in `crates/tempo-ui/src/player.rs`,
+> `AudioOutput` in `crates/tempo-audio/src/lib.rs`). §9.1–9.2 below are the 1.0 design.
+>
+> - A feeder thread (`tempo-audio-feed`) mixes 10 ms blocks and keeps about 200 ms queued
+>   ahead of the speaker. Everything is 48 kHz stereo `f32`.
+> - `AudioOutput` holds a lock-free queue (`crossbeam::queue::ArrayQueue`) with room for
+>   2 s. The PipeWire callback only pops samples and updates atomics: it never allocates,
+>   locks or blocks. Its count of frames played is the playback clock (§9.3).
+> - **Which file**: `reader_for` opens the proxy when it has a sound track, and the
+>   original otherwise. Each `AudioReader` has its own demuxer; up to 4 stay open.
+> - **Retimed clips**: for a clip whose speed is not 1.0, `source_frames` works out how much
+>   source one block covers, so consecutive blocks join up exactly and the reader never
+>   seeks back. `stretch` then resamples that block into 10 ms by straight-line
+>   interpolation, so the pitch moves with the speed, as in Resolve on Linux. The block
+>   buffer is sized once for the fastest speed (4×).
+> - **Mix**: per clip, volume × track volume × fade, then pan; sum; clamp to [-1, 1].
+> - **Solo**: when any audio track is soloed, only soloed tracks are heard
+>   (`audible_tracks`). A track that is turned off stays silent even when soloed. Solo
+>   affects playback only; export ignores it.
+> - Sound plays only at normal speed; shuttling and reverse are silent and run on the wall
+>   clock.
 
 ### 9.1 Audio Decode Thread
 

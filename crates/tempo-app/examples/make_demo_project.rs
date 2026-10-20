@@ -14,7 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `TEMPO_DEMO_VERTICAL=1` makes a 9:16 project, to check the vertical layout.
     let (w, h) = if std::env::var_os("TEMPO_DEMO_VERTICAL").is_some() { (1080, 1920) } else { (1920, 1080) };
-    let mut project = Project::new("Demo Project", w, h, RationalFps::FPS_30);
+    // `TEMPO_DEMO_FPS=60` makes a 60 fps project, for the playback benchmark.
+    let fps = if std::env::var("TEMPO_DEMO_FPS").as_deref() == Ok("60") { RationalFps::FPS_60 } else { RationalFps::FPS_30 };
+    let mut project = Project::new("Demo Project", w, h, fps);
     let track = |p: &Project, kind: TrackKind, index: u32| {
         p.timeline.tracks.iter().find(|t| t.kind == kind && t.kind_index == index).map(|t| t.id)
     };
@@ -54,6 +56,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A short overlay on V2.
             let clip = Clip::new(v2, source.id, ClipType::Video, "overlay", at + 500_000, at + 2_000_000, 0, 1_500_000);
             project.timeline.find_track_mut(v2).ok_or("track")?.clips.push(clip);
+        }
+        // `TEMPO_DEMO_PROXY=audio` gives each file a ready proxy made by Tempo's own code
+        // (kept beside the file); `=silent` uses a copy of it without sound. For benchmarks.
+        if let Ok(kind) = std::env::var("TEMPO_DEMO_PROXY") {
+            let with_sound = path.with_extension("proxy.mp4");
+            if !with_sound.exists() {
+                tempo_proxy::ProxyEngine::generate_proxy_sync(path, &with_sound)?;
+            }
+            let proxy = if kind == "silent" { path.with_extension("proxy-silent.mp4") } else { with_sound.clone() };
+            if !proxy.exists() {
+                let status = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&with_sound).args(["-an", "-c", "copy"]).arg(&proxy).status()?;
+                if !status.success() {
+                    return Err("could not make the silent proxy".into());
+                }
+            }
+            source.proxy_path = Some(proxy);
+            source.proxy_ready = true;
         }
         project.sources.insert(source.id, source);
         at += len;

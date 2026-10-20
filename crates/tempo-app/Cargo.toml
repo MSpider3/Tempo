@@ -27,6 +27,7 @@ uuid = { workspace = true }
 tempo-timeline = { path = "../tempo-timeline" }
 tempo-media = { path = "../tempo-media" }
 tempo-project = { path = "../tempo-project" }
+tempo-proxy = { path = "../tempo-proxy" }
 
 # ---- Packaging (see .github/workflows/release.yml) ---------------------------
 

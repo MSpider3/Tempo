@@ -41,6 +41,20 @@ pub struct TimelineExport {
     /// Try the graphics chip's H.264 encoder (VA-API) first. If it cannot be
     /// used, the export is done again with the software encoder.
     pub hardware: bool,
+    /// Cap the picture at this many kb/s instead of using `crf`, to make a file fit a
+    /// size limit (see `bitrate_for_size`). Always encoded on the processor.
+    pub max_video_kbps: Option<u32>,
+}
+
+/// The picture bitrate that keeps `duration_us` of video plus `audio_kbps` of sound
+/// under `target_bytes`, leaving 5 % for the container and the encoder's overshoot.
+/// `None` when that would be under 200 kb/s, too little to watch.
+pub fn bitrate_for_size(target_bytes: u64, duration_us: i64, audio_kbps: u32) -> Option<u32> {
+    if duration_us <= 0 {
+        return None;
+    }
+    let total_kbps = (target_bytes as f64 * 8.0 * 0.95 / 1000.0 / (duration_us as f64 / 1e6)).floor() as i64;
+    u32::try_from(total_kbps - audio_kbps as i64).ok().filter(|kbps| *kbps >= 200)
 }
 
 fn secs(us: i64) -> String {
@@ -70,7 +84,7 @@ fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Pi
         .filter(|c| c.properties.enabled && kinds.contains(&c.clip_type) && c.timeline_out > r0 && c.timeline_in < r1)
         .map(|c| {
             let start = c.timeline_in.max(r0);
-            Piece { clip: c, start: start - r0, end: c.timeline_out.min(r1) - r0, source_in: c.source_in + (start - c.timeline_in) }
+            Piece { clip: c, start: start - r0, end: c.timeline_out.min(r1) - r0, source_in: c.source_offset_at(start) }
         })
         .collect();
     out.sort_by_key(|p| p.start);
@@ -194,6 +208,8 @@ fn build_args(
     metadata_file: Option<&PathBuf>,
     section: Option<bool>,
 ) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
+    // A size limit always uses the processor's encoder, which keeps to a bitrate.
+    let hardware = e.hardware && e.max_video_kbps.is_none();
     let mut text_files: Vec<(PathBuf, String)> = Vec::new();
     let sx = ((e.width.max(16) + 1) & !1) as f32 / project.width.max(1) as f32;
     let sy = ((e.height.max(16) + 1) & !1) as f32 / project.height.max(1) as f32;
@@ -275,7 +291,7 @@ fn build_args(
                 inputs.extend(["-loop".into(), "1".into(), "-t".into(), secs(len)]);
             } else {
                 // One frame more than needed, so rounding never leaves the clip short.
-                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len + frame_time(1, project))]);
+                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len + frame_time(1, project)))]);
             }
             inputs.extend(["-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
@@ -289,10 +305,13 @@ fn build_args(
             let label = format!("vc{ti}_{}", segs.len());
             // Blur radii are in pixels of a 1080-line picture.
             let effects = effect_filters(props, h as f32 / 1080.0);
+            // A retimed clip's pictures are spread out (or packed together) before the
+            // frame rate is set, so slow motion repeats frames and fast motion skips them.
+            let retime = if props.speed != 1.0 { format!("setpts=(PTS-STARTPTS)/{:.6},", props.speed) } else { String::new() };
             // If the file ends early its last picture is held, so the clip always
             // gives exactly the frames the timeline has for it.
             let head = format!(
-                "[{idx}:v]fps={fps},tpad=stop_mode=clone:stop_duration=2,{fit},setsar=1,format=rgba{effects},trim=end_frame={frames},setpts=PTS-STARTPTS"
+                "[{idx}:v]{retime}fps={fps},tpad=stop_mode=clone:stop_duration=2,{fit},setsar=1,format=rgba{effects},trim=end_frame={frames},setpts=PTS-STARTPTS"
             );
             if is_default_transform(props) {
                 graph.push(format!("{head},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0.0{fades}[{label}]"));
@@ -341,7 +360,7 @@ fn build_args(
         graph.push(format!("[{base}][{label}]overlay=eof_action=pass:format=auto[{next}]"));
         base = next;
     }
-    if e.hardware {
+    if hardware {
         graph.push(format!("[{base}]format=nv12,hwupload[vout]"));
     } else {
         graph.push(format!("[{base}]format=yuv420p[vout]"));
@@ -381,15 +400,18 @@ fn build_args(
             }
             let len = p.end - p.start;
             let (path, _) = source_path(p.clip)?;
-            inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(len), "-i".into(), path.to_string_lossy().into_owned()]);
+            inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len)), "-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
             n_inputs += 1;
             let props = &p.clip.properties;
+            // Sound plays faster or slower with the picture, and its pitch moves with it,
+            // as in Resolve on Linux and Windows and as Tempo's preview plays it.
+            let retime = if props.speed != 1.0 { format!("asetrate={},aresample=48000,", (48_000.0 * props.speed).round() as u32) } else { String::new() };
             let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track_volume.max(0.0) };
             let (left, right) = (1.0 - props.pan.max(0.0), 1.0 + props.pan.min(0.0));
             let label = format!("ac{ti}_{}", segs.len());
             graph.push(format!(
-                "[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
+                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
                  volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}[{label}]",
                 secs(len),
                 fade_filters(p, r0, true)
@@ -417,8 +439,8 @@ fn build_args(
 
     // ---- Command line.
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-nostats".into(), "-progress".into(), "pipe:1".into()];
-    if e.hardware {
-        args.extend(["-vaapi_device".into(), "/dev/dri/renderD128".into()]);
+    if hardware {
+        args.extend(["-vaapi_device".into(), crate::ffmpeg::VAAPI_DEVICE.into()]);
     }
     args.extend(inputs);
     if let Some(meta) = metadata_file {
@@ -431,11 +453,11 @@ fn build_args(
     } else if has_audio {
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
     }
-    if e.hardware {
+    match (e.max_video_kbps, hardware) {
+        (Some(kbps), _) => args.extend(crate::ffmpeg::h264_capped_args(kbps)),
         // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
-        args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]);
-    } else {
-        args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false));
+        (None, true) => args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]),
+        (None, false) => args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false)),
     }
     if section.is_some() {
         args.extend(["-f".into(), "matroska".into()]);
@@ -507,7 +529,7 @@ fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
 /// and removes the partial file. Blocking: call from a worker thread.
 pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<()> {
-    if e.hardware {
+    if e.hardware && e.max_video_kbps.is_none() {
         match run_ffmpeg(project, e, cancel, &mut progress) {
             Ok(()) => return Ok(()),
             Err(_) if cancel.load(Ordering::Relaxed) => return Err(ExportError::Ffmpeg("Cancelled".into())),
@@ -706,7 +728,54 @@ mod tests {
     }
 
     fn settings(output: PathBuf) -> TimelineExport {
-        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false }
+        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false, max_video_kbps: None }
+    }
+
+    #[test]
+    fn bitrate_fits_the_size_with_headroom() {
+        // 10 MB over 60 s: 1266 kb/s in all, less 96 for sound.
+        assert_eq!(bitrate_for_size(10_000_000, 60_000_000, 96), Some(1170));
+        assert_eq!(bitrate_for_size(10_000_000, 10_000_000, 96), Some(7504));
+        // Too long to look like anything at 10 MB.
+        assert_eq!(bitrate_for_size(10_000_000, 300_000_000, 96), None);
+        assert_eq!(bitrate_for_size(10_000_000, 0, 96), None);
+    }
+
+    #[test]
+    fn size_capped_export_stays_under_ten_megabytes() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        // Moving grain is the hardest thing to squeeze; a test pattern would pass too easily.
+        let dir = std::env::temp_dir().join(format!("tempo-discord-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("grain.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=40", "-f", "lavfi", "-i", "sine=duration=40"])
+            .args(["-vf", "noise=alls=20:allf=t", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-c:a", "aac", "-shortest"])
+            .arg(&input)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no x264 here
+        }
+        let mut project = Project::new("t", 1280, 720, RationalFps::FPS_30);
+        let mut source = MediaSource::new(input, MediaType::Video, 40_000_000);
+        source.audio_channels = Some(1);
+        let v = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).unwrap();
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        for (track, kind) in [(v, ClipType::Video), (a, ClipType::Audio)] {
+            project.timeline.find_track_mut(track).unwrap().clips.push(Clip::new(track, source.id, kind, "c", 0, 40_000_000, 0, 40_000_000));
+        }
+        project.sources.insert(source.id, source);
+        let output = dir.join("discord.mp4");
+        let kbps = bitrate_for_size(10_000_000, 40_000_000, 96).unwrap();
+        let e = TimelineExport { width: 1280, height: 720, max_video_kbps: Some(kbps), ..settings(output.clone()) };
+        export_timeline(&project, &e, &AtomicBool::new(false), |_| {}).expect("export");
+        let size = std::fs::metadata(&output).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(size <= 10_000_000, "{size} bytes");
+        assert!(size >= 6_000_000, "{size} bytes: the cap, not the quality setting, should decide the size");
     }
 
     #[test]
@@ -757,6 +826,71 @@ mod tests {
         assert!(text.contains("title=Next"), "chapters are embedded: {text}");
         let duration: f64 = text.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse().ok()).unwrap_or(0.0);
         assert!((duration - 3.0).abs() < 0.2, "duration was {duration}");
+    }
+
+    /// Where the loudest sound is in a file, in seconds (mono, 48 kHz).
+    fn loudest_at(path: &std::path::Path) -> f64 {
+        let pcm = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(path).args(["-f", "s16le", "-ac", "1", "-ar", "48000", "-"]).output().unwrap().stdout;
+        let samples: Vec<i16> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let at = samples.iter().enumerate().max_by_key(|(_, s)| s.unsigned_abs()).map(|(i, _)| i).unwrap_or(0);
+        at as f64 / 48_000.0
+    }
+
+    #[test]
+    fn retimed_clip_exports_at_its_speed() {
+        let click = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-media/sample_click.mp4");
+        if !click.exists() || Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        // 3 s of source with a click at 1 s, at double speed: 1.5 s, click at 0.5 s.
+        let mut project = Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        let mut source = MediaSource::new(click, MediaType::Video, 3_000_000);
+        source.audio_channels = Some(2);
+        for kind in [TrackKind::Video, TrackKind::Audio] {
+            let track = project.timeline.tracks.iter().find(|t| t.kind == kind).map(|t| t.id).unwrap();
+            let clip_type = if kind == TrackKind::Video { ClipType::Video } else { ClipType::Audio };
+            let mut clip = Clip::new(track, source.id, clip_type, "c", 0, 1_500_000, 0, 3_000_000);
+            clip.properties.speed = 2.0;
+            project.timeline.find_track_mut(track).unwrap().clips.push(clip);
+        }
+        project.sources.insert(source.id, source);
+        let out = std::env::temp_dir().join(format!("tempo-speed-{}.mp4", std::process::id()));
+        export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+        let probe = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(&out).output().unwrap();
+        let duration: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
+        let click_at = loudest_at(&out);
+        let _ = std::fs::remove_file(&out);
+        assert!((duration - 1.5).abs() < 0.1, "duration was {duration}");
+        assert!((click_at - 0.5).abs() < 0.02, "click at {click_at} s");
+    }
+
+    #[test]
+    fn hardware_export_runs_on_the_graphics_chip() {
+        let Some(path) = sample() else { return };
+        if !crate::ffmpeg::vaapi_h264_available() {
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("tempo-hw-export-{}.mp4", std::process::id()));
+        let e = TimelineExport { hardware: true, ..settings(out.clone()) };
+        // run_ffmpeg, not export_timeline: no quiet fallback to the processor here.
+        let result = run_ffmpeg(&project_with_clip(path), &e, &AtomicBool::new(false), &mut |_| {});
+        let exists = out.exists();
+        let _ = std::fs::remove_file(&out);
+        result.expect("hardware export");
+        assert!(exists);
+    }
+
+    #[test]
+    fn size_cap_wins_over_the_hardware_setting() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let out = std::env::temp_dir().join(format!("tempo-capped-hw-{}.mp4", std::process::id()));
+        let e = TimelineExport { hardware: true, max_video_kbps: Some(2_000), ..settings(out.clone()) };
+        let result = run_ffmpeg(&project_with_clip(path), &e, &AtomicBool::new(false), &mut |_| {});
+        let _ = std::fs::remove_file(&out);
+        result.expect("a size-capped export uses the processor's encoder, whatever the hardware setting");
     }
 
     #[test]

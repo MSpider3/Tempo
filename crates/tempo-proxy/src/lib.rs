@@ -29,10 +29,11 @@ pub fn needs_proxy(source: &MediaSource) -> bool {
     height > LIGHT_HEIGHT || !light_codec
 }
 
-/// Make a proxy of `input` at `output`. Blocking: call from a worker thread.
-/// `progress` receives 0.0–1.0. Setting `cancel` stops the work; an unfinished
-/// file is never left at `output`. While `hold` is set the work stands still
-/// and uses no processor time.
+/// Make a proxy of `input` at `output`, with its first sound track. Blocking: call from
+/// a worker thread. `progress` receives 0.0–1.0. Setting `cancel` stops the work; an
+/// unfinished file is never left at `output`. While `hold` is set the work stands still
+/// and uses no processor time. The graphics chip encodes when it can (VA-API), and the
+/// processor does it otherwise.
 pub fn generate_proxy(
     input: &Path,
     output: &Path,
@@ -41,29 +42,80 @@ pub fn generate_proxy(
     hold: &AtomicBool,
     mut progress: impl FnMut(f32),
 ) -> Result<(), String> {
+    let device = tempo_export::ffmpeg::vaapi_h264_available().then_some(tempo_export::ffmpeg::VAAPI_DEVICE);
+    make_proxy(input, output, duration_us, cancel, hold, &mut progress, device)
+}
+
+/// `device` is the VA-API render node to try first; if that encode fails, the software
+/// encoder makes the proxy instead.
+fn make_proxy(
+    input: &Path,
+    output: &Path,
+    duration_us: i64,
+    cancel: &AtomicBool,
+    hold: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+    device: Option<&str>,
+) -> Result<(), String> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     // Write beside the target and rename at the end, so a crash never leaves a
     // half-written file that looks finished.
     let partial = output.with_extension("part.mp4");
+    let mut result = run_ffmpeg(input, &partial, duration_us, cancel, hold, progress, device);
+    if device.is_some() && result.as_ref().is_err_and(|e| e != "Cancelled") {
+        tracing::warn!("hardware proxy encoding failed for {}; using the processor", input.display());
+        result = run_ffmpeg(input, &partial, duration_us, cancel, hold, progress, None);
+    }
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
+    }
+    std::fs::rename(&partial, output).map_err(|e| e.to_string())?;
+    progress(1.0);
+    Ok(())
+}
 
+/// Run one FFmpeg encode into `partial`, watching `cancel` and `hold`.
+fn run_ffmpeg(
+    input: &Path,
+    partial: &Path,
+    duration_us: i64,
+    cancel: &AtomicBool,
+    hold: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+    device: Option<&str>,
+) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
+    command.args(["-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]);
+    if let Some(device) = device {
+        // Decode, scale and encode all on the graphics chip: measured 5x faster than
+        // decoding on the processor and uploading full-size frames, at a third of the CPU.
+        // Footage the chip can't decode makes this fail, and the caller retries in software.
+        command.args(["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]);
+    }
+    // One thread to decode, one to scale, one to encode: about a third of a
+    // four-thread processor, measured, instead of nearly all of it.
+    command.args(["-threads", "1", "-i"]).arg(input);
+    // The picture and the first sound track: playback then reads one small file.
+    command.args(["-map", "0:v:0", "-map", "0:a:0?", "-filter_threads", "1"]);
+    match device {
+        Some(_) => {
+            command.args(["-vf", &format!("scale_vaapi=w=-2:h={PROXY_HEIGHT}"), "-c:v", "h264_vaapi", "-qp", "28"]);
+        }
+        None => {
+            command
+                .args(["-vf", &format!("scale=-2:{PROXY_HEIGHT}")])
+                .args(tempo_export::ffmpeg::h264_args(28, 960, PROXY_HEIGHT, true))
+                .args(["-pix_fmt", "yuv420p"]);
+        }
+    }
     command
-        // One thread to decode, one to scale, one to encode: about a third of a
-        // four-thread processor, measured, instead of nearly all of it.
-        .args(["-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-threads", "1", "-i"])
-        .arg(input)
-        // Picture only: sound is always read from the original file.
-        .args(["-map", "0:v:0", "-an", "-filter_threads", "1", "-vf", &format!("scale=-2:{PROXY_HEIGHT}")])
-        .args(tempo_export::ffmpeg::h264_args(28, 960, PROXY_HEIGHT, true))
-        .args([
-            "-pix_fmt", "yuv420p",
-            // A keyframe every half second keeps seeking cheap.
-            "-g", "15", "-bf", "0",
-            "-threads", "1",
-        ])
-        .arg(&partial)
+        // A keyframe every half second keeps seeking cheap.
+        .args(["-g", "15", "-bf", "0", "-threads", "1"])
+        .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000"])
+        .arg(partial)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -83,7 +135,6 @@ pub fn generate_proxy(
         text
     });
 
-    let mut cancelled = false;
     let finished = AtomicBool::new(false);
     std::thread::scope(|scope| {
         // Holding and cancelling are done from here, because the loop below
@@ -117,21 +168,16 @@ pub fn generate_proxy(
         }
         finished.store(true, Ordering::Relaxed);
     });
-    cancelled |= cancel.load(Ordering::Relaxed);
     let status = child.wait().map_err(|e| e.to_string())?;
     let stderr_text = errors.join().unwrap_or_default();
 
-    if cancelled || cancel.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&partial);
+    if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled".into());
     }
     if !status.success() {
-        let _ = std::fs::remove_file(&partial);
         tracing::warn!("proxy generation failed for {}:\n{stderr_text}", input.display());
         return Err(stderr_text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("ffmpeg failed").to_string());
     }
-    std::fs::rename(&partial, output).map_err(|e| e.to_string())?;
-    progress(1.0);
     Ok(())
 }
 
@@ -204,6 +250,62 @@ mod tests {
         assert_eq!(result, Err("Cancelled".to_string()));
         assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
         assert!(!output.exists() && !output.with_extension("part.mp4").exists());
+    }
+
+    /// Where the loudest sample is, in microseconds from the start.
+    fn click_us(path: &Path) -> i64 {
+        let mut reader = tempo_media::AudioReader::open(path).expect("audio");
+        let mut buf = vec![0.0f32; 3 * tempo_media::OUT_RATE as usize * tempo_media::OUT_CHANNELS];
+        reader.read(0, &mut buf);
+        let loudest = buf.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map(|(i, _)| i).unwrap_or(0);
+        (loudest / tempo_media::OUT_CHANNELS) as i64 * 1_000_000 / tempo_media::OUT_RATE as i64
+    }
+
+    #[test]
+    fn proxy_sound_lines_up_with_the_original() {
+        let Some(input) = media("sample_click.mp4") else { return };
+        tempo_media::ensure_ffmpeg_init();
+        let output = std::env::temp_dir().join(format!("tempo-proxy-click-{}.mp4", std::process::id()));
+        generate_proxy(&input, &output, 3_000_000, &AtomicBool::new(false), &AtomicBool::new(false), |_| {}).expect("proxy");
+        let (original, proxy) = (click_us(&input), click_us(&output));
+        let _ = std::fs::remove_file(&output);
+        assert!((original - 1_000_000).abs() < 5_000, "original click at {original} us");
+        assert!((proxy - original).abs() <= 1_000, "proxy click at {proxy} us, original at {original} us");
+    }
+
+    #[test]
+    fn failed_hardware_encode_falls_back_to_software() {
+        let Some(input) = media("sample_1080p_h264.mp4") else { return };
+        let output = std::env::temp_dir().join(format!("tempo-proxy-hw-{}.mp4", std::process::id()));
+        // A device that does not exist makes the hardware attempt fail every time.
+        let result = make_proxy(&input, &output, 5_000_000, &AtomicBool::new(false), &AtomicBool::new(false), &mut |_| {}, Some("/dev/dri/does-not-exist"));
+        let made = output.exists();
+        let _ = std::fs::remove_file(&output);
+        result.expect("software fallback");
+        assert!(made);
+    }
+
+    #[test]
+    fn footage_the_graphics_chip_cannot_decode_still_gets_a_proxy() {
+        // MPEG-4 Part 2 has no VA-API decoder on Intel: the GPU attempt fails and the
+        // processor makes the proxy instead.
+        let dir = std::env::temp_dir().join(format!("tempo-proxy-mpeg4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("old.avi");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=2", "-c:v", "mpeg4"])
+            .arg(&input)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        let output = dir.join("proxy.mp4");
+        let result = make_proxy(&input, &output, 2_000_000, &AtomicBool::new(false), &AtomicBool::new(false), &mut |_| {}, Some(tempo_export::ffmpeg::VAAPI_DEVICE));
+        let made_proxy = output.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("proxy");
+        assert!(made_proxy);
     }
 
     #[test]

@@ -13,6 +13,38 @@ pub enum H264Encoder {
     OpenH264,
 }
 
+/// H.264 held to `kbps`, for exports that must fit a file size.
+/// shortcut: one pass can overshoot on noisy footage; switch to two passes if the size check after export ever fails on real projects.
+pub fn h264_capped_args(kbps: u32) -> Vec<String> {
+    match h264_encoder() {
+        H264Encoder::X264 => ["-c:v", "libx264", "-preset", "veryfast", "-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k"), "-bufsize", &format!("{}k", kbps * 2)]
+            .map(String::from)
+            .to_vec(),
+        H264Encoder::OpenH264 => ["-c:v", "libopenh264", "-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k")].map(String::from).to_vec(),
+    }
+}
+
+/// The render node VA-API encoding uses.
+pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
+/// Whether the graphics chip's H.264 encoder really works here. Listing it is not
+/// enough (a driver may be missing), so one tiny frame is encoded, once. Blocking.
+pub fn vaapi_h264_available() -> bool {
+    static FOUND: OnceLock<bool> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let mut probe = Command::new("ffmpeg");
+        probe
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1", "-vaapi_device", VAAPI_DEVICE])
+            .args(["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-frames:v", "1", "-f", "null", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let works = probe.status().is_ok_and(|s| s.success());
+        tracing::info!("hardware H.264 encoding (VA-API) {}", if works { "works" } else { "is not available" });
+        works
+    })
+}
+
 /// Which encoder to use, found once by asking `ffmpeg -encoders`.
 pub fn h264_encoder() -> H264Encoder {
     static FOUND: OnceLock<H264Encoder> = OnceLock::new();
@@ -71,5 +103,15 @@ pub fn die_with_parent(command: &mut Command) {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hardware_probe_answers_without_a_gpu() {
+        // On a machine without a working driver this is false; it must never hang or panic.
+        let first = super::vaapi_h264_available();
+        assert_eq!(first, super::vaapi_h264_available());
     }
 }

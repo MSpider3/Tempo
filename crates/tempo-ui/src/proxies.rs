@@ -44,7 +44,8 @@ impl Proxies {
                 p.seen.borrow_mut().clear();
                 p.start_next();
             }
-            Change::Media => p.start_next(),
+            // Proxies are made only for footage on the timeline, so placing a clip may start one.
+            Change::Media | Change::Timeline => p.start_next(),
             _ => {}
         });
         proxies
@@ -75,14 +76,10 @@ impl Proxies {
         let next = self
             .state
             .with_project(|p| {
-                p.sources
-                    .values()
-                    .filter(|s| !s.proxy_ready && tempo_proxy::needs_proxy(s) && !self.seen.borrow().contains(&s.id))
-                    .min_by_key(|s| s.import_order)
-                    .map(|s| {
+                next_proxy(p, &self.seen.borrow()).and_then(|id| p.sources.get(&id)).map(|s| {
                         let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        (s.id, s.path.clone(), p.proxy_dir.join(format!("{}.mp4", s.id)), s.duration_us, name)
-                    })
+                    (s.id, s.path.clone(), p.proxy_dir.join(format!("{}.mp4", s.id)), s.duration_us, name)
+                })
             })
             .flatten();
         let Some((id, input, output, duration, name)) = next else {
@@ -150,5 +147,45 @@ impl Proxies {
             }
             p.start_next();
         });
+    }
+}
+
+/// The next source to make a proxy for: heavy footage that is on the timeline, has no
+/// proxy yet and was not tried this session. The first imported goes first. Footage
+/// that is only in the Media Pool is never transcoded.
+fn next_proxy(project: &tempo_timeline::Project, seen: &HashSet<Uuid>) -> Option<Uuid> {
+    let used: HashSet<Uuid> = project.timeline.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.source_id)).collect();
+    project
+        .sources
+        .values()
+        .filter(|s| used.contains(&s.id) && !s.proxy_ready && tempo_proxy::needs_proxy(s) && !seen.contains(&s.id))
+        .min_by_key(|s| s.import_order)
+        .map(|s| s.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempo_timeline::{Clip, ClipType, MediaSource, MediaType, Project, RationalFps};
+
+    fn heavy(order: u32) -> MediaSource {
+        let mut s = MediaSource::new(format!("{order}.mp4").into(), MediaType::Video, 1_000_000);
+        s.video_height = Some(2160);
+        s.video_codec = Some("h264".into());
+        s.import_order = order;
+        s
+    }
+
+    #[test]
+    fn only_footage_on_the_timeline_gets_a_proxy() {
+        let mut project = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let (pool_only, placed) = (heavy(0), heavy(1));
+        let track = project.timeline.tracks[0].id;
+        project.timeline.tracks[0].clips.push(Clip::new(track, placed.id, ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000));
+        let placed_id = placed.id;
+        project.sources.insert(pool_only.id, pool_only);
+        project.sources.insert(placed.id, placed);
+        assert_eq!(next_proxy(&project, &HashSet::new()), Some(placed_id));
+        assert_eq!(next_proxy(&project, &HashSet::from([placed_id])), None);
     }
 }

@@ -1,7 +1,8 @@
 # System Design Document — Tempo 2
 
-> **Status (2026-10-03): partly out of date.** Written for version 1.0. The product and
-> interface documents take priority.
+> **Status (2026-10-21): partly out of date.** Written for version 1.0. The product and
+> interface documents take priority. Sections marked "What the code does now" describe the
+> code; where they disagree with the 1.0 text around them, they win.
 >
 > Superseded here:
 > - **§10 Plugin Host API (WASM)**: replaced by the Lua API in `PLUGIN_SPEC.md §7`.
@@ -11,12 +12,14 @@
 >   follow `VISUAL_DESIGN.md §2.1`. Named markers become chapters on export.
 > - **Export (§6)**: no pause state; jobs take a timeline snapshot; the "hardware exclusivity"
 >   rule is dropped.
+> - **Commands (§2)**: `Command` methods take `&mut self` and `&mut Timeline`, so a command
+>   stores its own undo data. Undo is atomic (§2.1).
+> - **Clip speed (§1.7)**: clips have a speed, so source length and timeline length differ.
+> - **Frame cache (§4) and render engine (§7)**: not built. Playback and proxies are
+>   described in `MEDIA_ENGINE.md`.
 >
 > Known problems, not yet rewritten:
-> - **§1.2** `us_to_frame` / `frame_to_us` truncate, so a frame converted to time and back can
->   come out one lower. The code already rounds; this section should be brought in line.
 > - **Keyframe times** are absolute timeline positions; they should be relative to the clip.
-> - **`Command::execute(&self)`** cannot store undo data such as the deleted clip.
 > - **Clip positions** are stored in pixels; they should be fractions of the frame.
 > - Slider drags need to be grouped into one undo step.
 
@@ -52,17 +55,28 @@ This avoids floating-point precision issues when dealing with non-integer FPS (e
 /// Can be negative for internal arithmetic.
 pub type TimeUs = i64;
 
-/// Convert between TimeUs and frame numbers for display purposes.
-pub fn us_to_frame(time_us: TimeUs, fps_num: u32, fps_den: u32) -> i64 {
-    // frame = time_us * fps_num / (fps_den * 1_000_000)
-    (time_us as i128 * fps_num as i128 / (fps_den as i128 * 1_000_000)) as i64
+/// Convert between TimeUs and frame numbers. Both round to the nearest, so a frame
+/// converted to time and back comes out the same.
+pub fn us_to_frame(us: i64, fps: RationalFps) -> i64 {
+    if fps.den == 0 || fps.num == 0 {
+        return 0;
+    }
+    let denom = 1_000_000 * fps.den as i64;
+    (us * fps.num as i64 + denom / 2) / denom
 }
 
-pub fn frame_to_us(frame: i64, fps_num: u32, fps_den: u32) -> TimeUs {
-    // us = frame * fps_den * 1_000_000 / fps_num
-    (frame as i128 * fps_den as i128 * 1_000_000 / fps_num as i128) as TimeUs
+pub fn frame_to_us(frame: i64, fps: RationalFps) -> i64 {
+    if fps.num == 0 {
+        return 0;
+    }
+    let num = frame * 1_000_000 * fps.den as i64;
+    (num + fps.num as i64 / 2) / fps.num as i64
 }
 ```
+
+`RationalFps { num, den }` is the frame rate, e.g. `30000/1001` for 29.97. Playback finds
+the frame that *holds* a position by rounding down, not to the nearest
+(`source_request_us`, `MEDIA_ENGINE.md §3.6`).
 
 ### 1.3 Project
 
@@ -195,7 +209,7 @@ pub struct Clip {
     pub source_in: TimeUs,
 
     /// The point in the source file this clip stops reading (exclusive)
-    /// Invariant: source_out - source_in == timeline_out - timeline_in
+    /// source_out - source_in == to_source_us(timeline_out - timeline_in): equal at speed 1.0
     pub source_out: TimeUs,
 
     pub name: String,           // defaults to filename
@@ -217,8 +231,19 @@ impl Clip {
 
     /// Given a timeline position within this clip, return the source offset to decode
     pub fn source_offset_at(&self, timeline_pos: TimeUs) -> TimeUs {
-        self.source_in + (timeline_pos - self.timeline_in)
+        self.source_in + self.to_source_us(timeline_pos - self.timeline_in)
     }
+
+    /// Timeline length → source length, at the clip's speed (rounded). Every edit that
+    /// turns timeline time into source time goes through here.
+    pub fn to_source_us(&self, timeline_us: TimeUs) -> TimeUs;
+
+    /// Source length → timeline length, at the clip's speed (rounded).
+    pub fn to_timeline_us(&self, source_us: TimeUs) -> TimeUs;
+
+    /// Like `to_timeline_us`, rounded down: never needs more footage than `source_us`.
+    /// Used for limits such as "trim to the start of the footage".
+    pub fn to_timeline_floor_us(&self, source_us: TimeUs) -> TimeUs;
 }
 
 pub enum ClipType {
@@ -239,6 +264,10 @@ pub struct ClipProperties {
     pub volume: f32,          // 0.0–2.0, default 1.0
     pub pan: f32,             // -1.0 (left) to 1.0 (right), default 0.0
     pub muted: bool,
+
+    // Speed (Resolve's Change Clip Speed): 1.0 normal, 0.5 slow motion, 2.0 double.
+    // Source time = timeline time × speed. Kept within 0.25–4.0 by SetClipSpeedCommand.
+    pub speed: f64,
 
     // Basic color correction
     pub lift: [f32; 3],       // RGB, default [0.0, 0.0, 0.0]
@@ -350,12 +379,13 @@ Every mutation to project state goes through the `CommandLog`. Commands are trai
 and `undo` methods. The log stores commands as `Box<dyn Command>` objects.
 
 ```rust
-pub trait Command: Send + 'static {
-    /// Apply the command to the project. Returns Err if preconditions are not met.
-    fn execute(&self, project: &mut Project) -> Result<(), CommandError>;
+pub trait Command: Send + Sync + Debug {
+    /// Apply the command to the timeline. Returns Err if preconditions are not met.
+    /// `&mut self`, so the command can keep what undo needs (such as a deleted clip).
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()>;
 
-    /// Reverse the command. The project must be in the state after execute().
-    fn undo(&self, project: &mut Project) -> Result<(), CommandError>;
+    /// Reverse the command. The timeline must be in the state after execute().
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()>;
 
     /// Human-readable description shown in Edit menu ("Undo Delete Clip")
     fn description(&self) -> &str;
@@ -368,8 +398,8 @@ pub struct CommandLog {
 }
 
 impl CommandLog {
-    pub fn execute(&mut self, cmd: Box<dyn Command>, project: &mut Project) -> Result<()> {
-        cmd.execute(project)?;
+    pub fn execute(&mut self, mut cmd: Box<dyn Command>, timeline: &mut Timeline) -> Result<()> {
+        cmd.execute(timeline)?;
         // Truncate any redo history beyond cursor
         self.history.truncate(self.cursor);
         self.history.push(cmd);
@@ -382,20 +412,28 @@ impl CommandLog {
         Ok(())
     }
 
-    pub fn undo(&mut self, project: &mut Project) -> Result<()> {
-        if self.cursor == 0 { return Ok(()); }
-        self.cursor -= 1;
-        self.history[self.cursor].undo(project)
+    pub fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        if !self.can_undo() { return Err(TimelineError::NothingToUndo); }
+        // Move the cursor only once the undo has worked, so a failure changes nothing.
+        let idx = self.cursor - 1;
+        self.history[idx].undo(timeline)?;
+        self.cursor = idx;
+        Ok(())
     }
 
-    pub fn redo(&mut self, project: &mut Project) -> Result<()> {
-        if self.cursor >= self.history.len() { return Ok(()); }
-        self.history[self.cursor].execute(project)?;
+    pub fn redo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        if !self.can_redo() { return Err(TimelineError::NothingToRedo); }
+        self.history[self.cursor].execute(timeline)?;
         self.cursor += 1;
         Ok(())
     }
 }
 ```
+
+**Undo is atomic.** A failed undo or redo leaves the cursor where it was, so the history
+never gets out of step with the timeline. `CompositeCommand` (several commands as one undo
+step) does the same inside: if one part fails to execute, the parts already run are undone;
+if one part fails to undo, the parts already undone are executed again.
 
 ### 2.2 Concrete Command Types
 
@@ -476,7 +514,26 @@ pub enum TransitionEdge { In, Out }
 pub struct AddMarkerCmd { marker: Marker }
 pub struct DeleteMarkerCmd { marker_id: MarkerId, deleted_marker: Option<Marker> }
 pub struct MoveMarkerCmd { marker_id: MarkerId, old_pos: TimeUs, new_pos: TimeUs }
+
+// Change Clip Speed (Resolve's R). In the code: SetClipSpeedCommand.
+pub struct SetClipSpeedCommand {
+    clip_id: Uuid,
+    speed: f64,                 // MIN_SPEED 0.25 ..= MAX_SPEED 4.0
+    ripple: bool,
+    fps: RationalFps,           // new lengths are whole frames
+    source_limits: HashMap<Uuid, i64>,  // media length per source: never read past the end
+    before: Vec<(Uuid, Vec<Clip>)>,     // the clips of every changed track, for undo
+}
 ```
+
+`SetClipSpeedCommand` changes the clip and the clips linked to it together. Titles and
+images have no speed.
+
+- **Ripple on**: the clip keeps its footage and changes length. Every clip that starts at
+  or after its end, on every track, moves by the same amount, so linked picture and sound
+  stay in sync. A locked track that would have to move refuses the change.
+- **Ripple off**: the clip keeps its length. If a faster speed runs out of footage, it ends
+  early and leaves a gap. It never covers the next clip.
 
 ---
 
@@ -544,6 +601,10 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     pub pts_us: TimeUs,          // actual PTS of this frame
 }
+// In the code: always RGBA (no `format` field), and `data: Arc<Vec<u8>>`, so a clone
+// shares the pixels instead of copying them. Decoding is done by `FfmpegDecoder`
+// (`open`, `open_with(path, hardware)`, `decode_video_frame`, `decode_keyframe`,
+// `set_max_output_height`, `set_fast_decode`); see MEDIA_ENGINE.md §3 and §5.
 
 pub struct AudioBuffer {
     pub sample_rate: u32,
@@ -640,6 +701,14 @@ impl ProxyEngine {
 // Proxy uses FFmpeg's pipe API: decode via source codec → encode to H.264.
 // Uses all available proxy thread pool threads for encode (-threads N).
 ```
+
+**What the code does now:** there is no `ProxyEngine` state or thread pool.
+`tempo_proxy::generate_proxy(input, output, duration_us, cancel, hold, progress)` runs the
+`ffmpeg` program once, blocking, and is called from `gio::spawn_blocking` by
+`crates/tempo-ui/src/proxies.rs`, one proxy at a time. `needs_proxy(source)` decides which
+footage is heavy. Proxies are 540p H.264 with AAC sound, named `{source_id}.mp4`, made on
+the graphics chip when `tempo_export::ffmpeg::vaapi_h264_available()` passes and on the
+processor otherwise. Details in `MEDIA_ENGINE.md §8`.
 
 ---
 
@@ -773,6 +842,25 @@ stateDiagram-v2
 3. **Hardware Exclusivity:** A global `OnceLock<HwEncoderContext>` ensures hardware encoders are exclusive. When active, live preview renderers in `tempo-render` automatically drop to software RGB decoding.
 4. **Session Lifetime:** The `RenderQueue` is in-memory only and discarded on app quit. Active encodes are cancelled and cleaned up during graceful shutdown.
 
+### 6.3 What the Code Does Now: Speed, Solo and Size Limits
+
+Export runs the `ffmpeg` program with a filter graph built from the timeline
+(`crates/tempo-export/src/timeline_export.rs`, settings in `TimelineExport`).
+
+- **Retimed clips**: a clip whose speed is not 1.0 gets `setpts=(PTS-STARTPTS)/speed` on its
+  picture and `asetrate=48000×speed,aresample=48000` on its sound, so the pitch moves with
+  the speed, as in playback. An EDL export writes a CMX 3600 motion (`M2`) line for such
+  clips.
+- **Solo** is ignored: export includes every enabled audio track.
+- **Size limit**: `max_video_kbps: Option<u32>` caps the picture bitrate instead of using
+  `crf`. `bitrate_for_size(target_bytes, duration_us, audio_kbps)` picks it, leaving 5 % for
+  the container and encoder overshoot, and returns `None` under 200 kb/s (too little to
+  watch). The "≤ 10 MB" card uses it with 96 kb/s sound, and drops to 720p below about
+  1.5 Mb/s. A size-limited export always uses the processor's encoder, whatever the
+  hardware setting, because it keeps to a bitrate.
+- **Hardware encoding**: with `hardware` set, the VA-API H.264 encoder is tried first; if it
+  can't be used, the export runs again with the software encoder.
+
 ---
 
 ## 7. Render Engine Interface (`tempo-render`)
@@ -817,8 +905,19 @@ open(path: &Path)
   └── rusqlite::Connection::open(path)  [WAL mode, read-write]
         └── check schema version
               ├── version == CURRENT → read into Project struct
-              └── version < CURRENT  → run migrations, then read
+              └── version < CURRENT  → copy to <file>.v<N>.bak (VACUUM INTO),
+                                        run migrations, then read
 ```
+
+- **Before an upgrade**, a project written by an older Tempo is copied to
+  `<file>.v<N>.bak` with `VACUUM INTO`, which writes one consistent file including changes
+  still in the WAL (`crates/tempo-project/src/db.rs`). New files and existing `.bak` files
+  are left alone.
+- **Strict loading**: if a clip's properties or title can't be parsed, or it points to a
+  track that doesn't exist, loading stops with `ProjectError::CorruptClip { clip_id, field,
+  reason }`. It never fills in defaults, which the next save would make permanent. The UI
+  then points to the project's backups (§8.4).
+- A proxy marked ready whose file is gone loads as not ready, so it is made again.
 
 ### 8.2 Project Save Flow
 
@@ -840,6 +939,25 @@ Autosave runs on a dedicated `tokio::task`. Every N seconds (from settings):
 
 This ensures the autosave is never partially written.
 
+In the code, autosave runs `auto_save_project` in `gio::spawn_blocking` from the GTK
+thread; there is no tokio.
+
+### 8.4 Project Backups
+
+Rolling backups, kept as DaVinci Resolve keeps them (`crates/tempo-project/src/backup.rs`):
+
+- While the project changes, a backup is written every 10 minutes, on a worker, to
+  `~/.local/share/tempo/backups/<project id>/`.
+- Each backup is a complete project file, written under a hidden `.part` name, checked
+  (`PRAGMA integrity_check`, then a full `load_project`) and only then renamed into place.
+- Files are named by the time in UTC (`%Y%m%d-%H%M%SZ.tempo`), so the hour repeated when
+  daylight saving ends can't make a newer backup look older. They are shown and kept by
+  local time.
+- `BackupPolicy::default()` keeps up to 6 from the last hour, the newest of each of the
+  last 8 hours of today, and the newest of each of the last 5 days.
+- **Project Backups…** in the Project Manager opens a backup as a copy with its own id; the
+  original is never changed.
+- A failed backup is reported once and never blocks editing.
 ---
 
 ## 9. Settings
@@ -879,6 +997,27 @@ pub enum Theme { System, Light, Dark }
 // Settings stored at: ~/.config/tempo/settings.toml
 // Loaded on startup, saved on any change via debounced 2-second write.
 ```
+
+**What the code does now** (`crates/tempo-ui/src/settings.rs`): settings are one flat
+struct saved as `~/.config/tempo/settings.json`:
+
+```rust
+pub struct Settings {
+    pub autosave_seconds: u32,   // default 120
+    pub playback_height: u32,    // preview decode height; 0 = Full (originals), default 540
+    pub auto_proxies: bool,      // default true
+    pub hardware_decode: bool,   // VA-API decoding; default false (experimental)
+    pub hardware_encode: bool,   // try VA-API H.264 for export first; default false
+    pub plugins_off: Vec<String>,
+}
+```
+
+At start-up, on a worker, Tempo checks whether VA-API decoding opens
+(`tempo_media::hardware_decode_available()`) and whether the chip can really encode H.264
+(`tempo_export::ffmpeg::vaapi_h264_available()`, a one-frame test encode). A saved
+`hardware_decode` or `hardware_encode` the machine can't do is switched off and saved, and
+the user is told once. Hardware decoding is off by default because it drops more frames
+at 4K (`MEDIA_ENGINE.md §5.1`).
 
 ---
 

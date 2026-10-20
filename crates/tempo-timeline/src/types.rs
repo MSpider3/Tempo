@@ -86,7 +86,9 @@ pub struct Keyframe {
     pub value: f32,
 }
 
+/// Fields missing from saved data take their default value, so older and newer files load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClipProperties {
     pub opacity: f32,
     pub position_x: f32,
@@ -120,6 +122,9 @@ pub struct ClipProperties {
     /// Filters on this clip, applied in order.
     #[serde(default)]
     pub effects: Vec<crate::effects::ClipEffect>,
+    /// Playback speed: 1.0 is normal, 0.5 half speed (slow motion), 2.0 double.
+    /// Source time = timeline time × speed. Kept within 0.25–4.0 by the commands.
+    pub speed: f64,
 }
 
 fn enabled_by_default() -> bool {
@@ -148,11 +153,27 @@ impl Default for ClipProperties {
             dissolve_in_us: 0,
             link: None,
             effects: Vec::new(),
+            speed: 1.0,
         }
     }
 }
 
 impl ClipProperties {
+    /// True when the clip differs from a freshly placed one in the ways Resolve shades a
+    /// clip darker for: filters, keyframes, and picture or sound adjustments. Fades,
+    /// dissolves and links show on the timeline themselves and do not count.
+    pub fn is_modified(&self) -> bool {
+        let d = Self::default();
+        let picture = (self.opacity, self.position_x, self.position_y, self.scale_x, self.scale_y, self.rotation);
+        let sound = (self.volume, self.pan);
+        !self.effects.is_empty()
+            || !self.keyframes.is_empty()
+            || self.speed != 1.0
+            || picture != (d.opacity, d.position_x, d.position_y, d.scale_x, d.scale_y, d.rotation)
+            || sound != (d.volume, d.pan)
+            || (self.lift, self.gamma, self.gain) != (d.lift, d.gamma, d.gain)
+    }
+
     pub fn get_base_property(&self, property: &str) -> f32 {
         match property {
             "opacity" => self.opacity,
@@ -242,7 +263,10 @@ pub enum TitleType {
     LowerThird,
 }
 
+/// Fields missing from saved data take their default value, so titles from older and
+/// newer versions load (the loader refuses unreadable clip data).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TitleData {
     pub title_type: TitleType,
     pub text: String,
@@ -324,26 +348,67 @@ impl Clip {
         time_us >= self.timeline_in && time_us < self.timeline_out
     }
 
+    /// Source time that `timeline_time_us` of this clip shows.
     pub fn source_offset_at(&self, timeline_time_us: i64) -> i64 {
-        self.source_in + (timeline_time_us - self.timeline_in)
+        self.source_in + self.to_source_us(timeline_time_us - self.timeline_in)
+    }
+
+    /// How much source a stretch of this clip's timeline covers, at its speed.
+    /// Every edit that turns timeline time into source time goes through here.
+    pub fn to_source_us(&self, timeline_us: i64) -> i64 {
+        scale_us(timeline_us, self.properties.speed)
+    }
+
+    /// How much timeline a stretch of this clip's source takes, at its speed.
+    pub fn to_timeline_us(&self, source_us: i64) -> i64 {
+        scale_us(source_us, 1.0 / self.properties.speed)
+    }
+
+    /// Like `to_timeline_us`, rounded down: the longest stretch of timeline that never
+    /// needs more than `source_us` of footage. For limits such as "trim to the start of
+    /// the footage", where rounding up would ask for a microsecond that isn't there.
+    pub fn to_timeline_floor_us(&self, source_us: i64) -> i64 {
+        let speed = self.properties.speed;
+        if speed == 1.0 || !speed.is_finite() || speed <= 0.0 {
+            source_us
+        } else {
+            (source_us as f64 / speed).floor() as i64
+        }
     }
 
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
     pub fn dissolve_lead(&self) -> Option<Clip> {
-        let d = self.properties.dissolve_in_us.min(self.source_in);
+        let d = self.properties.dissolve_in_us.min(self.to_timeline_floor_us(self.source_in));
         if d <= 0 {
             return None;
         }
         let mut lead = self.clone();
         lead.timeline_in = self.timeline_in - d;
         lead.timeline_out = self.timeline_in;
-        lead.source_in = self.source_in - d;
+        lead.source_in = self.source_in - self.to_source_us(d);
         lead.source_out = self.source_in;
         lead.properties.fade_in_us = d;
         lead.properties.fade_out_us = 0;
         lead.properties.dissolve_in_us = 0;
         Some(lead)
+    }
+
+    /// This clip with its fade at `edge` set to `us`, rounded to whole frames and kept
+    /// between zero and what the fade at the other end leaves free.
+    pub fn with_fade(&self, edge: FadeEdge, us: i64, fps: RationalFps) -> Clip {
+        let mut clip = self.clone();
+        let p = &mut clip.properties;
+        let other = match edge {
+            FadeEdge::In => p.fade_out_us,
+            FadeEdge::Out => p.fade_in_us,
+        };
+        let length = frame_to_us(us_to_frame(us.max(0), fps), fps).min((self.duration_us() - other).max(0));
+        match edge {
+            FadeEdge::In => p.fade_in_us = length,
+            FadeEdge::Out => p.fade_out_us = length,
+        }
+        clip
     }
 
     /// How much of the clip shows through its fades at a timeline position:
@@ -795,11 +860,205 @@ impl Project {
             ui_state: UiState::default(),
         }
     }
+
+    /// What to offer when `source` is the first video brought into an empty project
+    /// (Resolve's "Change Project Frame Rate?"), or `None` when it already matches or
+    /// clips are on the timeline. Odd rates snap to the nearest standard one, and frame
+    /// sizes to even numbers. A portrait clip gives a vertical project.
+    pub fn first_import_offer(&self, source: &MediaSource) -> Option<FormatOffer> {
+        if source.media_type != MediaType::Video || self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+            return None;
+        }
+        let (w, h, fps) = (source.video_width?, source.video_height?, source.video_fps?);
+        if w < 2 || h < 2 || fps.num == 0 || fps.den == 0 {
+            return None;
+        }
+        const STANDARD: [RationalFps; 8] = [
+            RationalFps::FPS_23_976,
+            RationalFps::FPS_24,
+            RationalFps::FPS_25,
+            RationalFps::FPS_29_97,
+            RationalFps::FPS_30,
+            RationalFps::FPS_50,
+            RationalFps::FPS_59_94,
+            RationalFps::FPS_60,
+        ];
+        let fps = STANDARD.into_iter().min_by(|a, b| (a.to_f64() - fps.to_f64()).abs().total_cmp(&(b.to_f64() - fps.to_f64()).abs()))?;
+        let offer = FormatOffer { width: w & !1, height: h & !1, fps };
+        (offer != FormatOffer { width: self.width, height: self.height, fps: self.fps }).then_some(offer)
+    }
+
+    /// Change the project's frame size and rate. Only while the timeline is empty, since
+    /// clips are placed on the frame grid.
+    pub fn apply_format(&mut self, offer: &FormatOffer) -> crate::Result<()> {
+        if self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+            return Err(crate::TimelineError::CommandFailed("the frame rate can't change once clips are on the timeline".into()));
+        }
+        (self.width, self.height, self.fps) = (offer.width, offer.height, offer.fps);
+        Ok(())
+    }
+}
+
+/// The start or end of a clip, where its fade handles sit.
+/// `us × factor`, rounded. Exactly `us` at normal speed (and for a nonsense factor), so
+/// clips that are not retimed keep their exact times.
+fn scale_us(us: i64, factor: f64) -> i64 {
+    if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
+        us
+    } else {
+        (us as f64 * factor).round() as i64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FadeEdge {
+    In,
+    Out,
+}
+
+/// A frame size and rate offered for the project to match its first clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOffer {
+    pub width: u32,
+    pub height: u32,
+    pub fps: RationalFps,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video(w: u32, h: u32, fps: RationalFps) -> MediaSource {
+        let mut s = MediaSource::new(PathBuf::from("clip.mp4"), MediaType::Video, 10_000_000);
+        (s.video_width, s.video_height, s.video_fps) = (Some(w), Some(h), Some(fps));
+        s
+    }
+
+    #[test]
+    fn no_offer_when_the_clip_matches() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        assert_eq!(p.first_import_offer(&video(1920, 1080, RationalFps::FPS_30)), None);
+    }
+
+    #[test]
+    fn offer_matches_size_and_rate() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(3840, 2160, RationalFps::FPS_23_976)).unwrap();
+        assert_eq!(offer, FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_23_976 });
+    }
+
+    #[test]
+    fn odd_rates_snap_to_the_nearest_standard_rate() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_24);
+        // A phone's variable rate is often reported as something like 29.98 or 59.9.
+        let offer = p.first_import_offer(&video(1920, 1080, RationalFps { num: 2998, den: 100 })).unwrap();
+        assert_eq!(offer.fps, RationalFps::FPS_29_97);
+        let offer = p.first_import_offer(&video(1920, 1080, RationalFps { num: 120, den: 1 })).unwrap();
+        assert_eq!(offer.fps, RationalFps::FPS_60);
+    }
+
+    #[test]
+    fn portrait_clips_offer_a_vertical_project() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(1080, 1920, RationalFps::FPS_30)).unwrap();
+        assert_eq!((offer.width, offer.height), (1080, 1920));
+    }
+
+    #[test]
+    fn odd_sizes_round_down_to_even() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let offer = p.first_import_offer(&video(1279, 719, RationalFps::FPS_30)).unwrap();
+        assert_eq!((offer.width, offer.height), (1278, 718));
+    }
+
+    #[test]
+    fn no_offer_once_the_timeline_has_clips() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let track = p.timeline.tracks[0].id;
+        p.timeline.tracks[0].clips.push(Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 0, 1, 0, 1));
+        let clip = video(3840, 2160, RationalFps::FPS_24);
+        assert_eq!(p.first_import_offer(&clip), None);
+        assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
+        assert_eq!((p.width, p.fps), (1920, RationalFps::FPS_30));
+    }
+
+    #[test]
+    fn no_offer_for_sound_or_unknown_rates() {
+        let p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let mut sound = video(3840, 2160, RationalFps::FPS_24);
+        sound.media_type = MediaType::Audio;
+        assert_eq!(p.first_import_offer(&sound), None);
+        let mut unknown = video(3840, 2160, RationalFps::FPS_24);
+        unknown.video_fps = None;
+        assert_eq!(p.first_import_offer(&unknown), None);
+    }
+
+    #[test]
+    fn apply_format_changes_an_empty_project() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        p.apply_format(&FormatOffer { width: 1080, height: 1920, fps: RationalFps::FPS_60 }).unwrap();
+        assert_eq!((p.width, p.height, p.fps), (1080, 1920, RationalFps::FPS_60));
+    }
+
+    fn ten_second_clip() -> Clip {
+        Clip::new(Uuid::new_v4(), Uuid::new_v4(), ClipType::Video, "c", 0, 10_000_000, 0, 10_000_000)
+    }
+
+    #[test]
+    fn with_fade_snaps_to_whole_frames() {
+        let c = ten_second_clip().with_fade(FadeEdge::In, 1_010_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, frame_to_us(30, RationalFps::FPS_30));
+        let c = c.with_fade(FadeEdge::Out, 500_000, RationalFps::FPS_25);
+        assert_eq!(c.properties.fade_out_us, 520_000); // 13 frames at 25 fps, the nearest whole frame
+    }
+
+    #[test]
+    fn with_fade_leaves_room_for_the_other_fade() {
+        let mut c = ten_second_clip();
+        c.properties.fade_out_us = 4_000_000;
+        let c = c.with_fade(FadeEdge::In, 9_000_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, 6_000_000);
+        assert_eq!(c.properties.fade_out_us, 4_000_000);
+    }
+
+    #[test]
+    fn with_fade_is_never_negative() {
+        let mut c = ten_second_clip();
+        c.properties.fade_in_us = 2_000_000;
+        let c = c.with_fade(FadeEdge::In, -500_000, RationalFps::FPS_30);
+        assert_eq!(c.properties.fade_in_us, 0);
+    }
+
+    #[test]
+    fn fresh_clip_is_not_modified_and_fades_do_not_count() {
+        let mut p = ClipProperties::default();
+        assert!(!p.is_modified());
+        (p.fade_in_us, p.fade_out_us, p.dissolve_in_us, p.link) = (1, 1, 1, Some(Uuid::new_v4()));
+        assert!(!p.is_modified());
+    }
+
+    #[test]
+    fn inspector_changes_mark_a_clip_modified() {
+        let changes: [fn(&mut ClipProperties); 12] = [
+            |p| p.opacity = 0.5,
+            |p| p.position_x = 10.0,
+            |p| p.position_y = -3.0,
+            |p| p.scale_x = 1.2,
+            |p| p.scale_y = 0.8,
+            |p| p.rotation = 5.0,
+            |p| p.volume = 0.7,
+            |p| p.pan = -0.2,
+            |p| p.lift = [0.1, 0.0, 0.0],
+            |p| p.gamma = [1.0, 1.1, 1.0],
+            |p| p.gain = [1.0, 1.0, 0.9],
+            |p| p.add_keyframe("opacity", 0, 1.0),
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut p = ClipProperties::default();
+            change(&mut p);
+            assert!(p.is_modified(), "change {i} should count");
+        }
+    }
 
     #[test]
     fn test_rational_fps() {

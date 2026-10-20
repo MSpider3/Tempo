@@ -508,11 +508,13 @@ fn install_api(lua: &Lua, session: &Rc<RefCell<Session>>, playhead_us: i64, sele
         // One value per `window` seconds across the clip, in decibels (0 is full level).
         let window = window.clamp(1.0 / PEAKS_PER_SECOND, 10.0);
         let steps = (secs(clip.duration_us()) / window).ceil() as usize;
+        // Each step of timeline covers `speed` times as much sound in a retimed clip.
+        let source_window = window * clip.properties.speed;
         let levels = (0..steps)
             .map(|i| {
-                let t0 = secs(clip.source_in) + i as f64 * window;
+                let t0 = secs(clip.source_in) + i as f64 * source_window;
                 let a = (t0 * PEAKS_PER_SECOND) as usize;
-                let b = (((t0 + window) * PEAKS_PER_SECOND) as usize).max(a + 1).min(peaks.len());
+                let b = (((t0 + source_window) * PEAKS_PER_SECOND) as usize).max(a + 1).min(peaks.len());
                 let peak = peaks.get(a..b).and_then(|p| p.iter().max()).copied().unwrap_or(0);
                 20.0 * (peak.max(1) as f64 / 255.0).log10()
             })
@@ -734,5 +736,19 @@ mod tests {
         // Two clips remain, touching at 4 s, eight seconds in total.
         assert_eq!(spans, vec![(0, 4_000_000), (4_000_000, 8_000_000)]);
         assert!(out.messages[0].contains("Removed 1"));
+    }
+
+    #[test]
+    fn remove_silence_follows_a_retimed_clip() {
+        let (mut timeline, clip, source) = timeline_with_audio_clip();
+        // The same ten seconds of sound played at double speed: the silence is at 2-3 s.
+        let c = timeline.find_clip_mut(clip).expect("clip");
+        (c.properties.speed, c.timeline_out) = (2.0, c.timeline_in + 5_000_000);
+        let peaks: Vec<u8> = (0..500).map(|i| if (200..300).contains(&i) { 0 } else { 180 }).collect();
+        let run = RunInput { timeline, playhead_us: 0, selection: vec![clip], loudness: HashMap::from([(source, Arc::new(peaks))]) };
+        let out = run_command(&built_in()[0], "remove_silence", run).expect("run");
+        let track = out.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).expect("audio track");
+        let spans: Vec<(i64, i64)> = track.clips.iter().map(|c| (c.timeline_in, c.timeline_out)).collect();
+        assert_eq!(spans, vec![(0, 2_000_000), (2_000_000, 4_000_000)], "{:?}", out.messages);
     }
 }

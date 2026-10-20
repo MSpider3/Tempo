@@ -13,7 +13,7 @@ use gtk4::prelude::*;
 use gtk4::gio;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_export::{chapters_from_markers, export_timeline, format_chapter_list, youtube_problems, Chapter, Fit, TimelineExport};
+use tempo_export::{bitrate_for_size, chapters_from_markers, export_timeline, format_chapter_list, youtube_problems, Chapter, Fit, TimelineExport};
 use tempo_timeline::Project;
 
 use crate::state::{AppState, Change};
@@ -25,15 +25,22 @@ struct Format {
     width: u32,
     height: u32,
     best_for: &'static str,
+    /// Keep the file under this many bytes, choosing the bitrate (and 720p when it is low).
+    max_bytes: Option<u64>,
 }
 
-const FORMATS: [Format; 5] = [
-    Format { ratio: "16:9", width: 1920, height: 1080, best_for: "YouTube, Vimeo" },
-    Format { ratio: "16:9 4K", width: 3840, height: 2160, best_for: "YouTube 4K" },
-    Format { ratio: "9:16", width: 1080, height: 1920, best_for: "TikTok, Reels, Shorts" },
-    Format { ratio: "1:1", width: 1080, height: 1080, best_for: "Instagram feed" },
-    Format { ratio: "4:5", width: 1080, height: 1350, best_for: "Instagram portrait" },
+const FORMATS: [Format; 6] = [
+    Format { ratio: "16:9", width: 1920, height: 1080, best_for: "YouTube, Vimeo", max_bytes: None },
+    Format { ratio: "16:9 4K", width: 3840, height: 2160, best_for: "YouTube 4K", max_bytes: None },
+    Format { ratio: "9:16", width: 1080, height: 1920, best_for: "TikTok, Reels, Shorts", max_bytes: None },
+    Format { ratio: "1:1", width: 1080, height: 1080, best_for: "Instagram feed", max_bytes: None },
+    Format { ratio: "4:5", width: 1080, height: 1350, best_for: "Instagram portrait", max_bytes: None },
+    // Discord's limit for accounts without Nitro.
+    Format { ratio: "≤ 10 MB", width: 1920, height: 1080, best_for: "Discord, email", max_bytes: Some(10_000_000) },
 ];
+
+/// Sound bitrate for size-limited exports: clear speech, more room for the picture.
+const SIZE_LIMITED_AUDIO_KBPS: u32 = 96;
 
 const QUALITIES: [(&str, u8, u32); 3] = [("High", 18, 192), ("Medium", 23, 160), ("Small file", 28, 128)];
 
@@ -205,6 +212,10 @@ impl ExportPage {
             button.connect_toggled(move |b| {
                 if b.is_active() {
                     p.format_index.set(i);
+                    // Vertical video from a landscape edit: fill the frame, as Shorts and Reels expect.
+                    if f.height > f.width && p.state.with_project(|pr| pr.width > pr.height).unwrap_or(false) {
+                        p.fit.set_selected(1);
+                    }
                     p.refresh_settings();
                 }
             });
@@ -234,7 +245,10 @@ impl ExportPage {
         page.location.connect_activate(move |_| p.update_free_space());
 
         let p = page.clone();
+        page.range.connect_selected_notify(move |_| p.update_size_cards());
+        let p = page.clone();
         state.connect(move |change| {
+            p.update_size_cards();
             match change {
                 Change::Project => p.load_defaults(),
                 // The Share menus list the upload targets of enabled plugins.
@@ -274,6 +288,25 @@ impl ExportPage {
         }
         self.update_free_space();
         self.refresh_settings();
+    }
+
+    /// Grey out size-limited cards when what would be exported is too long for them.
+    fn update_size_cards(&self) {
+        let end = self.state.with_project(|p| p.timeline.tracks.iter().map(|t| t.duration_us()).max().unwrap_or(0)).unwrap_or(0);
+        let length = match (self.range.selected(), self.state.mark_in.get(), self.state.mark_out.get()) {
+            (1, Some(a), Some(b)) if b > a => b - a,
+            _ => end,
+        };
+        for (f, button) in FORMATS.iter().zip(self.format_buttons.borrow().iter()) {
+            let Some(max) = f.max_bytes else { continue };
+            let fits = length <= 0 || bitrate_for_size(max, length, SIZE_LIMITED_AUDIO_KBPS).is_some();
+            button.set_sensitive(fits);
+            button.set_tooltip_text(Some(if fits {
+                "Up to 10 MB — picks the bitrate, and 720p when it must, so the file fits Discord's limit"
+            } else {
+                "Too long to fit in 10 MB and still look good. Set In and Out around a shorter part"
+            }));
+        }
     }
 
     fn refresh_settings(&self) {
@@ -322,7 +355,20 @@ impl ExportPage {
         let name = self.file_name.text().trim().to_string();
         let name = if name.is_empty() { project.name.clone() } else { name };
         let f = &FORMATS[self.format_index.get()];
-        let (_, crf, audio_kbps) = QUALITIES[self.quality.selected() as usize];
+        let (_, crf, mut audio_kbps) = QUALITIES[self.quality.selected() as usize];
+        let (mut width, mut height, mut max_video_kbps) = (f.width, f.height, None);
+        if let Some(max) = f.max_bytes {
+            let Some(kbps) = bitrate_for_size(max, r1 - r0, SIZE_LIMITED_AUDIO_KBPS) else {
+                self.state.message("This is too long to fit in 10 MB and still look good. Set In and Out around a shorter part.");
+                return false;
+            };
+            // Below about 1.5 Mb/s, 720p looks better than a starved 1080p. Portrait stays portrait.
+            (width, height) = if kbps < 1500 { (1280, 720) } else { (1920, 1080) };
+            if project.height > project.width {
+                (width, height) = (height, width);
+            }
+            (audio_kbps, max_video_kbps) = (SIZE_LIMITED_AUDIO_KBPS, Some(kbps));
+        }
 
         // Do not silently replace an existing file or an output already queued.
         let dir = PathBuf::from(self.location.text().as_str());
@@ -336,19 +382,21 @@ impl ExportPage {
 
         let chapters = if self.chapters.is_active() { chapters_from_markers(&project.timeline.markers, r0, r1) } else { Vec::new() };
         let settings = TimelineExport {
-            width: f.width,
-            height: f.height,
+            width,
+            height,
             crf,
             audio_kbps,
             fit: if self.fit.selected() == 1 { Fit::Fill } else { Fit::Fit },
             range,
             chapters,
             output,
-            hardware: self.state.settings.borrow().hardware_encode,
+            // A size limit needs the processor's encoder, which keeps to a bitrate exactly.
+            hardware: self.state.settings.borrow().hardware_encode && max_video_kbps.is_none(),
+            max_video_kbps,
         };
         self.jobs.borrow_mut().push(Job {
             name,
-            format: format!("{} · {} × {}", f.ratio, f.width, f.height),
+            format: format!("{} · {} × {}", f.ratio, width, height),
             settings,
             // A copy of the project as it is now: later edits do not change this job.
             project: Arc::new(project),
@@ -433,12 +481,19 @@ impl ExportPage {
         let page = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let cancel_flag = cancel.clone();
+            let limited = settings.max_video_kbps.is_some();
             let result = gio::spawn_blocking(move || {
                 export_timeline(&project, &settings, &cancel_flag, |p| progress.store((p * 1000.0) as u32, Ordering::Relaxed))
+                    .map(|()| std::fs::metadata(&settings.output).map(|m| m.len()).unwrap_or(0))
             })
             .await;
+            let limit = FORMATS.iter().find_map(|f| f.max_bytes).unwrap_or(u64::MAX);
             let (status, toast) = match result {
-                Ok(Ok(())) => (Status::Done, Some("Export finished".to_string())),
+                Ok(Ok(size)) if limited && size > limit => (
+                    Status::Done,
+                    Some(format!("Export finished, but it came out at {:.1} MB, over the 10 MB limit. Try a shorter part.", size as f64 / 1e6)),
+                ),
+                Ok(Ok(_)) => (Status::Done, Some("Export finished".to_string())),
                 _ if cancel.load(Ordering::Relaxed) => (Status::Cancelled, None),
                 Ok(Err(e)) => (Status::Failed(e.to_string()), Some("Export failed".to_string())),
                 Err(_) => (Status::Failed("The export stopped unexpectedly.".into()), Some("Export failed".to_string())),
@@ -742,7 +797,11 @@ fn format_button(f: &Format) -> gtk::ToggleButton {
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
     content.append(&shape);
     content.append(&label(f.ratio, &["tempo-heading"]));
-    content.append(&label(&format!("{} × {}", f.width, f.height), &["tempo-small"]));
+    let size = match f.max_bytes {
+        Some(_) => "720p or 1080p".to_string(),
+        None => format!("{} × {}", f.width, f.height),
+    };
+    content.append(&label(&size, &["tempo-small"]));
     content.append(&label(f.best_for, &["tempo-small"]));
     let button = gtk::ToggleButton::builder().child(&content).css_classes(["format"]).build();
     button.set_tooltip_text(Some(&format!("{} — best for {}", f.ratio, f.best_for)));

@@ -9,10 +9,11 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
-use tempo_timeline::{ClipType, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimEdge};
+use tempo_timeline::{ClipType, EditClipCommand, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, Timeline, TrackFlag, TrackKind, TrimEdge};
 use uuid::Uuid;
 
 use crate::actions::{self, Place};
+use crate::keybinds::HintZone;
 use crate::state::{timecode, AppState, Change, Tool};
 use crate::util::{css_color, label};
 use crate::viewer::Viewer;
@@ -26,6 +27,9 @@ const EDGE_GRAB_PX: f64 = 6.0;
 /// A press becomes a drag only after the pointer has travelled this far.
 const DRAG_START_PX: f64 = 4.0;
 const SNAP_PX: f64 = 8.0;
+/// Fade handles: how far from a clip's top corner they can be grabbed, and their size.
+const FADE_GRAB_PX: f64 = 7.0;
+const FADE_HANDLE_PX: f32 = 8.0;
 pub const MIN_PPS: f64 = 0.5;
 pub const MAX_PPS: f64 = 400.0;
 
@@ -39,6 +43,14 @@ pub struct Row {
     pub h: f32,
     pub locked: bool,
     pub enabled: bool,
+    pub solo: bool,
+}
+
+/// How many times the timeline canvas has been redrawn; reported by `stats` for benchmarks.
+static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn draw_count() -> u64 {
+    DRAWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Video tracks stack upward and audio tracks downward from the divider, as in Resolve.
@@ -52,7 +64,7 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
     let mut y = RULER_H;
     for (list, h) in [(video, VIDEO_H), (audio, AUDIO_H)] {
         for t in list {
-            out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled });
+            out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled, solo: t.solo });
             y += h;
         }
         if h == VIDEO_H {
@@ -68,6 +80,8 @@ enum Drag {
     Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid },
     /// `roll` moves the cut between two touching clips (Shift in Trim mode).
     Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
+    /// Dragging a fade handle: the fade length at the start of the drag and now.
+    Fade { clip: Uuid, edge: FadeEdge, from: i64, to: i64 },
 }
 
 mod imp {
@@ -86,6 +100,8 @@ mod imp {
         /// Modifier keys held when the pointer went down.
         pub press_mods: Cell<gdk::ModifierType>,
         pub pointer_x: Cell<f64>,
+        /// The clip under the pointer, which shows its fade handles.
+        pub hover: Cell<Option<Uuid>>,
         pub snap_line: Cell<Option<i64>>,
         pub hadj: gtk::Adjustment,
         pub zoom_listener: RefCell<Option<Box<dyn Fn(f64)>>>,
@@ -93,6 +109,9 @@ mod imp {
         pub fit_pending: Cell<bool>,
         /// The right-click menu while it is open.
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The playhead, drawn on its own layer above the canvas so moving it does
+        /// not redraw every clip.
+        pub playhead_layer: RefCell<Option<super::PlayheadLayer>>,
     }
 
     impl Default for TimelineCanvas {
@@ -108,11 +127,13 @@ mod imp {
                 dragging: Cell::new(false),
                 press_mods: Cell::new(gdk::ModifierType::empty()),
                 pointer_x: Cell::new(0.0),
+                hover: Cell::new(None),
                 snap_line: Cell::new(None),
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
                 zoom_listener: RefCell::new(None),
                 fit_pending: Cell::new(false),
                 menu: RefCell::new(None),
+                playhead_layer: RefCell::new(None),
             }
         }
     }
@@ -176,15 +197,15 @@ impl TimelineCanvas {
                     Change::Project => {
                         c.imp().scroll.set(0.0);
                         c.update_adjustment();
-                        c.queue_draw();
+                        c.redraw();
                     }
                     Change::Timeline => {
                         // An edit may have moved the playhead (after an insert, say).
                         c.imp().playhead.set(c.state().playhead_us());
                         c.update_adjustment();
-                        c.queue_draw();
+                        c.redraw();
                     }
-                    Change::Selection | Change::Options | Change::Waveform => c.queue_draw(),
+                    Change::Selection | Change::Options | Change::Waveform => c.redraw(),
                     _ => {}
                 }
             }
@@ -203,7 +224,7 @@ impl TimelineCanvas {
             if let Some(c) = c.upgrade() {
                 if (c.imp().scroll.get() - adj.value()).abs() > 0.5 {
                     c.imp().scroll.set(adj.value());
-                    c.queue_draw();
+                    c.redraw();
                 }
             }
         });
@@ -249,7 +270,7 @@ impl TimelineCanvas {
     fn set_scroll(&self, px: f64) {
         self.imp().scroll.set(px.max(0.0));
         self.update_adjustment();
-        self.queue_draw();
+        self.redraw();
     }
 
     /// Change zoom keeping the time under `anchor_x` in place.
@@ -299,7 +320,8 @@ impl TimelineCanvas {
             self.set_scroll(us as f64 / 1_000_000.0 * self.pps() - w * lead);
             return;
         }
-        self.queue_draw();
+        // Only the playhead moved: the clips need not be drawn again.
+        self.redraw_playhead();
     }
 
     fn row_at(&self, y: f64) -> Option<Row> {
@@ -391,6 +413,13 @@ impl TimelineCanvas {
 
     /// Run a pointer press, drag and release through the same handlers the mouse
     /// uses. For scripted checks of the editing gestures.
+    /// Like `point_for`, but at the top edge of the row, where fade handles are.
+    pub fn top_point_for(&self, seconds: f64, track: &str) -> Option<(f64, f64)> {
+        let (x, y) = self.point_for(seconds, track)?;
+        let row = self.row_at(y)?;
+        Some((x, row.y as f64 + 3.0))
+    }
+
     pub fn simulate_drag(&self, from: (f64, f64), to: (f64, f64), mods: gdk::ModifierType) {
         self.imp().press_mods.set(mods);
         self.on_press(from.0, from.1);
@@ -402,6 +431,22 @@ impl TimelineCanvas {
             }
         }
         self.on_release();
+    }
+
+    /// A fade handle under the pointer: near a clip's top corner, or where its fade
+    /// ends. Locked tracks have none.
+    fn fade_hit(&self, x: f64, y: f64) -> Option<(Uuid, FadeEdge, i64)> {
+        // Only the top strip of an unlocked row holds fade handles.
+        self.row_at(y).filter(|r| !r.locked && y - (r.y as f64) < 2.0 * FADE_GRAB_PX)?;
+        let (_, id, _) = [0.0, -FADE_GRAB_PX, FADE_GRAB_PX].into_iter().find_map(|dx| self.hit(x + dx, y))?;
+        let (tin, tout, fade_in, fade_out) = self.state().with_timeline(|t| {
+            t.find_clip(id).map(|(_, c)| (c.timeline_in, c.timeline_out, c.properties.fade_in_us, c.properties.fade_out_us))
+        })??;
+        [(FadeEdge::In, tin + fade_in, fade_in), (FadeEdge::Out, tout - fade_out, fade_out)]
+            .into_iter()
+            .filter(|(_, at, _)| (self.x_of(*at) - x).abs() <= FADE_GRAB_PX)
+            .min_by(|a, b| (self.x_of(a.1) - x).abs().total_cmp(&(self.x_of(b.1) - x).abs()))
+            .map(|(edge, _, length)| (id, edge, length))
     }
 
     fn install_controllers(&self) {
@@ -449,12 +494,34 @@ impl TimelineCanvas {
             if let Some(c) = c.upgrade() {
                 c.imp().pointer_x.set(x);
                 let tool = c.state().tool.get();
-                let cursor = match (tool, c.hit(x, y)) {
+                let hit = c.hit(x, y);
+                if c.imp().hover.replace(hit.as_ref().map(|(_, id, _)| *id)) != hit.as_ref().map(|(_, id, _)| *id) {
+                    c.redraw();
+                }
+                let zone = if y < RULER_H as f64 {
+                    Some(HintZone::Ruler)
+                } else if c.fade_hit(x, y).is_some() {
+                    Some(HintZone::FadeHandle)
+                } else {
+                    hit.as_ref().map(|(_, _, edge)| if edge.is_some() { HintZone::ClipEdge } else { HintZone::ClipBody })
+                };
+                c.state().hint(zone);
+                let cursor = match (tool, hit) {
                     (Tool::Blade, Some(_)) => Some("crosshair"),
+                    (Tool::Select | Tool::Trim, _) if c.fade_hit(x, y).is_some() => Some("ew-resize"),
                     (Tool::Select | Tool::Trim, Some((_, _, Some(_)))) => Some("col-resize"),
                     _ => None,
                 };
                 c.set_cursor_from_name(cursor);
+            }
+        });
+        let c = self.downgrade();
+        motion.connect_leave(move |_| {
+            if let Some(c) = c.upgrade() {
+                c.state().hint(None);
+                if c.imp().hover.take().is_some() {
+                    c.redraw();
+                }
             }
         });
         self.add_controller(motion);
@@ -501,6 +568,15 @@ impl TimelineCanvas {
         if y < RULER_H as f64 {
             *imp.drag.borrow_mut() = Some(Drag::Scrub);
             self.scrub(x);
+            return;
+        }
+
+        let plain = !imp.press_mods.get().contains(gdk::ModifierType::CONTROL_MASK);
+        if let Some((id, edge, length)) = self.fade_hit(x, y).filter(|_| plain && state.tool.get() != Tool::Blade) {
+            if !state.is_selected(id) {
+                state.select(Some(id));
+            }
+            *imp.drag.borrow_mut() = Some(Drag::Fade { clip: id, edge, from: length, to: length });
             return;
         }
 
@@ -595,6 +671,7 @@ impl TimelineCanvas {
                 clip_items.push((if enabled { "Turn Clip Off" } else { "Turn Clip On" }, "win.clip-enable-toggle"));
                 menu.append_section(None, &section(&clip_items));
                 menu.append_section(None, &section(&[("Fade In", "win.fade-in"), ("Fade Out", "win.fade-out"), ("Cross Dissolve", "win.transition-add")]));
+                menu.append_section(None, &section(&[("Change Clip Speed…", "win.clip-speed")]));
             }
             None => {
                 let gap = self.row_at(y).and_then(|row| actions::gap_at(&state, row.track_id, self.us_at(x)));
@@ -647,6 +724,10 @@ impl TimelineCanvas {
         let delta_us = ((x - px) / self.pps() * 1_000_000.0) as i64;
         let mut drag = imp.drag.borrow_mut();
         match drag.as_mut() {
+            Some(Drag::Fade { edge, from, to, .. }) => {
+                // Toward the middle of the clip lengthens the fade.
+                *to = (*from + if *edge == FadeEdge::In { delta_us } else { -delta_us }).max(0);
+            }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
                 let raw = (*orig_in + delta_us).max(0);
                 let moving = self.moving_with(*clip);
@@ -679,10 +760,13 @@ impl TimelineCanvas {
                         let footage = p.sources.get(&c.source_id).map(|s| s.duration_us).filter(|d| !still && *d > 0);
                         let before = track.clips.iter().map(|o| o.timeline_out).filter(|o| *o <= c.timeline_in).max().unwrap_or(0);
                         let after = track.clips.iter().map(|o| o.timeline_in).filter(|o| *o >= c.timeline_out).min();
-                        Some((c.timeline_in, c.timeline_out, c.source_in, c.source_out, still, footage, before, after))
+                        // Unused footage before and after the clip, in timeline time at its speed.
+                        let head = c.to_timeline_floor_us(c.source_in);
+                        let tail = footage.map(|d| c.to_timeline_floor_us((d - c.source_out).max(0)));
+                        Some((c.timeline_in, c.timeline_out, head, tail, still, before, after))
                     })
                     .flatten();
-                let Some((tin, tout, source_in, source_out, still, footage, before, after)) = facts else { return };
+                let Some((tin, tout, head, tail, still, before, after)) = facts else { return };
                 let base = if *edge == TrimEdge::In { tin } else { tout };
                 let moving = self.moving_with(*clip);
                 let (target, hit) = self.snap(base + delta_us, &moving);
@@ -695,11 +779,11 @@ impl TimelineCanvas {
                 let makes_room = state.tool.get() == Tool::Trim && !*roll;
                 let (low, high) = match edge {
                     TrimEdge::In => {
-                        let footage_low = if still { 0 } else { tin - source_in };
+                        let footage_low = if still { 0 } else { tin - head };
                         (footage_low.max(if makes_room { 0 } else { before }), tout - frame)
                     }
                     TrimEdge::Out => {
-                        let footage_high = footage.map_or(i64::MAX, |d| tout + (d - source_out).max(0));
+                        let footage_high = tail.map_or(i64::MAX, |room| tout + room);
                         (tin + frame, footage_high.min(if makes_room { i64::MAX } else { after.unwrap_or(i64::MAX) }))
                     }
                 };
@@ -708,7 +792,7 @@ impl TimelineCanvas {
             _ => return,
         }
         drop(drag);
-        self.queue_draw();
+        self.redraw();
     }
 
     fn on_release(&self) {
@@ -732,6 +816,12 @@ impl TimelineCanvas {
                     state.execute(Box::new(MoveClipCommand::new(clip, from_track, to_track, orig_in, new_in)));
                 }
             }
+            Some(Drag::Fade { clip, edge, from, to }) if to != from => {
+                let edited = state.with_project(|p| p.timeline.find_clip(clip).map(|(_, c)| c.with_fade(edge, to, p.fps))).flatten();
+                if let Some(edited) = edited {
+                    state.execute(Box::new(EditClipCommand::new(if edge == FadeEdge::In { "Fade In" } else { "Fade Out" }, edited)));
+                }
+            }
             // Trim mode ripples (later clips follow), or rolls the cut with Shift.
             // Selection mode leaves a gap.
             Some(Drag::Trim { clip, edge, delta, roll }) if delta != 0 => {
@@ -745,7 +835,7 @@ impl TimelineCanvas {
             }
             _ => {}
         }
-        self.queue_draw();
+        self.redraw();
     }
 
     // ---- Drawing -------------------------------------------------------------
@@ -771,12 +861,13 @@ impl TimelineCanvas {
 
     /// Draw the loudness of a clip as vertical bars, one every two pixels, only
     /// for the part of the clip that is on screen.
+    /// `speed` is the clip's: each pixel of timeline covers that much more (or less) sound.
     #[allow(clippy::too_many_arguments)]
-    fn draw_waveform(&self, s: &gtk::Snapshot, peaks: &[u8], source_start_us: i64, x: f32, y: f32, width: f32, height: f32, view_w: f32) {
+    fn draw_waveform(&self, s: &gtk::Snapshot, peaks: &[u8], source_start_us: i64, speed: f64, x: f32, y: f32, width: f32, height: f32, view_w: f32) {
         const PEAKS_PER_SECOND: f64 = 50.0;
         let color = css_color(self, "tempo_clip_text");
         let color = gdk::RGBA::new(color.red(), color.green(), color.blue(), 0.85);
-        let us_per_px = 1_000_000.0 / self.pps();
+        let us_per_px = 1_000_000.0 / self.pps() * speed;
         let mid = y + height / 2.0;
         let mut px = (-x).max(0.0);
         let end = width.min(view_w - x);
@@ -792,6 +883,7 @@ impl TimelineCanvas {
     }
 
     fn draw(&self, s: &gtk::Snapshot) {
+        DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (w, h) = (self.width() as f32, self.height() as f32);
         let state = self.state();
         let imp = self.imp();
@@ -905,16 +997,22 @@ impl TimelineCanvas {
                     ClipType::Title => ("tempo_clip_title", "tempo_clip_title"),
                     _ => ("tempo_clip_video_top", "tempo_clip_video"),
                 };
+                // Like Resolve, a clip with adjustments or filters is a darker shade.
+                let shaded = |name: &str| {
+                    let c = color(name);
+                    let k = if clip.properties.is_modified() { 0.82 } else { 1.0 };
+                    gdk::RGBA::new(c.red() * k, c.green() * k, c.blue() * k, c.alpha())
+                };
                 let rounded = gsk::RoundedRect::from_rect(body, 3.0);
                 s.push_rounded_clip(&rounded);
-                s.append_color(&color(top), &body);
+                s.append_color(&shaded(top), &body);
                 let bar_y = body.y() + body.height() - NAME_BAR_H;
                 if clip.clip_type == ClipType::Audio {
                     if let Some(peaks) = state.waveforms.borrow().get(&clip.source_id) {
-                        self.draw_waveform(s, peaks, clip.source_in + (tin - clip.timeline_in), x0, body.y(), x1 - x0, bar_y - body.y(), w);
+                        self.draw_waveform(s, peaks, clip.source_offset_at(tin), clip.properties.speed, x0, body.y(), x1 - x0, bar_y - body.y(), w);
                     }
                 }
-                s.append_color(&color(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
+                s.append_color(&shaded(bar), &rect(body.x(), bar_y, body.width(), NAME_BAR_H));
                 // The name stays readable while the start of the clip is off screen.
                 let mut name_x = x0.max(0.0) + 6.0;
                 if clip.properties.link.is_some() && x1 - name_x > 40.0 {
@@ -925,7 +1023,12 @@ impl TimelineCanvas {
                     }
                     name_x += 18.0;
                 }
-                self.text(s, &clip.name, name_x, bar_y + 3.0, &white, true, x1 - name_x - 4.0);
+                // A retimed clip says its speed, as Resolve marks it.
+                let name = match clip.properties.speed {
+                    s if s != 1.0 => format!("{}  {}%", clip.name, (s * 100.0).round()),
+                    _ => clip.name.clone(),
+                };
+                self.text(s, &name, name_x, bar_y + 3.0, &white, true, x1 - name_x - 4.0);
                 if !row.enabled || !clip.properties.enabled {
                     s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.6), &body);
                 }
@@ -938,10 +1041,44 @@ impl TimelineCanvas {
                 s.pop();
                 // A cross dissolve is marked by a box reaching back over the previous clip.
                 if clip.properties.dissolve_in_us > 0 && track.has_clip_ending_at(clip.timeline_in) {
-                    let lead = (clip.properties.dissolve_in_us.min(clip.source_in) as f64 / 1_000_000.0 * self.pps()) as f32;
+                    let lead = (clip.properties.dissolve_in_us.min(clip.to_timeline_floor_us(clip.source_in)) as f64 / 1_000_000.0 * self.pps()) as f32;
                     let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
                     s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
                     s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);
+                }
+                // Fades: a ramp from the corner down to where the fade ends, and handles
+                // on the clip under the pointer.
+                let (mut fade_in, mut fade_out) = (clip.properties.fade_in_us, clip.properties.fade_out_us);
+                if let Some(Drag::Fade { clip: id, edge, to, .. }) = &dragging {
+                    if *id == clip.id {
+                        let preview = clip.with_fade(*edge, *to, state.with_project(|p| p.fps).unwrap_or_default());
+                        (fade_in, fade_out) = (preview.properties.fade_in_us, preview.properties.fade_out_us);
+                    }
+                }
+                let (top, bottom) = (body.y(), bar_y);
+                for (corner, end, length) in [(x0, self.x_of(tin + fade_in) as f32, fade_in), (x1, self.x_of(tout - fade_out) as f32, fade_out)] {
+                    if length <= 0 {
+                        continue;
+                    }
+                    let shade = gsk::PathBuilder::new();
+                    shade.move_to(corner, top);
+                    shade.line_to(end, top);
+                    shade.line_to(corner, bottom);
+                    shade.close();
+                    s.append_fill(&shade.to_path(), gsk::FillRule::Winding, &gdk::RGBA::new(0.0, 0.0, 0.0, 0.35));
+                    let ramp = gsk::PathBuilder::new();
+                    ramp.move_to(corner, bottom);
+                    ramp.line_to(end, top);
+                    s.append_stroke(&ramp.to_path(), &gsk::Stroke::new(1.5), &white);
+                }
+                let hovered = imp.hover.get() == Some(clip.id) || matches!(&dragging, Some(Drag::Fade { clip: id, .. }) if *id == clip.id);
+                if hovered && !row.locked {
+                    for at in [self.x_of(tin + fade_in) as f32, self.x_of(tout - fade_out) as f32] {
+                        let x = (at - FADE_HANDLE_PX / 2.0).clamp(x0, (x1 - FADE_HANDLE_PX).max(x0));
+                        let handle = gsk::RoundedRect::from_rect(rect(x, top + 1.0, FADE_HANDLE_PX, FADE_HANDLE_PX), 2.0);
+                        s.append_color(&white, handle.bounds());
+                        s.append_border(&handle, &[1.0; 4], &[gdk::RGBA::new(0.0, 0.0, 0.0, 0.6); 4]);
+                    }
                 }
                 if state.is_selected(clip.id) {
                     s.append_border(&rounded, &[2.0; 4], &[accent; 4]);
@@ -988,17 +1125,76 @@ impl TimelineCanvas {
             }
         }
 
-        // Snap guide and playhead.
+        // Snap guide. The playhead is drawn by `PlayheadLayer`.
         if let Some(us) = imp.snap_line.get() {
             s.append_color(&white, &rect(self.x_of(us) as f32, RULER_H, 1.0, h - RULER_H));
         }
-        let px = self.x_of(imp.playhead.get()) as f32;
+    }
+
+    fn draw_playhead(&self, s: &gtk::Snapshot) {
+        let (w, h) = (self.width() as f32, self.height() as f32);
+        let accent = css_color(self, "tempo_accent");
+        let rect = |x, y, w, h| graphene::Rect::new(x, y, w, h);
+        let px = self.x_of(self.imp().playhead.get()) as f32;
         if px >= -8.0 && px <= w + 8.0 {
             s.append_color(&accent, &rect(px, 0.0, 1.0, h));
             s.append_color(&accent, &rect(px - 6.0, RULER_H - 16.0, 13.0, 10.0));
             s.append_color(&accent, &rect(px - 3.0, RULER_H - 6.0, 7.0, 3.0));
         }
     }
+
+    /// Redraw the canvas and the playhead above it.
+    fn redraw(&self) {
+        self.queue_draw();
+        self.redraw_playhead();
+    }
+
+    fn redraw_playhead(&self) {
+        if let Some(layer) = self.imp().playhead_layer.borrow().as_ref() {
+            layer.queue_draw();
+        }
+    }
+
+    /// The layer that shows this canvas's playhead; place it over the canvas.
+    pub fn playhead_layer(&self) -> PlayheadLayer {
+        let layer: PlayheadLayer = glib::Object::builder().build();
+        layer.set_can_target(false);
+        layer.set_overflow(gtk::Overflow::Hidden);
+        layer.imp().canvas.set(Some(self));
+        *self.imp().playhead_layer.borrow_mut() = Some(layer.clone());
+        layer
+    }
+}
+
+mod layer_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct PlayheadLayer {
+        pub canvas: glib::WeakRef<super::TimelineCanvas>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PlayheadLayer {
+        const NAME: &'static str = "TempoPlayheadLayer";
+        type Type = super::PlayheadLayer;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for PlayheadLayer {}
+
+    impl WidgetImpl for PlayheadLayer {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(canvas) = self.canvas.upgrade() {
+                canvas.draw_playhead(snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct PlayheadLayer(ObjectSubclass<layer_imp::PlayheadLayer>)
+        @extends gtk::Widget, @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 /// Canvas, scrollbar, and the column of track headers to its left.
@@ -1033,7 +1229,9 @@ impl TimelineArea {
         viewer.connect_position(move |_| timecode_label.set_text(&timecode(s.playhead_us(), s.fps())));
 
         let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        right.append(&canvas);
+        let stack = gtk::Overlay::builder().child(&canvas).build();
+        stack.add_overlay(&canvas.playhead_layer());
+        right.append(&stack);
         right.append(&gtk::Scrollbar::new(gtk::Orientation::Horizontal, Some(&canvas.hadjustment())));
 
         let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).vexpand(true).build();
@@ -1096,7 +1294,6 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.emit(Change::Options);
         });
         header.append(&name);
-        header.append(&gtk::Box::builder().hexpand(true).build());
 
         let lock = gtk::ToggleButton::builder()
             .icon_name(if row.locked { "changes-prevent-symbolic" } else { "changes-allow-symbolic" })
@@ -1110,6 +1307,22 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Locked, b.is_active())));
         });
         header.append(&lock);
+
+        // Resolve has Solo on audio tracks only: while any is on, playback hears just those.
+        if row.kind == TrackKind::Audio {
+            let solo = gtk::ToggleButton::builder()
+                .label("S")
+                .tooltip_text("Solo: hear only this track while playing. Export is not affected")
+                .active(row.solo)
+                .css_classes(["tool", "track-solo"])
+                .valign(gtk::Align::Center)
+                .build();
+            let s = state.clone();
+            solo.connect_toggled(move |b| {
+                s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Solo, b.is_active())));
+            });
+            header.append(&solo);
+        }
 
         let (icon_on, icon_off, tip) = match row.kind {
             TrackKind::Video => ("view-reveal-symbolic", "view-conceal-symbolic", "Show or hide this video track"),
@@ -1127,6 +1340,8 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.execute(Box::new(SetTrackFlagCommand::new(row.track_id, TrackFlag::Enabled, b.is_active())));
         });
         header.append(&enable);
+        // Controls sit left, as in Resolve, so Lock lines up on every row.
+        header.append(&gtk::Box::builder().hexpand(true).build());
 
         container.append(&header);
     }

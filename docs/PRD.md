@@ -1,6 +1,6 @@
 # Product Requirements — Tempo
 
-**Version:** 2.0 (2026-10-03)
+**Version:** 2.1 (2026-10-21)
 **Replaces:** version 1.0 (Cut page + Edit page, WASM plugins).
 
 ---
@@ -90,9 +90,13 @@ There is no separate Cut page.
 ### 7.1 Projects
 - Project Manager with thumbnails, search, rename, duplicate, move to trash.
 - New project: name, shape (landscape, vertical, square), resolution, frame rate.
-- "Match project to first clip" prompt.
+- "Change Project Frame Rate?" prompt, as in Resolve: the first video brought into an empty
+  project offers to set the project to its size and frame rate.
 - One project is one `.tempo` file. Source media is never copied into it.
 - Autosave (default every 2 minutes) and recovery after a crash.
+- Project backups, kept like Resolve's: one every 10 minutes while editing, thinned to 6 from
+  the last hour, one per hour for up to 8 hours of today and one per day for 5 days. Each is checked before it
+  is kept, and opens as a copy from the Project Manager.
 - Missing-media detection with relink.
 
 ### 7.2 Media
@@ -110,21 +114,27 @@ There is no separate Cut page.
 - Insert, Overwrite, Replace, Place on Top, Append.
 - Move, trim, ripple trim, roll, split, delete, ripple delete, copy, paste, duplicate.
 - Snapping. Linked video and audio, with a linked-selection switch.
-- Enable/disable clip. Lock track. Hide video track, mute audio track.
+- Enable/disable clip. Lock track. Hide video track, mute or solo audio track (solo is for
+  listening only; export includes every enabled track).
+- Change Clip Speed (`R`): 25–400 %, with Ripple Sequence. Linked sound follows the picture.
 - Source clips can be previewed and given In/Out points before placing.
 - Undo and redo for every change (100 steps).
 
 ### 7.4 Picture and sound
 - Transform per clip: zoom, position, rotation. Opacity.
-- Transitions: Cross Dissolve, Dip to Colour. Fade in and fade out handles on every clip.
+- Transitions: Cross Dissolve, Dip to Colour. Fade in and fade out handles on every clip,
+  dragged on the timeline and snapped to whole frames.
 - Titles: Text and Lower Third, with font, size, colour, background and position.
 - Volume and pan per clip. Audio fades. Waveforms. Output level meter.
 
 ### 7.5 Playback
 - `J` `K` `L`, frame step, loop, play In to Out.
-- Full, Half and Quarter playback quality.
+- Full, Half and Quarter playback quality. While playback can't keep up, decoding gets
+  cheaper by itself (no deblocking, half height) and returns to full quality when playback
+  stops or seeks.
 - Automatic small-size proxies for footage the machine cannot play smoothly, made in the
-  background and only when needed. Export always uses the original files.
+  background and only when needed: only for footage on the timeline, on the graphics chip when
+  it can, with the clip's sound. Export always uses the original files.
 - Full-screen viewer.
 
 ### 7.6 Markers and chapters
@@ -137,6 +147,8 @@ There is no separate Cut page.
 - Export page with formats chosen by frame ratio, each labelled with what it suits:
   16:9 (YouTube), 9:16 (TikTok, Reels, Shorts), 1:1 and 4:5 (Instagram), Custom.
   No platform logos.
+- A "≤ 10 MB" format (Discord, email) that picks the bitrate, and 720p when needed, so the
+  file fits. It is greyed out when the export is too long to fit and still look good.
 - Render queue: several outputs of the same project in different sizes and formats, rendered
   one after another while editing continues.
 - Export the whole timeline or the In–Out range.
@@ -151,8 +163,11 @@ There is no separate Cut page.
 - Plugins dialog: install, enable, see permissions, remove.
 
 ### 7.9 Settings
-- Font scale, autosave interval, default playback quality, hardware decoding, automatic
-  proxies, cache size and location.
+- Font scale, autosave interval, default playback quality, hardware decoding, hardware
+  encoding for export, automatic proxies, cache size and location.
+- Tempo checks at start-up whether hardware decoding and encoding work. Switches the machine
+  can't use are greyed out with the reason; saved settings it can't honour are switched off,
+  and the user is told once.
 - Shortcuts are shown but not remappable in 1.0.
 
 ---
@@ -168,7 +183,7 @@ There is no separate Cut page.
 | Remove silence, other timeline automation | Script plugins |
 | EDL / FCPXML export for moving a project to Resolve | Script plugin after 1.0 |
 | Noise reduction, auto subtitles (AI) | Optional helper after 1.0 |
-| Speed changes, slip and slide, dynamic trim | After 1.0; their Resolve keys are reserved |
+| Retime controls, slip and slide, dynamic trim | After 1.0; their Resolve keys are reserved. Change Clip Speed (`R`) is in the core |
 | Multicam, colour grading, audio mixing, node compositing | Never; use Resolve |
 
 ---

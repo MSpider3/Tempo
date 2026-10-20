@@ -1,6 +1,6 @@
 //! Media Pool: the files imported into the project.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -265,7 +265,10 @@ impl MediaPool {
         if self.state.project.borrow().is_none() {
             return;
         }
+        // Resolve asks once, for media brought into an empty Media Pool.
+        let may_offer = Rc::new(Cell::new(self.state.with_project(|p| p.sources.is_empty()).unwrap_or(false)));
         for path in paths {
+            let may_offer = may_offer.clone();
             let already = self.state.with_project(|p| p.sources.values().any(|s| s.path == path)).unwrap_or(false);
             if already {
                 continue;
@@ -277,6 +280,7 @@ impl MediaPool {
                 match probed {
                     Ok(Ok(mut source)) => {
                         let state = &pool.state;
+                        let offer = may_offer.get().then(|| state.with_project(|p| p.first_import_offer(&source)).flatten()).flatten();
                         if let Some(p) = state.project.borrow_mut().as_mut() {
                             source.import_order = p.sources.len() as u32;
                             p.sources.insert(source.id, source);
@@ -284,6 +288,10 @@ impl MediaPool {
                         state.sync_player();
                         state.set_dirty(true);
                         state.emit(Change::Media);
+                        if let Some(offer) = offer {
+                            may_offer.set(false);
+                            pool.offer_format(offer);
+                        }
                     }
                     Ok(Err(e)) => {
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -293,6 +301,43 @@ impl MediaPool {
                 }
             });
         }
+    }
+
+    /// Resolve's "Change Project Frame Rate?" for the first video in an empty project.
+    fn offer_format(&self, offer: tempo_timeline::FormatOffer) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        let rate = |f: tempo_timeline::RationalFps| format!("{:.3}", f.to_f64()).trim_end_matches('0').trim_end_matches('.').to_string();
+        let Some((w, h, fps)) = self.state.with_project(|p| (p.width, p.height, p.fps)) else { return };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Change Project Frame Rate?")
+            .body(format!(
+                "This clip is {} × {} at {} fps. The project is {w} × {h} at {} fps.\n\nChange the project to match? It can't be changed once clips are on the timeline.",
+                offer.width,
+                offer.height,
+                rate(offer.fps),
+                rate(fps)
+            ))
+            .build();
+        dialog.add_responses(&[("keep", "Don't Change"), ("change", "Change")]);
+        dialog.set_response_appearance("change", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("change"));
+        dialog.set_close_response("keep");
+        let state = self.state.clone();
+        dialog.connect_response(Some("change"), move |_, _| {
+            // Not undoable, as in Resolve; the project is empty, so nothing is lost.
+            let applied = state.project.borrow_mut().as_mut().map(|p| p.apply_format(&offer));
+            match applied {
+                Some(Ok(())) => {
+                    state.sync_player();
+                    state.set_dirty(true);
+                    state.emit(Change::Project);
+                }
+                Some(Err(e)) => state.message(e.to_string()),
+                None => {}
+            }
+        });
+        dialog.present(self.window.upgrade().as_ref());
     }
 
     fn reload(&self) {

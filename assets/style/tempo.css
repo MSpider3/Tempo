@@ -30,7 +30,8 @@
 @define-color tempo_clip_video_top   #3b688e;
 @define-color tempo_clip_audio       #448f64;
 @define-color tempo_clip_audio_wave  #397955;
-@define-color tempo_clip_title       #8a6fb0;
+/* Resolve's default clip colours: video steel blue, audio light green, text beige. */
+@define-color tempo_clip_title       #9c8a68;
 @define-color tempo_track_edge_video #345b7b;
 @define-color tempo_track_edge_audio #356d4d;
 @define-color tempo_clip_text        #ffffff;
@@ -218,6 +219,10 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .track-name     { font-weight: 600; color: @tempo_text; min-width: 30px; min-height: 22px;
                   border: 1px solid transparent; border-radius: 2px; margin-left: 8px; }
 .track-name.destination { border-color: @tempo_accent; color: @tempo_text_bright; }
+/* Compact, so Lock, Solo and Mute fit the header column. */
+.track-header button.tool { min-width: 24px; padding: 0 2px; }
+.tempo button.tool.track-solo { font-weight: 700; }
+.tempo button.tool.track-solo:checked { color: @tempo_bg_deep; background-color: @tempo_warn; }
 .track-divider  { background-color: @tempo_line_soft; min-height: 2px; }
 
 /* ---- Export page ----------------------------------------------------- */

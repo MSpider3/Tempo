@@ -445,6 +445,16 @@
   },
   {
    "group": "Editing",
+   "action": "win.clip-speed",
+   "keys": [
+    "r"
+   ],
+   "alt": [],
+   "label": "Change Clip Speed",
+   "resolve": "clipChangeClipSpeed"
+  },
+  {
+   "group": "Editing",
    "action": "win.cut",
    "keys": [
     "<Primary>x"

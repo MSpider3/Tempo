@@ -12,12 +12,22 @@
 - Smooth playback comes before features. If a later phase makes playback worse, stop and fix.
 - No time estimates. Each phase is done when its checks pass.
 
-### Where the code is today (updated 2026-10-05)
+### Where the code is today (updated 2026-10-21, version 0.2.0 alpha)
 
 Boxes ticked below are built and were checked by tests or by running the app. A box is left
 open if any part of its line is missing.
 
-**Measured** on the development machine, an Intel Core i3-1005G1 (2 cores, 4 threads,
+**0.2.0 alpha (2026-10-21)** added, as in DaVinci Resolve: Change Clip Speed on `R`
+(25–400 %, Ripple Sequence, linked sound follows, pitch moves with speed), fade handles on
+timeline clips, Solo on audio track headers, the Change Project Frame Rate? offer on the
+first clip, and rolling Project Backups. It also added a ≤ 10 MB export card, shortcut hints
+in the bottom bar, and the playback benchmark (`scripts/bench_playback.sh`,
+[`PERF.md`](PERF.md)). Playback work: cheaper decoding while playback can't keep up, the
+playhead on its own layer (no timeline redraw per frame), shared frames, proxies only for
+footage on the timeline (with sound, on the graphics chip when it can), and a start-up
+check of hardware video support. The full list is in `CHANGELOG.md` under `[0.2.0]`.
+
+**Measured (0.1.1)** on the development machine, an Intel Core i3-1005G1 (2 cores, 4 threads,
 integrated graphics), release build, with a 2400 × 1080 HEVC variable-frame-rate phone
 recording:
 
@@ -33,7 +43,8 @@ recording:
 | Program size | 4.4 MB |
 
 This is a newer i3 than the i3-6100 reference machine, and it has more memory, so the
-reference machine still needs its own run.
+reference machine still needs its own run. The 0.2.0 playback numbers, made with
+`scripts/bench_playback.sh` on the same laptop, are in [`PERF.md`](PERF.md).
 
 **First hands-on test (2026-10-06).** The owner used 0.1.0 and reported eleven problems;
 all are fixed in 0.1.1 except one that could not be reproduced: the Inspector and Quick
@@ -52,17 +63,19 @@ has still not sat down and used it.
 
 | Gap | Note |
 |---|---|
-| Hardware decode and encode | Built with automatic fallback, but off by default: the development machine's VA-API driver does not start, so only the fallback could be tested |
-| Plugins | Lua commands, filters (colour and blur recipes) and upload targets work. Not built: shader effects and transitions, title and export-preset packs, file access, an uploader for a real site (each needs its own developer keys), the `.tempo-plugin` archive (plugins install from a folder) |
+| Hardware decode and encode | Built with automatic fallback; a start-up check switches off what the machine can't do. Tested with the `iHD` driver in 0.2.0: VA-API decoding halves CPU but drops more frames at 4K (frames are copied back from graphics memory), so it stays off by default (`PERF.md`). Proxies are made on the graphics chip when the check finds VA-API encoding works |
+| DMA-BUF zero-copy display | Not built. Now measurable on the development machine; see the P1-T7 line in `PERF.md` for the test and the bar to keep it |
+| Plugins | Lua commands, filters (colour and blur recipes) and upload targets work. Not built: shader effects, and transitions, title templates and export presets as plugin types; file access, an uploader for a real site (each needs its own developer keys), the `.tempo-plugin` archive (plugins install from a folder) |
+| Change Clip Speed | Built in 0.2.0. Not built: Reverse, Freeze Frame and Pitch Correction (the pitch always moves with the speed) |
+| Auto Track Selector | Not built; deferred |
 | Project Settings window, duplicate clip, track add/remove | Not built |
 | Export | Uses the `ffmpeg` program, not the libraries. This is deliberate: it is robust and keeps Tempo small |
-| Proxies | Made for all heavy footage on import, not only when playback drops frames |
+| Proxies | Since 0.2.0 made only for heavy footage that is on the timeline, but not only when playback drops frames |
 | A/V sync | Picture follows the audio clock; the 40 ms target has not been measured |
 | Roll trim | Uses Shift in Trim mode, not Resolve's click-on-the-cut |
 | Inspector with several clips selected | Edits only the first clip; the title says "+N more" |
 | Title rotation | Shown in the viewer, ignored by export |
 | Render queue | A job keeps the project as it was when queued, so Retry after fixing the timeline renders the old state; jobs from a closed project stay listed |
-| Timeline drawing | The whole canvas is redrawn on each playhead move; not yet measured as a cost |
 | Frame grid in older projects | Positions made before 0.1.1 sit a fraction of a microsecond per frame early; past about five minutes they can read one frame low |
 | Keys listed in `KEYBINDS.md` but not built | Play again, loop, play around, play In to Out, audio scrubbing, mark selection, ripple overwrite, join clip, paste insert, select forward/backward, video-only and audio-only transition, select edit point, viewer fit/actual size/full page, source/timeline viewer focus, project settings, save as, new bin |
 | Silent cases | Importing a file twice says nothing; an empty export location writes to the working folder |
@@ -79,6 +92,7 @@ has still not sat down and used it.
 - [x] Real VA-API decode with automatic fallback to software.
 - [ ] Viewer shows frames without a round trip through CPU memory: `GdkDmabufTexture` in
       `GtkGraphicsOffload` when hardware decode is active, YUV upload otherwise.
+      *(Not built. Measurable on the development machine since 0.2.0; see `PERF.md`.)*
 - [x] Real PipeWire output. Audio is the clock; video follows it.
 - [ ] Look-ahead that fills a small frame cache (frames kept in YUV).
 - [x] Scrubbing: keyframes while dragging, exact frame on pause or release.
@@ -148,10 +162,12 @@ has still not sat down and used it.
 
 - [ ] Inspector: Transform, Composite, Audio, Title, Transition, Marker sections.
 - [ ] Live preview while dragging a value; one undo step per drag.
-- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades. *(Cross dissolve, fades and audio fades are built; fades are set in the Inspector and Effects panel, not by handles.)*
+- [ ] Cross Dissolve and Dip to Colour; fade handles on clips; audio fades. *(Cross dissolve, fades and audio fades are built. Fade handles on timeline clips are built in 0.2.0. Dip to Colour is not built.)*
 - [x] Title clips: Text and Lower Third.
 - [x] Vertical-project layout.
 - [ ] Automatic small proxies, made only when playback drops frames, paused during playback.
+      *(Since 0.2.0 made only for heavy footage on the timeline, with sound, and paused
+      during playback; not yet tied to dropped frames.)*
 - [x] Export page: presets, settings, viewer with range, render queue.
 - [ ] Export engine in-process (no `ffmpeg` program): timeline video and mixed audio,
       correct colour tagging, hardware encode when available.
@@ -227,7 +243,7 @@ has still not sat down and used it.
 | Direct upload — YouTube first | Upload plugin (`network`, `secrets`, OAuth) |
 | Keyframes | New plugin point; separate bottom panel as in Resolve 20+ |
 | EDL / FCPXML export to Resolve | Script plugin |
-| Speed changes, slip/slide, dynamic trim | Core, on their Resolve keys |
+| Speed changes, slip/slide, dynamic trim | Core, on their Resolve keys. Change Clip Speed (`R`) is built in 0.2.0; Retime Controls, Freeze Frame and Reverse are not |
 | Subtitles | Core track type plus importer plugins |
 | Noise reduction, auto subtitles | Optional AI helper |
 | Remappable keys | Preferences |

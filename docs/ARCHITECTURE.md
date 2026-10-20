@@ -1,23 +1,41 @@
 # Technical Architecture Document — Tempo 2
 
-> **Status (2026-10-03): partly out of date.** This document was written for version 1.0.
+> **Status (2026-10-21): partly out of date.** This document was written for version 1.0.
 > The product and interface documents were rewritten on 2026-10-03 and take priority.
+> Measured playback numbers are in `PERF.md`.
 >
 > Superseded here:
+> - **Crates** (§2, §11): there are nine — `tempo-timeline`, `-media`, `-audio`, `-proxy`,
+>   `-export`, `-plugin`, `-project`, `-ui`, `-app`. There is no `tempo-render` or
+>   `tempo-compute`, and no wgpu, Skia, tokio, rubato or rubberband. `tempo-proxy` depends
+>   on `tempo-export` for its `ffmpeg` helpers.
 > - **Plugins** (§1 diagram, §3 crate table, §9, §10): the runtime is now sandboxed Lua, not
 >   wasmtime. There is no Python compute server in 1.0. See `PLUGIN_SPEC.md`.
 > - **Pages**: there is one Edit page and one Export page; no Cut page. See `UI_SPEC.md`.
+> - **Threads** (§4): see §4.4 for the threads the code runs.
+> - **Viewer** (§7.1–7.2): there is no render thread. The playback worker decodes and GTK
+>   draws the layers (§4.4).
 > - **Timeline drawing** (§7.4): the timeline is a custom GTK widget drawn in `snapshot()`.
->   Skia is not needed for it.
+>   Skia is not needed for it. The playhead is drawn by a separate overlay widget
+>   (`PlayheadLayer` in `crates/tempo-ui/src/timeline.rs`), so moving it redraws only that
+>   layer. The canvas is redrawn when clips, scroll or zoom change: about 30 redraws a
+>   second during playback became none.
+> - **Audio** (§8): see the note at the top of §8.
 > - **Transitions** (§7.3): fragment shaders, not compute shaders, so they work on the
 >   OpenGL ES fallback.
 > - **Thread messaging** (§4.2): use `async-channel` with `spawn_local`;
 >   `glib::MainContext::channel` no longer exists.
+> - **App state** (§5): the project, command log and settings live on the GTK thread
+>   (`AppState` in `crates/tempo-ui/src/state.rs`, in `RefCell`s). Workers get snapshots:
+>   playback an immutable `Snapshot`, export a copy of the project.
 >
 > Still to be redesigned (open problems, not yet rewritten):
-> - How decoded frames reach the screen without a GPU → CPU → GPU copy.
-> - Timeline state shared as `Arc<RwLock<Project>>`; workers should get snapshots instead.
-> - The memory table in §10 leaves out decoder buffers and export.
+> - How decoded frames reach the screen without a GPU → CPU → GPU copy. Software-decoded
+>   frames are shared (`Arc`) from the decoder to the GTK texture without another copy, but
+>   hardware-decoded frames are still copied back from graphics memory. A DMA-BUF
+>   (zero-copy) spike was not implemented (`PERF.md`, P1-T7).
+> - The memory table in §10 leaves out decoder buffers and export. Measured peak memory
+>   while playing stays under 0.5 GB (`PERF.md`).
 
 **Version:** 1.0  
 **Status:** Approved  
@@ -184,6 +202,30 @@ The following is forbidden on the UI thread:
 - Network/IPC calls
 - Any operation that could take > 1 ms
 
+### 4.4 Threads in the Code
+
+What runs where today (the table in §4.1 is the 1.0 design):
+
+| Thread | Where | What it does |
+|---|---|---|
+| GTK main | `tempo-ui` | Widgets, input, commands, drawing. Blocking work goes to `gio::spawn_blocking` from a `spawn_local` future. |
+| `tempo-playback` | `crates/tempo-ui/src/player.rs` | Decodes the frame under the playhead for each video track and hands the layers to GTK. Commands arrive on a `crossbeam` channel; position, play state and a frame serial are atomics. |
+| `tempo-audio-feed` | `player.rs` (`feed_audio`) | Mixes the audio tracks in 10 ms blocks and keeps about 200 ms queued. |
+| `tempo-audio-out` | `crates/tempo-audio/src/lib.rs` | Runs the PipeWire loop. The real-time callback only pops from a lock-free queue and updates atomics. |
+| `gio` blocking pool | various | Project load and save, backups, probing, waveforms, the start-up hardware check, export and proxy jobs. |
+| `ffmpeg` processes | `tempo-export`, `tempo-proxy` | Export and proxies run the `ffmpeg` program at low priority. A proxy is paused (`SIGSTOP`) while the timeline plays or an export runs. |
+
+**Playback loop.** The playback worker sleeps when idle. While playing, the PipeWire
+frame count is the clock (wall clock when there is no sound or during shuttle). Each
+frame it decodes what is under the playhead, publishes it, and sleeps until the next frame
+is due. A frame that is already on screen is not decoded again. If 3 of the last 6 frames
+took more than 1.25 times their frame time, decoding switches to a cheaper mode (no
+deblocking, half height) until playback stops or seeks. Details in `MEDIA_ENGINE.md §3`.
+
+**To the screen.** Decoded frames are RGBA in an `Arc<Vec<u8>>`. The viewer wraps the same
+buffer in a `gdk::MemoryTexture` without copying it, and GTK's renderer scales, places and
+blends the layers.
+
 ---
 
 ## 5. State Management
@@ -341,6 +383,25 @@ This avoids re-rendering the Skia canvas every frame — only the viewer composi
 ---
 
 ## 8. Audio Pipeline
+
+> **What the code does now.** There is no `AudioEngine` or `AudioMixPlan`. Sound is mixed
+> by the `tempo-audio-feed` thread (`feed_audio` in `crates/tempo-ui/src/player.rs`) and
+> pushed into `AudioOutput`'s lock-free queue (`crates/tempo-audio/src/lib.rs`). The
+> PipeWire callback only pops from that queue and counts frames played; that count is the
+> clock the picture follows. Everything is 48 kHz stereo `f32`.
+>
+> - The feeder works from the same immutable `Snapshot` as the picture. Only enabled audio
+>   tracks are in it, and when any track is soloed only the soloed ones (`audible_tracks`).
+>   Solo is for listening; export ignores it.
+> - Sound is read from the proxy when it has a sound track, and from the original otherwise
+>   (`reader_for`).
+> - A retimed clip is read in blocks that cover exactly the source it needs
+>   (`source_frames`) and resampled by straight-line interpolation (`stretch`), so pitch
+>   moves with speed. No rubato or rubberband.
+> - Per clip: volume × track volume × fade, then pan; then sum and clamp to [-1, 1]. There
+>   is no master volume.
+>
+> The diagram below is the 1.0 design.
 
 ```
 Playhead position (AtomicI64)

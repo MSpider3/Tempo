@@ -25,7 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         range,
         chapters: Vec::new(),
         output: PathBuf::from(output),
-        hardware: false,
+        // `TEMPO_HW_EXPORT=1` tries the graphics chip's encoder first, for timing it.
+        hardware: std::env::var_os("TEMPO_HW_EXPORT").is_some(),
+        max_video_kbps: None,
     };
     let started = std::time::Instant::now();
     export_timeline(&project, &settings, &AtomicBool::new(false), |_| {})?;

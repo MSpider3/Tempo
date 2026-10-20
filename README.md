@@ -13,7 +13,7 @@ editor for cutting a video and posting it.
 - **Same keys as Resolve.** Every shared shortcut is checked against a key file exported
   from DaVinci Resolve 20.
 
-> **Alpha release.** Tempo is version 0.1 and is not stable yet. Expect bugs, rough
+> **Alpha release.** Tempo is version 0.2 and is not stable yet. Expect bugs, rough
 > edges and changes between versions, and keep a copy of anything you cannot afford to
 > lose. Do not rely on it for important work. The downloads on the Releases page are
 > marked as pre-releases for this reason. See
@@ -26,18 +26,32 @@ editor for cutting a video and posting it.
 - **Edit page** with a Media Pool, viewer, Inspector and timeline, arranged as in Resolve.
 - **Editing:** insert, overwrite, append, place on top, move, trim, blade, razor, ripple
   delete, snapping, nudge. Every edit can be undone.
+- **Change Clip Speed** (`R`, as in Resolve): 25 % to 400 %, with Ripple Sequence to let
+  later clips move. Sound follows the speed.
+- **Fade handles:** hover a clip and drag a top corner toward the middle.
+- **Track controls:** Lock on every track, show/hide on video tracks, and Mute and Solo
+  (for listening) on audio tracks.
 - **Preview with sound**, with the picture following the audio clock.
 - **Right-click menus** on timeline clips, on gaps and in the Media Pool, for the edits a
   beginner looks for first.
 - **Linked picture and sound:** a clip and its sound move, cut, trim and delete together
   until you unlink them.
-- **Proxies and preview quality:** heavy footage gets a small 540p copy made in the
-  background. The **Preview** button above the viewer switches between Full (the original
-  file), Half and Quarter; Half is the default. Export always reads the original files.
+- **Proxies and preview quality:**
+  - Heavy footage on the timeline gets a small 540p copy with sound, made in the background.
+    It is made on the graphics chip when the machine supports it (VA-API).
+  - The **Preview** button above the viewer switches between Full (the original file), Half
+    and Quarter; Half is the default.
+  - When playback can't keep up, it decodes more cheaply until you stop.
+  - Export always reads the original files.
+- **Matches the project to your footage:** the first video brought into an empty project
+  offers to set the project's frame rate and size to match, as Resolve does.
+- **Project backups:** a checked copy every 10 minutes while you edit, kept like Resolve's
+  (recent, hourly, daily). Right-click a project and choose **Project Backups…** to open one.
+- **Shortcut hints** in the bottom bar for whatever is under the pointer.
 - **Markers that become chapters:** name a marker and it is written into the exported file
   and offered as a ready-to-paste timestamp list, with YouTube's rules checked.
-- **Export page:** pick an output by frame shape — 16:9, 9:16, 1:1 or 4:5 — queue several,
-  and keep editing while they render.
+- **Export page:** pick an output by frame shape — 16:9, 9:16, 1:1 or 4:5 — or **≤ 10 MB**
+  for Discord and email, queue several, and keep editing while they render.
 
 ## Install
 
@@ -90,6 +104,7 @@ The same as DaVinci Resolve. A few to start with:
 | `Space` | Play / stop |
 | `J` `K` `L` | Play reverse, stop, play forward (press again to go faster) |
 | `A` `T` `B` | Selection, Trim, Blade |
+| `R` | Change clip speed |
 | `Ctrl+B` | Cut at the playhead |
 | `Backspace` | Delete, leaving a gap |
 | `Shift+Backspace` | Delete and close the gap |
@@ -104,8 +119,13 @@ The full list is in [docs/KEYBINDS.md](docs/KEYBINDS.md).
 
 ## What is not done yet
 
-- Hardware (VA-API) decoding and encoding exist but are switched off by default: they
-  have not yet been tried on a machine with a working driver.
+- **Hardware (VA-API) decoding is off by default.** On the test laptop it halves CPU use,
+  but drops more frames than the processor on 4K footage (see [docs/PERF.md](docs/PERF.md)).
+  Proxies are made on the graphics chip when a start-up check finds it works. Hardware
+  export encoding is a switch in Preferences, off by default.
+- Change Clip Speed has no Reverse, Freeze Frame or Pitch Correction yet.
+- Transitions other than Cross Dissolve, and title styles, are planned as plugins; those
+  plugin types are not built yet.
 - No upload plugin for a real site ships yet. The plugin point works (see
   [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md)), but each site needs its own developer keys.
 - Keyframe animation.
@@ -142,9 +162,10 @@ Design and behaviour are described in [docs/](docs/README.md).
 
 ## Contributing
 
-Read [docs/AGENT_PROMPT.md](docs/AGENT_PROMPT.md) first; it lists the rules the code
-follows (nothing slow on the interface thread, every edit undoable, Resolve's keys).
-Run `./scripts/run_all_tests.sh` before opening a pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Tempo is for weaker computers and for
+beginners. It keeps DaVinci Resolve's layout and keys on purpose, and effects and titles
+come as plugins. The guide explains what that means for a change, and lists the checks to
+run before opening a pull request.
 
 ## Licence
 

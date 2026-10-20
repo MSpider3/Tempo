@@ -11,12 +11,13 @@ footage on import.
 
 | | |
 |---|---|
+| Version | 0.2.0 alpha (2026-10-21) |
 | Language | Rust |
 | UI | GTK 4 + libadwaita, dark only |
 | Screens | Loading, Project Manager, Edit page, Export page |
-| Media | FFmpeg, VA-API hardware decode when available |
+| Media | FFmpeg; VA-API hardware decode optional (off by default); proxies made with VA-API when it works |
 | Audio | PipeWire |
-| Plugins | Lua 5.4 (`mlua`); shaders in WGSL |
+| Plugins | Lua 5.4 (`mlua`); filters as lists of `ops` (WGSL shader effects are planned) |
 | Project file | SQLite, one `.tempo` file |
 | Reference machine | Intel Core i3-6100, 8 GB RAM, integrated graphics |
 | Reference for layout and keys | DaVinci Resolve 20 — screenshots in `EX/DVR_UI/`, key export in `EX/DaVinci Resolve Keys.txt` |
@@ -34,8 +35,9 @@ footage on import.
 | `VISUAL_DESIGN.md` | How every screen looks, with colours sampled from DaVinci Resolve 20 |
 | `UI_SPEC.md` | Which widgets build each screen and how they behave |
 | `KEYBINDS.md` | Every shortcut, checked against the key file exported from DaVinci Resolve 20 |
-| `PLUGIN_SPEC.md` | The Lua plugin system |
-| `ROADMAP.md` | Order of work |
+| `PLUGIN_SPEC.md` | The Lua plugin system; the note at its top says what is built today |
+| `ROADMAP.md` | Order of work, and what is built and still open |
+| `PERF.md` | Playback benchmark results (`scripts/bench_playback.sh`) and the experiment log |
 | `AGENT_PROMPT.md` | Working rules for anyone (or any AI agent) writing code |
 
 **Engine — written for version 1.0, partly out of date**
@@ -45,10 +47,13 @@ footage on import.
 | `ARCHITECTURE.md` | Crates, threads, memory | Plugin and UI parts are superseded; see the note at its top |
 | `SYSTEM_DESIGN.md` | Data types, commands, interfaces | Plugin API superseded; see note |
 | `MEDIA_ENGINE.md` | Decoding, cache, proxies | Known design problems listed in its top note |
-| `DATABASE_SCHEMA.md` | Project file tables | Known design problems listed in its top note |
+| `DATABASE_SCHEMA.md` | Project file tables, loading rules, backups | Known design problems listed in its top note; updated for 0.2.0 |
 
 Where an engine document disagrees with a product or interface document, the product or
 interface document is right.
+
+**Outside `docs/`:** [`CONTRIBUTING.md`](../CONTRIBUTING.md) says what Tempo accepts and how
+to get a change merged; [`CHANGELOG.md`](../CHANGELOG.md) lists what each version changed.
 
 The previous versions of all documents are kept in `EX/docs_backup_2026-10-03/`.
 

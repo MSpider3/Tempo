@@ -69,6 +69,10 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         ],
     )?;
 
+    // A file holds one project: a copy saved under a new id must not keep the old row,
+    // or loading could read it instead.
+    tx.execute("DELETE FROM project_meta WHERE id <> ?1", params![project.id.to_string()])?;
+
     // 2. Clear dynamic tables to overwrite with current project state in transaction
     tx.execute("DELETE FROM media_sources", [])?;
     tx.execute("DELETE FROM tracks", [])?;
@@ -360,8 +364,9 @@ pub fn load_project(path: &Path) -> Result<Project> {
             audio_channels,
             audio_codec,
             audio_bit_rate,
+            // Readiness is a cache fact: a proxy file that is gone is rebuilt, not trusted.
+            proxy_ready: proxy_ready != 0 && proxy_path_str.as_deref().is_some_and(|p| Path::new(p).is_file()),
             proxy_path: proxy_path_str.map(PathBuf::from),
-            proxy_ready: proxy_ready != 0,
             thumbnail_data,
             imported_at,
             import_order,
@@ -447,10 +452,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             _ => ClipType::Title,
         };
 
-        let properties: ClipProperties = serde_json::from_str(&prop_json).unwrap_or_default();
-        let title_data: Option<TitleData> = title_json.and_then(|s| serde_json::from_str(&s).ok());
-
-        Ok(Clip {
+        let clip = Clip {
             id: Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
             track_id: Uuid::parse_str(&track_id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?,
             source_id: Uuid::parse_str(&source_id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?,
@@ -460,16 +462,25 @@ pub fn load_project(path: &Path) -> Result<Project> {
             timeline_out,
             source_in,
             source_out,
-            properties,
-            title_data,
-        })
+            properties: ClipProperties::default(),
+            title_data: None,
+        };
+        Ok((clip, prop_json, title_json))
     })?;
 
-    for clip in clip_rows {
-        let clip = clip?;
-        if let Some(track) = tracks.iter_mut().find(|t| t.id == clip.track_id) {
-            track.clips.push(clip);
-        }
+    for row in clip_rows {
+        let (mut clip, prop_json, title_json) = row?;
+        let corrupt = |field, reason: String| ProjectError::CorruptClip { clip_id: clip.id, field, reason };
+        clip.properties = serde_json::from_str(&prop_json).map_err(|e| corrupt("properties", e.to_string()))?;
+        clip.title_data = title_json
+            .map(|s| serde_json::from_str::<TitleData>(&s))
+            .transpose()
+            .map_err(|e| corrupt("title", e.to_string()))?;
+        let track = tracks
+            .iter_mut()
+            .find(|t| t.id == clip.track_id)
+            .ok_or_else(|| corrupt("track", format!("no track {}", clip.track_id)))?;
+        track.clips.push(clip);
     }
 
     // 5. Load transitions
@@ -989,5 +1000,108 @@ mod tests {
 
         assert_eq!(loaded_clip.properties.keyframes.len(), 2);
         assert_eq!(loaded_clip.properties.evaluate_property("opacity", 2_000_000), 0.5);
+    }
+
+    /// A saved one-clip project, then `sql` run on its file without foreign key checks.
+    fn tampered(sql: &str) -> (NamedTempFile, Uuid) {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Tamper", 1920, 1080, RationalFps::FPS_30);
+        let track_id = project.timeline.tracks[0].id;
+        let clip = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000);
+        let clip_id = clip.id;
+        project.timeline.tracks[0].clips.push(clip);
+        save_project(&project, file.path()).unwrap();
+        rusqlite::Connection::open(file.path()).unwrap().execute_batch(sql).unwrap();
+        (file, clip_id)
+    }
+
+    #[test]
+    fn missing_proxy_file_is_not_ready_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.tempo");
+        let present = dir.path().join("present.mp4");
+        std::fs::write(&present, b"x").unwrap();
+        let mut project = Project::new("Proxies", 1920, 1080, RationalFps::FPS_30);
+        for proxy in [present.clone(), dir.path().join("gone.mp4")] {
+            let mut source = MediaSource::new(PathBuf::from("/media/a.mp4"), MediaType::Video, 1_000_000);
+            source.proxy_path = Some(proxy);
+            source.proxy_ready = true;
+            project.sources.insert(source.id, source);
+        }
+        save_project(&project, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        for source in loaded.sources.values() {
+            assert_eq!(source.proxy_ready, source.proxy_path.as_deref() == Some(present.as_path()));
+        }
+    }
+
+    #[test]
+    fn files_without_speed_load_at_normal_speed() {
+        let (file, _) = tampered(r#"UPDATE clips SET properties = '{"opacity":1.0}';"#);
+        assert_eq!(load_project(file.path()).unwrap().timeline.tracks[0].clips[0].properties.speed, 1.0);
+    }
+
+    #[test]
+    fn a_copy_saved_under_a_new_id_loads_as_that_project() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Original", 1920, 1080, RationalFps::FPS_30);
+        save_project(&project, file.path()).unwrap();
+        project.id = Uuid::new_v4();
+        project.name = "Copy".into();
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!((loaded.id, loaded.name.as_str()), (project.id, "Copy"));
+        assert_eq!(crate::read_project_id(file.path()).unwrap(), project.id);
+    }
+
+    #[test]
+    fn a_retimed_clip_saves_and_loads() {
+        // At double speed a clip covers twice as much source as timeline.
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Speed", 1920, 1080, RationalFps::FPS_30);
+        let track = project.timeline.tracks[0].id;
+        let mut clip = Clip::new(track, Uuid::new_v4(), ClipType::Video, "fast", 0, 2_000_000, 1_000_000, 5_000_000);
+        clip.properties.speed = 2.0;
+        project.timeline.tracks[0].clips.push(clip.clone());
+        save_project(&project, file.path()).expect("save a retimed clip");
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].clips[0], clip);
+    }
+
+    #[test]
+    fn titles_with_missing_fields_still_load() {
+        let (file, _) = tampered(r#"UPDATE clips SET title_data = '{"text":"Hello"}';"#);
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].clips[0].title_data.as_ref().map(|t| t.text.as_str()), Some("Hello"));
+    }
+
+    #[test]
+    fn load_rejects_corrupt_clip_properties() {
+        let (file, clip_id) = tampered("UPDATE clips SET properties = '{bad';");
+        match load_project(file.path()) {
+            Err(ProjectError::CorruptClip { clip_id: id, field: "properties", .. }) => assert_eq!(id, clip_id),
+            other => panic!("expected CorruptClip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupt_title_data() {
+        let (file, _) = tampered("UPDATE clips SET title_data = '[1,2]';");
+        assert!(matches!(load_project(file.path()), Err(ProjectError::CorruptClip { field: "title", .. })));
+    }
+
+    #[test]
+    fn load_accepts_unknown_and_missing_property_fields() {
+        let (file, _) = tampered(r#"UPDATE clips SET properties = '{"opacity":0.5,"future_field":1}';"#);
+        let loaded = load_project(file.path()).unwrap();
+        let clip = &loaded.timeline.tracks[0].clips[0];
+        assert_eq!(clip.properties.opacity, 0.5);
+        assert_eq!(clip.properties.volume, 1.0);
+    }
+
+    #[test]
+    fn load_rejects_clip_on_unknown_track() {
+        let (file, _) = tampered(&format!("UPDATE clips SET track_id = '{}';", Uuid::new_v4()));
+        assert!(matches!(load_project(file.path()), Err(ProjectError::CorruptClip { field: "track", .. })));
     }
 }

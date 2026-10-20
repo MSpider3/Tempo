@@ -20,6 +20,11 @@ pub enum ProjectError {
     #[error("Migration error: {0}")]
     Migration(String),
 
+    /// Part of a clip could not be read. Loading stops rather than replacing it with defaults,
+    /// which the next save would make permanent.
+    #[error("Clip {clip_id} has unreadable {field}: {reason}")]
+    CorruptClip { clip_id: uuid::Uuid, field: &'static str, reason: String },
+
     #[error("Schema version mismatch: project is version {0}, supported is {1}")]
     UnsupportedSchemaVersion(u32, u32),
 }

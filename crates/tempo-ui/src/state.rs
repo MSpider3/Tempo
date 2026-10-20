@@ -61,6 +61,10 @@ pub struct AppState {
     /// When on, selecting a clip also selects the clips linked to it.
     pub linked_selection: Cell<bool>,
     pub dirty: Cell<bool>,
+    /// Set by every change; cleared when a rolling backup is taken.
+    pub changed_since_backup: Cell<bool>,
+    /// Whether hardware decoding and hardware encoding work here, found at start-up.
+    pub hardware: Cell<(bool, bool)>,
     pub mark_in: Cell<Option<i64>>,
     pub mark_out: Cell<Option<i64>>,
     /// `kind_index` of the video / audio track that receives the next edit.
@@ -87,6 +91,8 @@ pub struct AppState {
     pub uploaders: RefCell<Vec<crate::plugins::Uploader>>,
     /// Opens a Media Pool clip in whichever viewer shows source clips.
     pub open_source: RefCell<Option<Rc<dyn Fn(Option<Uuid>)>>>,
+    /// Shows the shortcut hints for where the pointer is (bottom bar).
+    pub show_hint: RefCell<Option<Rc<dyn Fn(Option<crate::keybinds::HintZone>)>>>,
     /// Loudness of each source, 50 values a second, for drawing waveforms.
     pub waveforms: RefCell<std::collections::HashMap<Uuid, Rc<Vec<u8>>>>,
     pub player: Player,
@@ -105,6 +111,8 @@ impl AppState {
             snapping: Cell::new(true),
             linked_selection: Cell::new(true),
             dirty: Cell::new(false),
+            changed_since_backup: Cell::new(false),
+            hardware: Cell::new((false, false)),
             mark_in: Cell::new(None),
             mark_out: Cell::new(None),
             dest_video: Cell::new(1),
@@ -120,6 +128,7 @@ impl AppState {
             filters: RefCell::new(Vec::new()),
             uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
+            show_hint: RefCell::new(None),
             waveforms: RefCell::new(Default::default()),
             player: Player::new(),
             listeners: RefCell::new(Vec::new()),
@@ -255,7 +264,18 @@ impl AppState {
         self.emit(Change::Timeline);
     }
 
+    /// Show the shortcut hints for a part of the window, or none.
+    pub fn hint(&self, zone: Option<crate::keybinds::HintZone>) {
+        let show = self.show_hint.borrow().clone();
+        if let Some(show) = show {
+            show(zone);
+        }
+    }
+
     pub fn set_dirty(&self, dirty: bool) {
+        if dirty {
+            self.changed_since_backup.set(true);
+        }
         if self.dirty.replace(dirty) != dirty {
             self.emit(Change::Dirty);
         }

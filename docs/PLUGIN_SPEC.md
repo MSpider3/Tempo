@@ -5,12 +5,38 @@
 **Runtime:** Lua 5.4 (via `mlua`)
 **Replaces:** version 1.0 (WASM plugins on wasmtime, HTML panels, Python compute server).
 
-> **What is built (2026-10-05).** Script plugins (§7) work: a folder with `plugin.toml`
-> and `main.lua`, commands in the main menu, the sandbox and limits of §7.2, and these parts
-> of the API: `tempo.log`, `tempo.notify`, `tempo.playhead`, `tempo.selection`,
+> **What is built (updated 2026-10-21, 0.2.0 alpha).** The rest of this document is the full
+> design; this note says how much of it the code does today. Where they differ, this note
+> describes the code.
+>
+> **Manifest.** The loader (`crates/tempo-plugin/src/lib.rs`) reads only these sections of
+> `plugin.toml`:
+>
+> | Section | Keys read |
+> |---|---|
+> | `[plugin]` | `id`, `name`, `version`, `description` |
+> | `[permissions]` | `timeline` (`"none"` \| `"read"` \| `"write"`), `network` (host names) |
+> | `[[filter]]` | `id`, `name`, `ops`, and `[[filter.param]]` entries |
+> | `[[command]]` | `id`, `name`, `function` |
+> | `[[uploader]]` | `id`, `name`, `function` |
+>
+> Other sections and keys (`[[transition]]`, `[[title]]`, `[[export_preset]]`, `author`,
+> `min_tempo`, `api`, `menu`, `files`, `secrets`, parameter `type`) are ignored.
+>
+> **Install.** A plugin is a folder holding `plugin.toml` and, if it has commands or
+> uploaders, `main.lua`. **Plugins…** in the menu copies those two files to
+> `~/.local/share/tempo/plugins/<id>/`. The `.tempo-plugin` archive (§3) is not built.
+> A newly installed plugin starts switched off; built-in plugins start on. Switched-off
+> plugins are kept as a `plugins_off` list in `~/.config/tempo/settings.json`, not in
+> `plugins.toml` (§8).
+>
+> **Script plugins** (§7) work: commands in the main menu, the sandbox and limits of §7.2,
+> and these parts of the API: `tempo.log`, `tempo.notify`, `tempo.playhead`, `tempo.selection`,
 > `tempo.timeline.tracks/clips/clip/split/delete/move/set`, `tempo.markers.list/add/remove`,
 > `tempo.media.loudness`. A script runs against a copy of the timeline and its changes are
-> applied as one undo step.
+> applied as one undo step. Each call gets a fresh Lua state on a worker thread
+> (`gio::spawn_blocking`); there is no plugin thread and no state kept between calls (§7.1).
+> Switching a plugin off after three failures (§7.2) is not built.
 >
 > **Filters** work as data: a `[[filter]]` entry lists `ops` (`saturation`, `brightness`,
 > `contrast`, `blur`, or a 4 × 5 colour `matrix`), each a number or `"$param"` naming one of
@@ -28,10 +54,14 @@
 > not followed. The token the user types is kept in the system keyring. No uploader for a
 > real site ships with Tempo.
 >
-> Not built yet: shader effects (§5), title and preset packs (§6), `tempo.ui`,
-> `tempo.files`, `tempo.secrets` for scripts, and the `.tempo-plugin` archive (plugins are
-> installed from a folder). `tempo.timeline.move` takes `(clip, start)`; `tempo.media.loudness`
-> returns decibel values from the cached waveform.
+> Not built yet: shader effects (§5; filters are `ops` recipes, not WGSL), transitions,
+> title templates and export presets as plugin types (§4, §6), `tempo.ui`,
+> `tempo.project.info`, `tempo.media.info`, `tempo.timeline.trim/add_title/add_transition`,
+> `tempo.files`, `tempo.secrets` and `tempo.oauth` for scripts, and the `.tempo-plugin`
+> archive. `tempo.timeline.move` takes `(clip, start)`; `tempo.markers.add` takes
+> `(time, name)`. `tempo.media.loudness` returns decibel values from the cached waveform;
+> for a retimed clip each window of timeline covers `speed ×` as much sound, so the values
+> line up with the clip as it plays.
 
 ---
 
@@ -74,10 +104,14 @@ Version 1.0 of this spec used WebAssembly. That is replaced by **Lua** because:
 | **2. Script plugin** | The above plus `main.lua` | Timeline commands, importers and exporters for text formats, upload targets, automatic actions |
 
 Tier 1 is built first (see `ROADMAP.md`). Tier 2 uses the same bundle and manifest.
+Today Tier 1 adds filters only (as `ops` recipes, see the note at the top) and Tier 2 adds
+timeline commands and upload targets.
 
 ---
 
 ## 3. Bundle
+
+*Planned. Today a plugin is installed from a folder; see the note at the top.*
 
 A plugin is a ZIP file with the extension `.tempo-plugin`.
 
@@ -101,6 +135,8 @@ compile, and the unpacked size is under 20 MB. Paths that leave the plugin folde
 ---
 
 ## 4. Manifest
+
+The full planned manifest. The note at the top lists the sections and keys read today.
 
 ```toml
 [plugin]
@@ -180,6 +216,8 @@ Inspector section per effect, saves the values with the clip, and makes every ch
 
 ## 5. Shaders
 
+*Planned, not built. Filters today are lists of `ops`; see the note at the top.*
+
 Effects are WGSL **fragment** shaders. Fragment shaders work on every graphics backend Tempo
 supports, including the OpenGL ES fallback on older integrated graphics.
 
@@ -224,6 +262,8 @@ Rules, checked at install time:
 ---
 
 ## 6. Title templates and export presets
+
+*Planned, not built. The ≤ 10 MB export card is part of the core, not a preset plugin.*
 
 **Title template** (`titles/bold.toml`) — the same fields as a built-in title, with defaults:
 
@@ -447,12 +487,12 @@ Remove   → disable, delete the folder
 
 Shipped with the app, in the same format, so they double as examples.
 
-| Plugin | Tier | Adds |
-|---|---|---|
-| `dev.tempo.transitions` | 1 | Wipe, Slide, Zoom |
-| `dev.tempo.filters` | 1 | Brightness/Contrast, Saturation, Blur, Black and White |
-| `dev.tempo.titles` | 1 | Four title styles |
-| `dev.tempo.remove-silence` | 2 | The command in §7.4 |
+| Plugin | Tier | Adds | Status |
+|---|---|---|---|
+| `dev.tempo.transitions` | 1 | Wipe, Slide, Zoom | Planned |
+| `dev.tempo.filters` | 1 | Black and White, Saturation, Brightness, Contrast, Blur, Warm | Built: `assets/plugins/filters/` |
+| `dev.tempo.titles` | 1 | Four title styles | Planned |
+| `dev.tempo.remove-silence` | 2 | The command in §7.4 | Built: `assets/plugins/remove-silence/` (without `tempo.ui.ask`) |
 
 Cross Dissolve, Dip to Colour, fades and the two basic titles are part of the core, not plugins.
 

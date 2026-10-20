@@ -54,6 +54,9 @@ pub struct MainWindow {
     edit_only: gtk::Box,
     speed: Cell<f64>,
     cinema: Cell<bool>,
+    /// When the last rolling backup was started, and whether a failure was already reported.
+    last_backup: Cell<std::time::Instant>,
+    backup_warned: Cell<bool>,
     loading_status: gtk::Label,
 }
 
@@ -64,6 +67,8 @@ impl MainWindow {
         let edit = EditPage::new(&state, &viewer);
         let export = ExportPage::new(&state);
         edit.viewer_slot.append(&viewer.root);
+        hint_over(&state, &viewer.root, crate::keybinds::HintZone::Viewer);
+        hint_over(&state, &edit.media_pool.root, crate::keybinds::HintZone::MediaPool);
 
         // ---- Top bar ---------------------------------------------------------
         let media_btn = labelled_toggle("folder-symbolic", "Media Pool", "Show or hide the Media Pool");
@@ -147,10 +152,27 @@ impl MainWindow {
         left.append(&activity);
         let home = tool_button("go-home-symbolic", "Project Manager (Shift+1)");
         home.set_margin_end(8);
+        // Shortcut hints for what is under the pointer, from the keybind table.
+        let hint = label("", &["tempo-small", "tempo-dim"]);
+        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        hint.set_xalign(1.0);
+        // Takes the free space beside the page switcher without pushing it off centre.
+        hint.set_max_width_chars(8);
+        hint.set_hexpand(true);
+        let right = gtk::Box::builder().spacing(14).margin_start(24).build();
+        right.append(&hint);
+        right.append(&home);
+        let binds = crate::keybinds::load();
+        let shown = Cell::new(None);
+        *state.show_hint.borrow_mut() = Some(Rc::new(move |zone| {
+            if shown.replace(zone) != zone {
+                hint.set_text(&zone.map(|z| crate::keybinds::hint(z, &binds, crate::keybinds::display)).unwrap_or_default());
+            }
+        }));
         let page_bar = gtk::CenterBox::builder().css_classes(["page-bar"]).build();
         page_bar.set_start_widget(Some(&left));
         page_bar.set_center_widget(Some(&page_box));
-        page_bar.set_end_widget(Some(&home));
+        page_bar.set_end_widget(Some(&right));
 
         let project_view = adw::ToolbarView::builder().content(&pages).build();
         project_view.add_top_bar(&header);
@@ -229,6 +251,8 @@ impl MainWindow {
             edit_only,
             speed: Cell::new(0.0),
             cinema: Cell::new(false),
+            last_backup: Cell::new(std::time::Instant::now()),
+            backup_warned: Cell::new(false),
             loading_status,
         });
 
@@ -311,6 +335,7 @@ impl MainWindow {
                 waited.set(0);
                 w.autosave();
             }
+            w.backup_if_due();
             glib::ControlFlow::Continue
         });
 
@@ -395,12 +420,28 @@ impl MainWindow {
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
             w.loading_status.set_text("STARTING MEDIA ENGINE");
-            let settings = gio::spawn_blocking(|| {
+            let (settings, hardware, turned_off) = gio::spawn_blocking(|| {
                 tempo_media::ensure_ffmpeg_init();
-                crate::settings::Settings::load()
+                let mut settings = crate::settings::Settings::load();
+                let hardware = (tempo_media::hardware_decode_available(), tempo_export::ffmpeg::vaapi_h264_available());
+                // A saved setting the machine can't do is switched off, as Resolve resets
+                // an invalid GPU configuration, and the user is told once.
+                let turned_off = (settings.hardware_decode && !hardware.0) || (settings.hardware_encode && !hardware.1);
+                if turned_off {
+                    settings.hardware_decode &= hardware.0;
+                    settings.hardware_encode &= hardware.1;
+                    if let Err(e) = settings.save() {
+                        tracing::warn!("could not save settings: {e}");
+                    }
+                }
+                (settings, hardware, turned_off)
             })
             .await
             .unwrap_or_default();
+            w.state.hardware.set(hardware);
+            if turned_off {
+                w.state.message("Hardware video acceleration isn't available on this computer, so it was turned off.");
+            }
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
             *w.state.settings.borrow_mut() = settings;
@@ -518,7 +559,7 @@ impl MainWindow {
                     }
                 }
                 Ok(Err(e)) => {
-                    w.state.message(format!("Could not open the project: {e}"));
+                    w.state.message(format!("Could not open the project: {e}. Right-click it and choose Project Backups… to open an earlier copy."));
                     w.show_manager();
                 }
                 Err(_) => w.show_manager(),
@@ -617,6 +658,36 @@ impl MainWindow {
         });
     }
 
+    /// Every few minutes of editing, keep a checked copy of the project (Resolve's
+    /// Project Backups). Runs on a worker; a failure is reported once and never blocks.
+    fn backup_if_due(self: &Rc<Self>) {
+        let every = std::time::Duration::from_secs(tempo_project::BackupPolicy::default().every_min as u64 * 60);
+        if self.last_backup.get().elapsed() < every || !self.state.changed_since_backup.get() {
+            return;
+        }
+        let Some(project) = self.state.project.borrow().clone() else { return };
+        self.last_backup.set(std::time::Instant::now());
+        self.state.changed_since_backup.set(false);
+        let dir = crate::project_manager::backup_dir(project.id);
+        let w = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gio::spawn_blocking(move || tempo_project::backup_now(&project, &dir)).await;
+            let problem = match result {
+                Ok(Ok(path)) => {
+                    tracing::debug!("project backup written to {}", path.display());
+                    return;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "the backup stopped unexpectedly".to_string(),
+            };
+            tracing::warn!("project backup failed: {problem}");
+            w.state.changed_since_backup.set(true);
+            if !w.backup_warned.replace(true) {
+                w.state.message(format!("Could not write a project backup: {problem}"));
+            }
+        });
+    }
+
     /// Show a short status in the page bar, unless an export is reporting there.
     fn flash_activity(self: &Rc<Self>, text: impl Into<String>) {
         if self.export.has_unfinished_jobs() {
@@ -709,6 +780,7 @@ impl MainWindow {
             player.set_max_height(self.state.settings.borrow().playback_height);
             let source = Viewer::new_source(&self.state, player);
             self.edit.source_slot.append(&source.root);
+            hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
             *self.source_viewer.borrow_mut() = Some(source);
         }
         self.edit.source_slot.set_visible(on);
@@ -756,7 +828,12 @@ impl MainWindow {
                             .map(|c| {
                                 let sel = if self.state.is_selected(c.id) { "*" } else { "" };
                                 let off = if c.properties.enabled { "" } else { "(off)" };
-                                format!("{sel}{}{off}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
+                                let p = &c.properties;
+                                let fades = match (p.fade_in_us, p.fade_out_us) {
+                                    (0, 0) => String::new(),
+                                    (i, o) => format!("(fade {:.2}/{:.2})", i as f64 / 1e6, o as f64 / 1e6),
+                                };
+                                format!("{sel}{}{off}{fades}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
                             })
                             .collect();
                         let kind = if row.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" };
@@ -782,6 +859,7 @@ impl MainWindow {
                 }
             }
             "media" => self.edit.media_pool.select_index(num(0).unwrap_or(0.0) as u32),
+            "import" => self.edit.media_pool.import(parts.iter().map(PathBuf::from).collect()),
             "tool" => self.set_tool(match parts.first().copied() {
                 Some("trim") => Tool::Trim,
                 Some("blade") => Tool::Blade,
@@ -791,6 +869,25 @@ impl MainWindow {
                 if let Some(p) = num(0).and_then(|s| canvas.point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
                     let mods = if parts.get(2) == Some(&"ctrl") { ModifierType::CONTROL_MASK } else { ModifierType::empty() };
                     canvas.simulate_drag(p, p, mods);
+                }
+            }
+            "hint" => {
+                use crate::keybinds::HintZone;
+                let zone = match parts.first().copied() {
+                    Some("clip") => Some(HintZone::ClipBody),
+                    Some("edge") => Some(HintZone::ClipEdge),
+                    Some("fade") => Some(HintZone::FadeHandle),
+                    Some("ruler") => Some(HintZone::Ruler),
+                    Some("viewer") => Some(HintZone::Viewer),
+                    Some("media") => Some(HintZone::MediaPool),
+                    _ => None,
+                };
+                self.state.hint(zone);
+            }
+            "fadedrag" => {
+                let track = parts.get(1).copied().unwrap_or("V1");
+                if let (Some(from), Some(to)) = (num(0).and_then(|s| canvas.top_point_for(s, track)), num(2).and_then(|s| canvas.top_point_for(s, track))) {
+                    canvas.simulate_drag(from, to, ModifierType::empty());
                 }
             }
             "drag" => {
@@ -880,7 +977,7 @@ impl MainWindow {
     /// Playback figures for automated checks.
     pub fn stats(&self) -> String {
         let p = &self.state.player;
-        format!("position_us={} dropped_frames={} playing={}", p.position_us(), p.dropped_frames(), p.is_playing())
+        format!("position_us={} dropped_frames={} playing={} degraded={} canvas_draws={}", p.position_us(), p.dropped_frames(), p.is_playing(), p.is_degraded() as u8, crate::timeline::draw_count())
     }
 
     fn in_project(&self) -> bool {
@@ -1100,6 +1197,7 @@ impl MainWindow {
                 state.emit(Change::Options);
             }
             "win.transition-add" => actions::cross_dissolve(state, 0.5),
+            "win.clip-speed" => dialogs::change_clip_speed(&self.window, state),
             "win.fade-in" => actions::set_fade(state, true, 0.5),
             "win.fade-out" => actions::set_fade(state, false, 0.5),
             "win.razor" => actions::razor(state),
@@ -1166,6 +1264,16 @@ impl MainWindow {
 /// A file whose presence means the first-use hint was dismissed.
 fn hint_marker() -> PathBuf {
     glib::user_config_dir().join("tempo").join("first-use-hint-seen")
+}
+
+/// Show `zone`'s shortcut hints while the pointer is over `widget`.
+fn hint_over(state: &Rc<AppState>, widget: &impl IsA<gtk::Widget>, zone: crate::keybinds::HintZone) {
+    let motion = gtk::EventControllerMotion::new();
+    let s = state.clone();
+    motion.connect_enter(move |_, _, _| s.hint(Some(zone)));
+    let s = state.clone();
+    motion.connect_leave(move |_| s.hint(None));
+    widget.add_controller(motion);
 }
 
 fn loading_view(status: &gtk::Label) -> gtk::Box {

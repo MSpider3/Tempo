@@ -49,6 +49,12 @@ fn hw_device() -> Option<&'static HwDevice> {
         .as_ref()
 }
 
+/// Whether the graphics driver can decode video here (VA-API opens). Blocking the first
+/// time; the answer is kept for the life of the process.
+pub fn hardware_decode_available() -> bool {
+    hw_device().is_some()
+}
+
 /// Called by FFmpeg to choose the output format. Takes the VA-API surface format
 /// when it is offered; otherwise the first format, which is ordinary software decoding.
 unsafe extern "C" fn pick_format(_ctx: *mut ffi::AVCodecContext, formats: *const ffi::AVPixelFormat) -> ffi::AVPixelFormat {
@@ -68,12 +74,12 @@ unsafe extern "C" fn pick_format(_ctx: *mut ffi::AVCodecContext, formats: *const
 /// A forward jump shorter than this is decoded through; longer jumps seek.
 pub const SEEK_THRESHOLD_US: i64 = 2_000_000;
 
-/// One RGBA picture.
+/// One RGBA picture. Cloning shares the pixels instead of copying them.
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub data: std::sync::Arc<Vec<u8>>,
     pub pts_us: i64,
 }
 
@@ -102,7 +108,13 @@ pub struct FfmpegDecoder {
 unsafe impl Send for FfmpegDecoder {}
 
 impl FfmpegDecoder {
+    /// Open with the app-wide hardware decoding setting (`set_hardware_decode`).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, HARDWARE_DECODE.load(Ordering::Relaxed))
+    }
+
+    /// Open, using the graphics chip when `hardware` is set and it can.
+    pub fn open_with(path: impl AsRef<Path>, hardware: bool) -> Result<Self> {
         ensure_ffmpeg_init();
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
@@ -129,7 +141,7 @@ impl FfmpegDecoder {
             // so slice threading would decode on a single core.
             kind: ffmpeg_next::codec::threading::Type::Frame,
         });
-        if HARDWARE_DECODE.load(Ordering::Relaxed) {
+        if hardware {
             if let Some(device) = hw_device() {
                 // SAFETY: the codec context is valid and not yet opened; it takes its own
                 // reference to the device, which FFmpeg releases with the context.
@@ -194,6 +206,23 @@ impl FfmpegDecoder {
         }
     }
 
+    /// Cheaper, slightly softer decoding for when playback can't keep up: skips the
+    /// deblocking filter. Takes effect on the next frame. Decoders that ignore it
+    /// (OpenH264, VA-API) are simply unaffected.
+    pub fn set_fast_decode(&mut self, on: bool) {
+        // SAFETY: the context belongs to this decoder and is only used from this thread.
+        unsafe {
+            let ctx = self.decoder.as_mut_ptr();
+            (*ctx).skip_loop_filter = if on { ffi::AVDiscard::AVDISCARD_ALL } else { ffi::AVDiscard::AVDISCARD_DEFAULT };
+            if on {
+                (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST;
+            } else {
+                (*ctx).flags2 &= !(ffi::AV_CODEC_FLAG2_FAST);
+            }
+        }
+        self.last_exact = None;
+    }
+
     fn scale_frame(&mut self, decoded: &ffmpeg_next::frame::Video, pts_us: i64) -> Result<VideoFrame> {
         // A hardware frame lives in graphics memory: copy it down first.
         let mut downloaded = ffmpeg_next::frame::Video::empty();
@@ -235,7 +264,7 @@ impl FfmpegDecoder {
                 }
             }
         }
-        Ok(VideoFrame { width, height, data: buffer, pts_us })
+        Ok(VideoFrame { width, height, data: buffer.into(), pts_us })
     }
 
     /// Exact frame at or after `target_pts_us` (microseconds from the start of the file).
@@ -309,7 +338,7 @@ impl FfmpegDecoder {
                 if keyframe_only || pts_us >= target_pts_us {
                     return self.scale_frame(&decoded, pts_us);
                 }
-                last_before = Some((decoded.clone(), pts_us));
+                last_before = frame_ref(&decoded).map(|f| (f, pts_us)).or(last_before);
             }
         }
 
@@ -321,7 +350,7 @@ impl FfmpegDecoder {
                 self.last_decoded_pts_us = -1; // drained; the next call must seek
                 return self.scale_frame(&decoded, pts_us);
             }
-            last_before = Some((decoded.clone(), pts_us));
+            last_before = frame_ref(&decoded).map(|f| (f, pts_us)).or(last_before);
         }
         self.last_decoded_pts_us = -1;
 
@@ -331,6 +360,15 @@ impl FfmpegDecoder {
             None => Err(MediaError::FrameDecodeFailed),
         }
     }
+}
+
+/// A second reference to the same picture, without copying it. ffmpeg-next's `clone`
+/// copies the pixels into a new buffer, which costs a full frame copy for every frame
+/// decoded on the way to a target, and loses the surface of a hardware (VA-API) frame.
+fn frame_ref(frame: &ffmpeg_next::frame::Video) -> Option<ffmpeg_next::frame::Video> {
+    let mut held = ffmpeg_next::frame::Video::empty();
+    // SAFETY: both frames are valid and `held` is empty, as av_frame_ref requires.
+    (unsafe { ffi::av_frame_ref(held.as_mut_ptr(), frame.as_ptr()) } >= 0).then_some(held)
 }
 
 pub(crate) fn to_us(ts: i64, time_base: Rational) -> i64 {
@@ -365,6 +403,8 @@ mod tests {
         let b = d.decode_video_frame(1_000_000).expect("frame");
         assert_eq!(a.pts_us, b.pts_us);
         assert!(a.pts_us >= 1_000_000 && a.pts_us < 1_100_000);
+        // The repeat shares the picture instead of copying it.
+        assert!(std::sync::Arc::ptr_eq(&a.data, &b.data));
     }
 
     #[test]
@@ -384,12 +424,35 @@ mod tests {
     fn hardware_decode_setting_never_breaks_decoding() {
         // With the setting on, a machine without a usable driver must still decode
         // (on the processor), and a machine with one must give the same picture size.
+        // (open_with, not the app-wide switch, so other tests running alongside are unaffected.)
         let Some(path) = sample("sample_1080p_h264.mp4") else { return };
-        set_hardware_decode(true);
-        let result = FfmpegDecoder::open(path).and_then(|mut d| d.decode_video_frame(1_000_000));
-        set_hardware_decode(false);
-        let frame = result.expect("frame");
+        let frame = FfmpegDecoder::open_with(path, true).and_then(|mut d| d.decode_video_frame(1_000_000)).expect("frame");
         assert_eq!((frame.width, frame.height), (1920, 1080));
+    }
+
+    #[test]
+    fn hardware_decoding_seeks_back_and_reads_past_the_end() {
+        // The same journey as the software test, on the graphics chip when there is one.
+        let Some(path) = sample("sample_1080p_h264.mp4") else { return };
+        let mut d = FfmpegDecoder::open_with(path, true).expect("open");
+        let late = d.decode_video_frame(3_000_000).expect("late frame");
+        let early = d.decode_video_frame(500_000).expect("early frame");
+        assert!(early.pts_us < late.pts_us);
+        let past = d.decode_video_frame(3_600_000_000);
+        assert!(past.is_ok(), "past the end: {:?}", past.err());
+        assert!(d.decode_video_frame(0).is_ok(), "usable afterwards");
+    }
+
+    #[test]
+    fn fast_decode_still_returns_the_requested_frame() {
+        let Some(path) = sample("sample_1080p_h264.mp4") else { return };
+        let mut d = FfmpegDecoder::open(path).expect("open");
+        d.set_fast_decode(true);
+        let fast = d.decode_video_frame(1_500_000).expect("frame");
+        assert!(fast.pts_us >= 1_500_000 && fast.pts_us < 1_600_000);
+        d.set_fast_decode(false);
+        let exact = d.decode_video_frame(2_000_000).expect("frame");
+        assert!(exact.pts_us >= 2_000_000 && exact.pts_us < 2_100_000);
     }
 
     #[test]

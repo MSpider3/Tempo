@@ -11,7 +11,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tempo_audio::AudioOutput;
 use tempo_media::{AudioReader, FfmpegDecoder, VideoFrame, OUT_CHANNELS, OUT_RATE};
-use tempo_timeline::{Clip, ClipProperties, ClipType, Project, TitleData, TrackKind};
+use tempo_timeline::{frame_to_us, Clip, ClipProperties, ClipType, Project, RationalFps, TitleData, TrackKind};
 use uuid::Uuid;
 
 /// How many container files may be open for decoding at once.
@@ -34,10 +34,12 @@ pub struct Snapshot {
     audio: Vec<(Vec<Clip>, f32)>,
     /// What the picture is decoded from: the proxy when there is one.
     sources: HashMap<Uuid, PathBuf>,
-    /// What the sound is decoded from: always the original file.
+    /// The original files. Sound is read from the proxy in `sources` when it has a sound
+    /// track (one file to read), and from here otherwise.
     audio_sources: HashMap<Uuid, PathBuf>,
     pub duration_us: i64,
-    pub frame_us: i64,
+    /// The frame grid playback steps on.
+    pub fps: RationalFps,
 }
 
 impl Snapshot {
@@ -62,11 +64,7 @@ impl Snapshot {
                 (*id, path)
             })
             .collect();
-        let audio = project
-            .timeline
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Audio && t.enabled)
+        let audio = audible_tracks(&project.timeline)
             .flat_map(|t| {
                 // For sound, the outgoing clip fades out while the incoming one fades in.
                 let leads = t.dissolve_leads();
@@ -106,16 +104,16 @@ impl Snapshot {
                 .map(|t| t.duration_us())
                 .max()
                 .unwrap_or(0),
-            frame_us: project.fps.frame_duration_us().max(1),
+            fps: project.fps,
         }
     }
 
     pub fn empty() -> Self {
-        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, frame_us: 33_333 }
+        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, fps: RationalFps::default() }
     }
 
     /// A one-clip snapshot used to preview a Media Pool item.
-    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, frame_us: i64, has_video: bool, has_audio: bool) -> Self {
+    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, fps: RationalFps, has_video: bool, has_audio: bool) -> Self {
         let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
         Self {
             tracks: if has_video { vec![vec![clip(ClipType::Video)]] } else { Vec::new() },
@@ -123,7 +121,7 @@ impl Snapshot {
             audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
             duration_us,
-            frame_us: frame_us.max(1),
+            fps,
         }
     }
 }
@@ -153,6 +151,8 @@ struct Shared {
     playing: AtomicBool,
     serial: AtomicU64,
     dropped: AtomicU32,
+    /// Playback has switched to cheaper decoding because it could not keep up.
+    degraded: AtomicBool,
     layers: Mutex<Option<Vec<Layer>>>,
 }
 
@@ -260,6 +260,11 @@ impl Player {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// True while playback decodes at reduced quality to keep up.
+    pub fn is_degraded(&self) -> bool {
+        self.shared.degraded.load(Ordering::Relaxed)
+    }
+
     /// Changes every time a new picture is ready.
     pub fn serial(&self) -> u64 {
         self.shared.serial.load(Ordering::Acquire)
@@ -298,6 +303,31 @@ struct Worker {
     audio_clock: bool,
     /// Last frame count seen and when, to notice a stalled sound device.
     audio_seen: (u64, Instant),
+    overload: Overload,
+}
+
+/// Notices playback that keeps missing its frame time, so decoding can get cheaper.
+#[derive(Default)]
+struct Overload {
+    /// One bit per recent frame, newest lowest: set when it took too long.
+    recent: u8,
+    degraded: bool,
+}
+
+impl Overload {
+    /// Record how long one frame took. True when playback should switch to cheaper
+    /// decoding now: three of the last six frames took over 1.25 times their time.
+    /// (Not "three in a row": with 30 fps footage in a 60 fps project every other
+    /// frame only repeats a picture, which is cheap.)
+    fn record(&mut self, spent: Duration, frame: Duration) -> bool {
+        if self.degraded {
+            return false;
+        }
+        let slow = spent.as_secs_f64() > frame.as_secs_f64() * 1.25;
+        self.recent = (self.recent << 1) | slow as u8;
+        self.degraded = (self.recent & 0b11_1111).count_ones() >= 3;
+        self.degraded
+    }
 }
 
 impl Worker {
@@ -318,16 +348,10 @@ impl Worker {
             feeder,
             audio_clock: false,
             audio_seen: (0, Instant::now()),
+            overload: Overload::default(),
             rx,
             shared,
-            timeline: Arc::new(Snapshot {
-                tracks: Vec::new(),
-                audio: Vec::new(),
-                sources: HashMap::new(),
-                audio_sources: HashMap::new(),
-                duration_us: 0,
-                frame_us: 33_333,
-            }),
+            timeline: Arc::new(Snapshot::empty()),
             source: None,
             timeline_pos: 0,
             decoders: Vec::new(),
@@ -353,9 +377,44 @@ impl Worker {
     }
 
     fn set_playing(&mut self, playing: bool) {
+        // Every start and stop of playback returns to full quality.
+        self.set_degraded(false);
         self.playing = playing;
         self.shared.playing.store(playing, Ordering::Release);
         self.restart_clock();
+    }
+
+    /// Height pictures are decoded at: the preview quality, halved while degraded.
+    fn output_height(&self) -> u32 {
+        match (self.overload.degraded, self.max_height) {
+            (false, h) => h,
+            (true, 0) => 540,
+            (true, h) => (h / 2).max(270),
+        }
+    }
+
+    /// Switch cheaper decoding on or off for every open decoder. Turning it off redraws
+    /// the current picture at full quality.
+    fn set_degraded(&mut self, on: bool) {
+        if !on {
+            self.overload = Overload::default();
+        }
+        // `overload` says what is wanted; the shared flag says what the decoders were told.
+        if self.shared.degraded.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        let height = self.output_height();
+        for (_, _, d) in &mut self.decoders {
+            d.set_fast_decode(on);
+            d.set_max_output_height(height);
+        }
+        if on {
+            tracing::info!("playback can't keep up; decoding at reduced quality until it stops");
+        } else {
+            self.exact = true;
+            self.dirty = true;
+            self.last_shown.clear();
+        }
     }
 
     /// Start or stop sound to match the transport. Sound plays only at normal
@@ -412,6 +471,9 @@ impl Worker {
                 self.last_shown.clear();
             }
             Cmd::Seek { us, exact } => {
+                if exact {
+                    self.set_degraded(false);
+                }
                 self.pos_us = us;
                 self.exact = exact;
                 self.dirty = true;
@@ -441,8 +503,9 @@ impl Worker {
             }
             Cmd::MaxHeight(h) => {
                 self.max_height = h;
+                let height = self.output_height();
                 for (_, _, d) in &mut self.decoders {
-                    d.set_max_output_height(h);
+                    d.set_max_output_height(height);
                 }
                 self.dirty = true;
                 self.last_shown.clear();
@@ -527,8 +590,11 @@ impl Worker {
             self.dirty = false;
 
             if self.playing {
-                let frame = Duration::from_micros((snap.frame_us as f64 / self.speed.abs().max(1.0)) as u64);
+                let frame = Duration::from_micros((snap.fps.frame_duration_us().max(1) as f64 / self.speed.abs().max(1.0)) as u64);
                 let spent = started.elapsed();
+                if self.overload.record(spent, frame) {
+                    self.set_degraded(true);
+                }
                 if spent > frame {
                     self.shared.dropped.fetch_add((spent.as_micros() / frame.as_micros().max(1)) as u32, Ordering::Relaxed);
                 } else {
@@ -553,10 +619,7 @@ impl Worker {
             .iter()
             .filter_map(|clips| clips.iter().find(|c| c.contains_point(pos)))
             .filter(|c| c.properties.enabled)
-            .map(|c| {
-                let offset = c.source_offset_at(pos);
-                (c, offset - offset % snap.frame_us)
-            })
+            .map(|c| (c, source_request_us(c, pos, snap.fps)))
             .collect();
 
         // Skip the work if this exact picture is already on screen. A title's key
@@ -603,7 +666,8 @@ impl Worker {
         } else {
             match FfmpegDecoder::open(path) {
                 Ok(mut d) => {
-                    d.set_max_output_height(self.max_height);
+                    d.set_max_output_height(self.output_height());
+                    d.set_fast_decode(self.overload.degraded);
                     if self.decoders.len() >= MAX_OPEN_DECODERS {
                         self.decoders.remove(0);
                     }
@@ -633,12 +697,43 @@ const FEED_FRAMES: usize = OUT_RATE as usize / 100;
 const FEED_AHEAD_FRAMES: usize = OUT_RATE as usize / 5;
 const MAX_OPEN_READERS: usize = 4;
 
+/// How many source frames one mixing block of a retimed clip covers, starting at
+/// timeline position `pos_us`: exactly up to where the next block starts, rounded the way
+/// `AudioReader` rounds, so consecutive reads join up and the reader never seeks back.
+fn source_frames(clip: &Clip, pos_us: i64) -> usize {
+    let frame = |us: i64| us.max(0) * OUT_RATE as i64 / 1_000_000;
+    let next = pos_us + (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+    (frame(clip.source_offset_at(next)) - frame(clip.source_offset_at(pos_us))).max(1) as usize
+}
+
+/// Resample interleaved stereo `src` to fill `out`, by straight-line interpolation.
+/// Used for retimed clips: reading `speed` times as much sound into one block plays it
+/// faster (or slower), with the pitch moving too, as in Resolve on Linux and Windows.
+fn stretch(src: &[f32], out: &mut [f32]) {
+    let (n, m) = (src.len() / OUT_CHANNELS, out.len() / OUT_CHANNELS);
+    if n == 0 {
+        out.fill(0.0);
+        return;
+    }
+    let step = n as f64 / m.max(1) as f64;
+    for (i, frame) in out.chunks_exact_mut(OUT_CHANNELS).enumerate() {
+        let x = i as f64 * step;
+        let (j, t) = (x as usize, (x - x.floor()) as f32);
+        let (a, b) = (j.min(n - 1), (j + 1).min(n - 1));
+        for (c, sample) in frame.iter_mut().enumerate() {
+            *sample = src[a * OUT_CHANNELS + c] * (1.0 - t) + src[b * OUT_CHANNELS + c] * t;
+        }
+    }
+}
+
 /// Mixes the audio tracks and keeps the output queue topped up while playing.
 fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
-    let mut readers: Vec<(Uuid, AudioReader)> = Vec::new();
+    let mut readers: Vec<(Uuid, PathBuf, AudioReader)> = Vec::new();
     let mut job: Option<(Arc<Snapshot>, i64)> = None;
     let mut mix = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
     let mut part = vec![0.0f32; FEED_FRAMES * OUT_CHANNELS];
+    // Room for a block of a clip at the fastest speed, allocated once.
+    let mut source = vec![0.0f32; (FEED_FRAMES as f64 * tempo_timeline::MAX_SPEED).ceil() as usize * OUT_CHANNELS];
     loop {
         // Idle: wait for work. Playing: look for a command without waiting.
         let cmd = if job.is_none() {
@@ -655,7 +750,9 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         };
         match cmd {
             Some(Feed::Start { snapshot, pos_us }) => {
-                readers.retain(|(id, _)| snapshot.audio_sources.contains_key(id));
+                // Keep readers of a file the source may still be read from: its proxy or its
+                // original. (A proxy without sound would otherwise be retried on every play.)
+                readers.retain(|(id, path, _)| snapshot.sources.get(id) == Some(path) || snapshot.audio_sources.get(id) == Some(path));
                 job = Some((snapshot, pos_us));
                 continue;
             }
@@ -678,9 +775,18 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             if clip.properties.muted || !clip.properties.enabled {
                 continue;
             }
-            let Some(path) = snapshot.audio_sources.get(&clip.source_id) else { continue };
-            let Some(reader) = reader_for(&mut readers, clip.source_id, path) else { continue };
-            reader.read(clip.source_offset_at(*pos_us), &mut part);
+            let original = snapshot.audio_sources.get(&clip.source_id);
+            let Some(preferred) = snapshot.sources.get(&clip.source_id).or(original) else { continue };
+            let Some(reader) = reader_for(&mut readers, clip.source_id, preferred, original) else { continue };
+            let speed = clip.properties.speed;
+            if speed == 1.0 {
+                reader.read(clip.source_offset_at(*pos_us), &mut part);
+            } else {
+                let frames = source_frames(clip, *pos_us).min(source.len() / OUT_CHANNELS);
+                let block = &mut source[..frames * OUT_CHANNELS];
+                reader.read(clip.source_offset_at(*pos_us), block);
+                stretch(block, &mut part);
+            }
             let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us);
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
             let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
@@ -697,23 +803,161 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
     }
 }
 
-fn reader_for<'a>(readers: &'a mut Vec<(Uuid, AudioReader)>, id: Uuid, path: &PathBuf) -> Option<&'a mut AudioReader> {
-    if let Some(idx) = readers.iter().position(|(r, _)| *r == id) {
+/// The open reader for a source, opening `preferred` (or, if it has no sound, `fallback`).
+fn reader_for<'a>(readers: &'a mut Vec<(Uuid, PathBuf, AudioReader)>, id: Uuid, preferred: &PathBuf, fallback: Option<&PathBuf>) -> Option<&'a mut AudioReader> {
+    if let Some(idx) = readers.iter().position(|(r, _, _)| *r == id) {
         let entry = readers.remove(idx);
         readers.push(entry);
     } else {
-        match AudioReader::open(path) {
-            Ok(r) => {
-                if readers.len() >= MAX_OPEN_READERS {
-                    readers.remove(0);
-                }
-                readers.push((id, r));
-            }
+        let opened = std::iter::once(preferred).chain(fallback.filter(|f| *f != preferred)).find_map(|path| match AudioReader::open(path) {
+            Ok(r) => Some((path.clone(), r)),
             Err(e) => {
                 tracing::debug!("no sound from {}: {e}", path.display());
-                return None;
+                None
             }
+        });
+        let (path, reader) = opened?;
+        if readers.len() >= MAX_OPEN_READERS {
+            readers.remove(0);
+        }
+        readers.push((id, path, reader));
+    }
+    readers.last_mut().map(|(_, _, r)| r)
+}
+
+/// The audio tracks playback hears: those not muted, and only the soloed ones when any
+/// track is soloed. Solo is for listening only; export does not look at it.
+fn audible_tracks(timeline: &tempo_timeline::Timeline) -> impl Iterator<Item = &tempo_timeline::Track> {
+    let audio = || timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled);
+    let any_solo = audio().any(|t| t.solo);
+    audio().filter(move |t| !any_solo || t.solo)
+}
+
+/// Source time to decode for the picture shown at timeline position `pos`: the start of
+/// the project frame that holds `pos`, mapped into the clip and never before its In point.
+/// The same timeline frame always asks for the same source time, so it is decoded once.
+fn source_request_us(clip: &Clip, pos: i64, fps: RationalFps) -> i64 {
+    if fps.num == 0 || fps.den == 0 {
+        return clip.source_offset_at(pos);
+    }
+    let frame = (pos.max(0) as i128 * fps.num as i128 / (1_000_000 * fps.den as i128)) as i64;
+    clip.source_offset_at(frame_to_us(frame, fps).max(clip.timeline_in))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(timeline_in: i64, source_in: i64) -> Clip {
+        Clip::new(Uuid::nil(), Uuid::nil(), ClipType::Video, "c", timeline_in, timeline_in + 5_000_000, source_in, source_in + 5_000_000)
+    }
+
+    const FRAME: Duration = Duration::from_millis(33);
+
+    #[test]
+    fn overload_enters_after_three_consecutive_slow_frames() {
+        let mut o = Overload::default();
+        let slow = FRAME * 2;
+        assert!(!o.record(slow, FRAME));
+        assert!(!o.record(slow, FRAME));
+        assert!(o.record(slow, FRAME));
+        // Entered once; further slow frames don't ask again.
+        assert!(!o.record(slow, FRAME));
+        assert!(o.degraded);
+    }
+
+    #[test]
+    fn occasional_slow_frames_are_tolerated() {
+        let mut o = Overload::default();
+        // One slow frame in every three never makes three in six.
+        for _ in 0..20 {
+            assert!(!o.record(FRAME * 2, FRAME));
+            assert!(!o.record(FRAME, FRAME));
+            assert!(!o.record(FRAME, FRAME));
         }
     }
-    readers.last_mut().map(|(_, r)| r)
+
+    #[test]
+    fn every_other_frame_slow_is_an_overload() {
+        // 30 fps footage in a 60 fps project: the repeated pictures are cheap.
+        let mut o = Overload::default();
+        let entered = (0..6).any(|i| o.record(if i % 2 == 0 { FRAME * 2 } else { FRAME / 10 }, FRAME));
+        assert!(entered);
+    }
+
+    #[test]
+    fn slightly_slow_frames_are_tolerated() {
+        let mut o = Overload::default();
+        for _ in 0..10 {
+            assert!(!o.record(FRAME * 6 / 5, FRAME)); // 1.2x is within 1.25x
+        }
+    }
+
+    #[test]
+    fn stretch_fills_the_block_and_reads_the_source_at_speed() {
+        // A ramp of 8 stereo frames read at double speed into 4 frames: every other one.
+        let src: Vec<f32> = (0..8).flat_map(|i| [i as f32, -(i as f32)]).collect();
+        let mut out = vec![9.0f32; 4 * 2];
+        stretch(&src, &mut out);
+        assert_eq!(out, [0.0, -0.0, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0]);
+        // Half speed: 2 source frames spread over 4, in between values interpolated.
+        let mut slow = vec![0.0f32; 4 * 2];
+        stretch(&[0.0, 0.0, 1.0, 1.0], &mut slow);
+        assert_eq!(slow, [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn retimed_blocks_read_the_source_without_gaps_or_overlaps() {
+        // At 36 % a block needs 172.8 source frames. Rounding each block on its own read
+        // one frame too many, so the next block started behind the reader and it seeked.
+        let mut c = clip(0, 1_000_000);
+        c.properties.speed = 0.36;
+        let start = |pos: i64| c.source_offset_at(pos) * OUT_RATE as i64 / 1_000_000;
+        let step = (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+        for block in 0..200 {
+            let pos = block * step;
+            assert_eq!(start(pos) + source_frames(&c, pos) as i64, start(pos + step), "block {block}");
+        }
+    }
+
+    #[test]
+    fn solo_plays_only_soloed_audio_tracks() {
+        let mut timeline = tempo_timeline::Timeline::new_default();
+        let names = |t: &tempo_timeline::Timeline| audible_tracks(t).map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&timeline), ["Audio 1", "Audio 2"]);
+        let a2 = timeline.tracks.iter_mut().find(|t| t.name == "Audio 2").unwrap();
+        a2.solo = true;
+        assert_eq!(names(&timeline), ["Audio 2"]);
+        // A muted track stays silent even when soloed.
+        timeline.tracks.iter_mut().find(|t| t.name == "Audio 2").unwrap().enabled = false;
+        assert_eq!(names(&timeline), ["Audio 1"]);
+    }
+
+    #[test]
+    fn first_timeline_frame_never_requests_before_source_in() {
+        // Rounding the source offset on the project grid used to ask for 33 333 here.
+        let c = clip(0, 50_000);
+        assert_eq!(source_request_us(&c, 0, RationalFps::FPS_30), 50_000);
+        assert_eq!(source_request_us(&c, 40_000, RationalFps::FPS_30), 50_000 + 33_333);
+    }
+
+    #[test]
+    fn clip_starting_between_frames_starts_at_its_in_point() {
+        let c = clip(110_000, 2_000_000);
+        for fps in [RationalFps::FPS_24, RationalFps::FPS_30, RationalFps::FPS_60] {
+            assert_eq!(source_request_us(&c, 110_000, fps), 2_000_000);
+        }
+    }
+
+    #[test]
+    fn ntsc_rates_stay_on_the_rational_grid_after_an_hour() {
+        let fps = RationalFps::FPS_29_97;
+        let c = clip(0, 0);
+        let pos = 3_600_000_000;
+        let frame = (pos as i128 * 30_000 / 1_001_000_000) as i64;
+        assert_eq!(source_request_us(&c, pos, fps), frame_to_us(frame, fps));
+        // Every position inside one frame asks for the same time.
+        let start = frame_to_us(frame, fps);
+        assert_eq!(source_request_us(&c, start + 20_000, fps), start);
+    }
 }

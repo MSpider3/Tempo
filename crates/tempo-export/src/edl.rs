@@ -51,6 +51,10 @@ pub fn export_timeline_to_edl(timeline: &Timeline, title: &str, fps: RationalFps
             "{:03}  {:<8} {:<5} {:<8} {} {} {} {}\n",
             event_num, reel, track_type, cut_type, src_in_tc, src_out_tc, rec_in_tc, rec_out_tc
         ));
+        // A retimed clip gets CMX 3600's motion line, so other editors play it at its speed.
+        if clip.properties.speed != 1.0 {
+            out.push_str(&format!("M2   {:<8} {:05.1}                {}\n", reel, fps.to_f64() * clip.properties.speed, src_in_tc));
+        }
         out.push_str(&format!("* FROM CLIP NAME: {}\n\n", clip.name));
     }
 
@@ -125,5 +129,18 @@ mod tests {
         // Assert valid timecodes
         assert!(edl_output.contains("00:00:00:00 00:00:02:00 00:00:00:00 00:00:02:00"));
         assert!(edl_output.contains("00:00:01:00 00:00:06:00 00:00:02:00 00:00:07:00"));
+    }
+
+    #[test]
+    fn retimed_clips_get_a_motion_line() {
+        let mut timeline = Timeline::new();
+        let track = Track::new(TrackKind::Video, 1, "V1", 0);
+        let mut clip = Clip::new(track.id, Uuid::new_v4(), ClipType::Video, "Fast.mp4", 0, 2_000_000, 1_000_000, 5_000_000);
+        clip.properties.speed = 2.0;
+        timeline.tracks.push(track);
+        timeline.tracks[0].clips.push(clip);
+        let edl = export_timeline_to_edl(&timeline, "T", RationalFps::FPS_25);
+        // CMX 3600: the speed as frames per second (25 x 2), and the source In.
+        assert!(edl.contains("M2   AX       050.0                00:00:01:00"), "{edl}");
     }
 }

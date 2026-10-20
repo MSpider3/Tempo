@@ -6,6 +6,88 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
+Alpha. Built for slower computers first:
+- playback copes with heavy footage;
+- proxies are faster and include sound;
+- backups are kept the way Resolve keeps them;
+- a set of Resolve Edit page tools beginners reach for: clip speed, fade handles, Solo,
+  matching the project to the first clip, and a 10 MB export for Discord.
+
+### Added
+
+- **Change Clip Speed** on `R`, as in DaVinci Resolve. You set a speed from 25 % to 400 %.
+  - With **Ripple Sequence** on (the default), the clip changes length and later clips move
+    with it.
+  - With it off, the clip keeps its length and never covers the next clip.
+  - The linked sound changes with the picture.
+  - The sound's pitch moves with the speed, in preview and in export.
+  - Retimed clips show their speed after their name.
+- **Fade handles** on timeline clips: hover a clip and drag a top corner toward the middle.
+  Fades snap to whole frames and are drawn as ramps.
+- **Solo** (`S`) on audio track headers. It is for listening only: export still includes every
+  enabled track.
+- **Change Project Frame Rate?** When the first video goes into an empty project, Tempo
+  offers to match the project to the clip's size and frame rate. Odd rates snap to the
+  nearest standard one, and portrait clips get a vertical project.
+- **Project Backups**, kept like Resolve's: every 10 minutes while you edit, 6 from the last
+  hour, one per hour for today and one per day for 5 days.
+  - Each backup is checked before it is kept.
+  - Right-click a project and choose **Project Backups…** to open one as a copy. The
+    original is never changed.
+  - A project written by an older Tempo is copied to `<file>.v<N>.bak` before it is upgraded.
+- A **≤ 10 MB** export card for Discord and email. It picks the bitrate (and 720p when
+  needed) so the file fits, and is greyed out when the export is too long to fit watchably.
+- Shortcut hints in the bottom bar for what is under the pointer, read from the keybind
+  table.
+- `scripts/bench_playback.sh` and `docs/PERF.md`: a playback benchmark and its results,
+  including hardware (VA-API) playback, proxies and export.
+- `CONTRIBUTING.md`: what Tempo accepts and how to contribute. Weak computers and beginners
+  come first, the layout and keys stay DaVinci Resolve's, and effects and titles come as
+  plugins.
+
+### Changed
+
+- **Project files move to schema 2**, so clips with a changed speed can be saved. A project
+  from 0.1.x is copied to `<file>.v1.bak` the first time 0.2.0 opens it. Tempo 0.1.x can't
+  open a project once 0.2.0 has saved it; keep the `.v1.bak` if you need to go back.
+- Playback decodes more cheaply (no deblocking, half height) while it can't keep up, and
+  returns to full quality when it stops or seeks. On a 4K60 stress clip, dropped frames
+  fell from 83 % to 9.5 %.
+- Moving the playhead no longer redraws the whole timeline. Redraws during playback fell
+  from about 30 per second to none.
+- Decoded frames are shared with the viewer instead of copied (CPU at Full preview
+  quality 52 → 45 %).
+- Proxies:
+  - They are made only for footage that is on the timeline.
+  - They are made entirely on the graphics chip when it can (VA-API decode, scale and
+    encode: 5× faster on a 4K clip, at a third of the CPU), falling back to the processor.
+  - They now carry the clip's sound, so playback reads one small file.
+- At start-up Tempo checks whether hardware decoding and encoding really work. If saved
+  settings ask for something the machine can't do, those settings are switched off and
+  you are told once.
+- Titles are beige on the timeline, and clips with adjustments are a darker shade, as in
+  Resolve.
+- Choosing a tall format (9:16 or 4:5) on a landscape timeline defaults to Fill.
+- Track header buttons are smaller and left-aligned.
+
+### Fixed
+
+- A failed undo could leave the undo history out of step with the timeline.
+- A project whose clip settings could not be read opened with those settings reset, and
+  the next save made the loss permanent. Such a project now refuses to open and points to
+  its backups.
+- A proxy marked ready whose file was gone was never rebuilt.
+- Playback could show a frame from before a clip's In point. The frame grid also no
+  longer drifts at 29.97 and 59.94 fps.
+- With hardware decoding on, playing past the end of a file failed to show a picture.
+- An export with a size limit failed if hardware encoding was switched on.
+
+### Removed
+
+- Three files in `tempo-audio` that were never compiled.
+
 ## [0.1.1] - 2026-10-06
 
 Alpha. Fixes for the problems found in the first hands-on test of 0.1.0, and for more of
@@ -149,5 +231,7 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
 - The wgpu renderer, the WebAssembly plugin host and the Python helper, none of which the
   editor used any more.
 
-[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MSpider3/Tempo/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/MSpider3/Tempo/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MSpider3/Tempo/releases/tag/v0.1.0
