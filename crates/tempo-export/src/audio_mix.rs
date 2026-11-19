@@ -76,9 +76,10 @@ fn piece(clip: &Clip, from: i64, to: i64, source_in: i64) -> Clip {
 }
 
 /// Builds the strips and ramps for an audio track. Strip 0 is the track's clips; the
-/// next two hold the handle pieces before and after the cuts. (shortcut: pieces of two
-/// transitions that overlap each other in one strip are not both heard; real overlaps need
-/// transitions shorter than a clip, which the model limits.)
+/// next two hold the handle pieces before and after the cuts. A cut's ramps cover only the
+/// footage there is (before the cut: the incoming clip's head, after it: the outgoing
+/// clip's tail), each side also limited to the neighbouring clip's length so pieces in one
+/// strip never overlap; with no footage on either side it is a plain cut.
 pub fn audio_strips(track: &Track, sources: &HashMap<Uuid, MediaSource>) -> AudioStrips {
     let mut out = AudioStrips { strips: vec![track.clips.clone(), Vec::new(), Vec::new()], ramps: HashMap::new() };
     let mut ramp = |id: Uuid, r: Ramp| out.ramps.entry(id).or_default().push(r);
@@ -90,24 +91,28 @@ pub fn audio_strips(track: &Track, sources: &HashMap<Uuid, MediaSource>) -> Audi
             continue;
         }
         let outgoing = (t.edge == TransitionEdge::In).then(|| track.clips.iter().find(|c| c.id != clip.id && c.timeline_out == clip.timeline_in)).flatten();
-        let r = |rising, equal_power| Ramp { start_us, end_us, rising, equal_power };
         let Some(outgoing) = outgoing else {
-            ramp(clip.id, r(t.edge == TransitionEdge::In, false));
+            let r = |rising| Ramp { start_us, end_us, rising, equal_power: false };
+            ramp(clip.id, r(t.edge == TransitionEdge::In));
             continue;
         };
-        ramp(outgoing.id, r(false, true));
-        ramp(clip.id, r(true, true));
         let cut = clip.timeline_in;
-        let before = (cut - start_us).min(head_room(clip));
+        let before = (cut - start_us).min(head_room(clip)).min(outgoing.duration_us()).max(0);
+        let after = (end_us - cut).min(tail_room(outgoing, sources)).min(clip.duration_us()).max(0);
+        if before + after == 0 {
+            continue;
+        }
+        let r = |rising| Ramp { start_us: cut - before, end_us: cut + after, rising, equal_power: true };
+        ramp(outgoing.id, r(false));
+        ramp(clip.id, r(true));
         if before > 0 && clip.clip_type == ClipType::Audio {
-            let p = piece(clip, cut - before, cut, (clip.source_in - clip.to_source_us(before)).max(0));
-            ramp(p.id, r(true, true));
+            let p = piece(clip, cut - before, cut, clip.source_in - clip.to_source_us(before));
+            ramp(p.id, r(true));
             heads.push(p);
         }
-        let after = (end_us - cut).min(tail_room(outgoing, sources));
         if after > 0 && outgoing.clip_type == ClipType::Audio {
             let p = piece(outgoing, cut, cut + after, outgoing.source_out);
-            ramp(p.id, r(false, true));
+            ramp(p.id, r(false));
             tails.push(p);
         }
     }
@@ -120,6 +125,7 @@ pub fn audio_strips(track: &Track, sources: &HashMap<Uuid, MediaSource>) -> Audi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempo_timeline::{TransitionEdge, TransitionKind};
 
     #[test]
     fn equal_power_ramps_keep_constant_power() {
@@ -130,5 +136,30 @@ mod tests {
         }
         assert_eq!(down.gain_at(-5), 1.0);
         assert_eq!(up.gain_at(500), 1.0);
+    }
+
+    /// A[0,4s] and B[4,8s] where B has no footage before its in-point: a centred 1 s
+    /// cross fade can only use A's tail, so the fade shrinks to [4s,4.5s] and the summed power
+    /// stays level with no step at the cut.
+    #[test]
+    fn cross_fade_without_a_head_handle_keeps_power_level() {
+        use tempo_timeline::{MediaType, Project, RationalFps, Transition, TransitionAlignment, TrackKind};
+        let mut project = Project::new("t", 320, 180, RationalFps::FPS_30);
+        let source = MediaSource::new(std::env::temp_dir().join("x.wav"), MediaType::Audio, 8_000_000);
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        let track = project.timeline.find_track_mut(a).unwrap();
+        track.clips.push(Clip::new(a, source.id, ClipType::Audio, "a", 0, 4_000_000, 1_000_000, 5_000_000));
+        track.clips.push(Clip::new(a, source.id, ClipType::Audio, "b", 4_000_000, 8_000_000, 0, 4_000_000));
+        let b = track.clips[1].id;
+        track.transitions.push(Transition::new(b, TransitionEdge::In, TransitionKind::Crossfade, 1_000_000, TransitionAlignment::Centered));
+        let sources = HashMap::from([(source.id, source)]);
+        let strips = audio_strips(project.timeline.find_track_mut(a).unwrap(), &sources);
+        let power = |t: i64| -> f32 {
+            strips.strips.iter().flatten().filter(|c| c.timeline_in <= t && t < c.timeline_out).map(|c| AudioStrips::gain(&strips.ramps, c, t).powi(2)).sum()
+        };
+        for t in (3_000_000..5_500_000).step_by(50_000) {
+            assert!((0.9..=1.1).contains(&power(t)), "{t}: {}", power(t));
+        }
+        assert!((power(3_999_999) - power(4_000_000)).abs() < 0.05, "{} vs {}", power(3_999_999), power(4_000_000));
     }
 }
