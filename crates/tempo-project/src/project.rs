@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 use tempo_timeline::types::{
     Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource, MediaType,
     Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition, TransitionAlignment,
-    TransitionEdge, TransitionKind, UiState,
+    TransitionEase, TransitionEdge, TransitionKind, UiState,
 };
 
 use crate::db::open_connection;
@@ -216,6 +216,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 TransitionKind::FadeFromWhite => (7, None),
                 TransitionKind::FadeToWhite => (8, None),
                 TransitionKind::Plugin(pid) => (6, Some(pid.clone())),
+                TransitionKind::DipToColor => (9, None),
             };
 
             let align_int = match trans.alignment {
@@ -224,10 +225,17 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 TransitionAlignment::EndAtCut => 2,
             };
 
+            let ease_int = match trans.ease {
+                TransitionEase::None => 0,
+                TransitionEase::In => 1,
+                TransitionEase::Out => 2,
+                TransitionEase::InOut => 3,
+            };
+
             tx.execute(
                 "INSERT INTO transitions (
-                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     trans.id.to_string(),
                     trans.clip_id.to_string(),
@@ -237,6 +245,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                     align_int,
                     plugin_id.or_else(|| trans.plugin_id.clone()),
                     trans.plugin_params.as_deref().unwrap_or("{}"),
+                    color_to_hex(trans.color),
+                    ease_int,
                 ],
             )?;
         }
@@ -498,7 +508,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
 
     // 5. Load transitions
     let mut trans_stmt = conn.prepare(
-        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params
+        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease
          FROM transitions",
     )?;
 
@@ -511,6 +521,8 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let align_int: i32 = row.get(5)?;
         let plugin_id: Option<String> = row.get(6)?;
         let plugin_params: Option<String> = row.get(7)?;
+        let color: Option<String> = row.get(8)?;
+        let ease_int: i32 = row.get(9)?;
 
         let edge = if edge_int == 0 {
             TransitionEdge::In
@@ -527,7 +539,15 @@ pub fn load_project(path: &Path) -> Result<Project> {
             5 => TransitionKind::FadeOut,
             7 => TransitionKind::FadeFromWhite,
             8 => TransitionKind::FadeToWhite,
+            9 => TransitionKind::DipToColor,
             _ => TransitionKind::Plugin(plugin_id.clone().unwrap_or_default()),
+        };
+
+        let ease = match ease_int {
+            1 => TransitionEase::In,
+            2 => TransitionEase::Out,
+            3 => TransitionEase::InOut,
+            _ => TransitionEase::None,
         };
 
         let alignment = match align_int {
@@ -545,6 +565,8 @@ pub fn load_project(path: &Path) -> Result<Project> {
             alignment,
             plugin_id,
             plugin_params,
+            color: color.map(|c| hex_to_color(&c)).transpose().map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into()))?.unwrap_or_default(),
+            ease,
         })
     })?;
 
@@ -557,6 +579,10 @@ pub fn load_project(path: &Path) -> Result<Project> {
                 break;
             }
         }
+    }
+    // Cross dissolves from before schema 4 become transitions.
+    for track in &mut tracks {
+        track.convert_legacy_dissolves();
     }
 
     // 6. Load markers
@@ -617,6 +643,22 @@ pub fn load_project(path: &Path) -> Result<Project> {
         sources,
         ui_state,
     })
+}
+
+/// `[r, g, b]` (0.0-1.0) as `#rrggbb`.
+fn color_to_hex(color: [f32; 3]) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(color[0]), byte(color[1]), byte(color[2]))
+}
+
+fn hex_to_color(hex: &str) -> std::result::Result<[f32; 3], String> {
+    let digits = hex.strip_prefix('#').filter(|d| d.len() == 6 && d.is_ascii()).ok_or_else(|| format!("bad colour {hex:?}"))?;
+    let mut color = [0.0f32; 3];
+    for (i, c) in color.iter_mut().enumerate() {
+        let byte = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).map_err(|e| format!("bad colour {hex:?}: {e}"))?;
+        *c = byte as f32 / 255.0;
+    }
+    Ok(color)
 }
 
 /// Splits loaded tracks and markers into the open timeline and the others, by the
@@ -793,6 +835,8 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
         };
         project.timeline.tracks[0].transitions.push(trans.clone());
 
@@ -896,6 +940,8 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
         };
         let t2 = Transition {
             id: Uuid::new_v4(),
@@ -906,6 +952,8 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
         };
         project.timeline.tracks[0].transitions.push(t1);
         project.timeline.tracks[0].transitions.push(t2);
@@ -1190,5 +1238,76 @@ mod tests {
     fn load_rejects_clip_on_unknown_track() {
         let (file, _) = tampered(&format!("UPDATE clips SET track_id = '{}';", Uuid::new_v4()));
         assert!(matches!(load_project(file.path()), Err(ProjectError::CorruptClip { field: "track", .. })));
+    }
+
+    /// A project with clip A [0, 2 s] and clip B [2, 4 s] (footage from 1 s) on V1.
+    fn two_clips() -> (Project, Uuid, Uuid) {
+        let mut project = Project::new("Cuts", 1920, 1080, RationalFps::FPS_25);
+        let track_id = project.timeline.tracks[0].id;
+        let a = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 0, 2_000_000);
+        let b = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "b", 2_000_000, 4_000_000, 1_000_000, 3_000_000);
+        let ids = (a.id, b.id);
+        project.timeline.tracks[0].clips = vec![a, b];
+        (project, ids.0, ids.1)
+    }
+
+    #[test]
+    fn transitions_keep_kind_colour_and_ease() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, a, b) = two_clips();
+        let mut dip = Transition::new(b, TransitionEdge::In, TransitionKind::DipToColor, 520_000, TransitionAlignment::Centered);
+        dip.color = [1.0, 0.2, 0.0];
+        dip.ease = TransitionEase::InOut;
+        let mut fade = Transition::new(a, TransitionEdge::In, TransitionKind::CrossDissolve, 1_000_000, TransitionAlignment::StartAtCut);
+        fade.ease = TransitionEase::Out;
+        project.timeline.tracks[0].transitions = vec![dip.clone(), fade.clone()];
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        let track = &loaded.timeline.tracks[0];
+        let got = track.transition_at_edit(b, TransitionEdge::In).unwrap();
+        assert_eq!((got.id, &got.kind, got.duration_us, got.alignment, got.ease), (dip.id, &TransitionKind::DipToColor, 520_000, TransitionAlignment::Centered, TransitionEase::InOut));
+        assert!(got.color.iter().zip(dip.color).all(|(x, y)| (x - y).abs() < 0.003), "{:?}", got.color);
+        let got = track.transition_at_edit(a, TransitionEdge::In).unwrap();
+        assert_eq!((got.id, &got.kind, got.alignment, got.ease, got.color), (fade.id, &fade.kind, fade.alignment, fade.ease, [0.0; 3]));
+    }
+
+    #[test]
+    fn old_cross_dissolves_load_as_transitions() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, _, b) = two_clips();
+        project.timeline.tracks[0].clips[1].properties.dissolve_in_us = 400_000;
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        let track = &loaded.timeline.tracks[0];
+        assert_eq!(track.find_clip(b).unwrap().properties.dissolve_in_us, 0);
+        let t = track.transition_at_edit(b, TransitionEdge::In).unwrap().clone();
+        assert_eq!((t.kind.clone(), t.duration_us, t.alignment), (TransitionKind::CrossDissolve, 400_000, TransitionAlignment::EndAtCut));
+
+        // Saving again keeps the one transition.
+        save_project(&loaded, file.path()).unwrap();
+        let again = load_project(file.path()).unwrap();
+        let ids: Vec<_> = again.timeline.tracks[0].transitions.iter().map(|x| (x.id, x.duration_us)).collect();
+        assert_eq!(ids, vec![(t.id, 400_000)]);
+    }
+
+    #[test]
+    fn schema_3_files_gain_transition_colour_and_ease() {
+        let (file, _) = tampered(
+            "ALTER TABLE transitions DROP COLUMN color; ALTER TABLE transitions DROP COLUMN ease; DELETE FROM schema_version WHERE version = 4;
+             INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2 FROM clips;",
+        );
+        let loaded = load_project(file.path()).unwrap();
+        let t = &loaded.timeline.tracks[0].transitions[0];
+        assert_eq!((t.color, t.ease, t.edge), ([0.0; 3], TransitionEase::None, TransitionEdge::Out));
+    }
+
+    #[test]
+    fn load_rejects_an_unreadable_transition_colour() {
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, color) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 9, 500000, 2, 'nope' FROM clips;",
+        );
+        assert!(load_project(file.path()).is_err());
     }
 }

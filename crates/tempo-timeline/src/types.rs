@@ -113,6 +113,8 @@ pub struct ClipProperties {
     pub fade_out_us: i64,
     /// Cross dissolve: this clip starts appearing this long *before* its start,
     /// over the end of the clip it touches, using footage from before its In point.
+    /// Deprecated: kept so old files still read; loading turns it into a `Transition`
+    /// (`Track::convert_legacy_dissolves`). New code adds transitions instead.
     #[serde(default)]
     pub dissolve_in_us: i64,
     /// Clips that share a link id (a video clip and its sound) are selected,
@@ -378,6 +380,9 @@ impl Clip {
 
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
+    ///
+    /// Deprecated: dissolves are `Transition`s now (see `crate::transition`); renderers
+    /// should switch to `Track::transition_layers`. Kept until they have.
     pub fn dissolve_lead(&self) -> Option<Clip> {
         let d = self.properties.dissolve_in_us.min(self.to_timeline_floor_us(self.source_in));
         if d <= 0 {
@@ -448,6 +453,9 @@ pub enum TransitionKind {
     FadeFromBlack,
     FadeFromWhite,
     Plugin(String),
+    /// Resolve's "Dip To Color Dissolve": the picture dissolves to `Transition::color`
+    /// over the first half and from it over the second.
+    DipToColor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +475,21 @@ pub struct Transition {
     pub alignment: TransitionAlignment,
     pub plugin_id: Option<String>,
     pub plugin_params: Option<String>,
+    /// Colour of a Dip To Color dissolve, RGB 0.0-1.0. Black unless set.
+    #[serde(default)]
+    pub color: [f32; 3],
+    #[serde(default)]
+    pub ease: TransitionEase,
+}
+
+/// Resolve's transition Ease setting: how the mix speeds up and slows down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransitionEase {
+    #[default]
+    None,
+    In,
+    Out,
+    InOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +597,8 @@ impl Track {
 
     /// Every dissolve lead-in on this track, as clips. A dissolve needs a clip
     /// to dissolve from: if the clip before was moved or deleted, there is none.
+    ///
+    /// Deprecated: use `Track::transition_layers`. Kept until the renderers switch.
     pub fn dissolve_leads(&self) -> Vec<Clip> {
         self.clips.iter().filter(|c| self.has_clip_ending_at(c.timeline_in)).filter_map(Clip::dissolve_lead).collect()
     }
@@ -884,6 +909,71 @@ impl Project {
     /// Adds `timeline` and opens it.
     pub fn add_timeline(&mut self, timeline: Timeline) {
         self.timelines.push(std::mem::replace(&mut self.timeline, timeline));
+    }
+
+    fn timeline_mut(&mut self, id: Uuid) -> Option<&mut Timeline> {
+        std::iter::once(&mut self.timeline).chain(&mut self.timelines).find(|t| t.id == id)
+    }
+
+    fn timeline_name_taken(&self, name: &str, except: Option<Uuid>) -> bool {
+        self.timeline_list().iter().any(|(id, n)| Some(*id) != except && n.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames timeline `id`. False when there is no such timeline, the name is blank or
+    /// another timeline already has it (case ignored).
+    pub fn rename_timeline(&mut self, id: Uuid, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.timeline_name_taken(name, Some(id)) {
+            return false;
+        }
+        let Some(timeline) = self.timeline_mut(id) else { return false };
+        timeline.name = name.to_string();
+        true
+    }
+
+    /// Deletes timeline `id`. False for the open timeline (so the last one always stays)
+    /// or one that does not exist.
+    pub fn remove_timeline(&mut self, id: Uuid) -> bool {
+        let Some(i) = self.timelines.iter().position(|t| t.id == id) else { return false };
+        self.timelines.remove(i);
+        true
+    }
+
+    /// Adds a copy of timeline `id`, not opened, named "<name> Copy" (or "Copy 2", …).
+    /// Everything in it gets new ids, with links and transitions following their clips.
+    pub fn duplicate_timeline(&mut self, id: Uuid) -> Option<Uuid> {
+        let mut copy = std::iter::once(&self.timeline).chain(&self.timelines).find(|t| t.id == id)?.clone();
+        let base = format!("{} Copy", copy.name);
+        copy.name = std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base} {n}")))
+            .find(|n| !self.timeline_name_taken(n, None))
+            .unwrap_or(base);
+        copy.id = Uuid::new_v4();
+        let mut links: HashMap<Uuid, Uuid> = HashMap::new();
+        for track in &mut copy.tracks {
+            track.id = Uuid::new_v4();
+            let mut clip_ids: HashMap<Uuid, Uuid> = HashMap::new();
+            for clip in &mut track.clips {
+                let new_id = Uuid::new_v4();
+                clip_ids.insert(clip.id, new_id);
+                clip.id = new_id;
+                clip.track_id = track.id;
+                if let Some(link) = clip.properties.link {
+                    clip.properties.link = Some(*links.entry(link).or_insert_with(Uuid::new_v4));
+                }
+            }
+            // A transition whose clip is gone would be dropped on the next load anyway.
+            track.transitions.retain_mut(|t| {
+                t.id = Uuid::new_v4();
+                clip_ids.get(&t.clip_id).map(|c| t.clip_id = *c).is_some()
+            });
+        }
+        for marker in &mut copy.markers {
+            marker.id = Uuid::new_v4();
+        }
+        let new_id = copy.id;
+        self.timelines.push(copy);
+        Some(new_id)
     }
 
     /// "Timeline N" with the first N no timeline uses yet.
@@ -1533,5 +1623,72 @@ mod tests {
         let back: Project = serde_json::from_value(v).unwrap();
         assert!(back.timelines.is_empty());
         assert_eq!(back.timeline.name, "Timeline 1");
+    }
+
+    fn project_with_a_second_timeline() -> (Project, Uuid, Uuid) {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let first = p.timeline.id;
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let open = p.timeline.id;
+        (p, first, open)
+    }
+
+    #[test]
+    fn rename_timeline_refuses_blank_and_taken_names() {
+        let (mut p, first, open) = project_with_a_second_timeline();
+        assert!(p.rename_timeline(first, "  Edit  "));
+        assert!(p.rename_timeline(open, "Grade"));
+        assert_eq!(p.timeline.name, "Grade");
+        assert!(!p.rename_timeline(open, "edit"));
+        assert!(!p.rename_timeline(open, "   "));
+        assert!(!p.rename_timeline(Uuid::new_v4(), "Other"));
+        assert!(p.rename_timeline(open, "GRADE"));
+        let names: Vec<_> = p.timeline_list().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["Edit", "GRADE"]);
+    }
+
+    #[test]
+    fn remove_timeline_keeps_the_open_one() {
+        let (mut p, first, open) = project_with_a_second_timeline();
+        assert!(!p.remove_timeline(open));
+        assert!(p.remove_timeline(first));
+        assert!(!p.remove_timeline(first));
+        assert_eq!(p.timeline_list().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_timeline_copies_everything_under_new_ids() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let (v, a) = (p.timeline.tracks[0].id, p.timeline.tracks[2].id);
+        let link = Uuid::new_v4();
+        let mut pic = Clip::new(v, Uuid::new_v4(), ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000);
+        let mut snd = Clip::new(a, pic.source_id, ClipType::Audio, "c", 0, 1_000_000, 0, 1_000_000);
+        (pic.properties.link, snd.properties.link) = (Some(link), Some(link));
+        let t = Transition::new(pic.id, TransitionEdge::Out, TransitionKind::DipToColor, 500_000, TransitionAlignment::EndAtCut);
+        p.timeline.tracks[0].clips.push(pic.clone());
+        p.timeline.tracks[0].transitions.push(t.clone());
+        p.timeline.tracks[2].clips.push(snd);
+        p.timeline.add_marker(Marker::new(0, "m", MarkerColor::Red));
+        let original = p.timeline.clone();
+
+        let id = p.duplicate_timeline(original.id).unwrap();
+        let again = p.duplicate_timeline(original.id).unwrap();
+        assert_eq!(p.timeline, original, "the open timeline is untouched and stays open");
+        let copy = p.timelines.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(copy.name, "Timeline 1 Copy");
+        assert_eq!(p.timelines.iter().find(|t| t.id == again).unwrap().name, "Timeline 1 Copy 2");
+        assert_ne!(copy.markers[0].id, original.markers[0].id);
+        let (cv, ca) = (&copy.tracks[0], &copy.tracks[2]);
+        assert_ne!(cv.id, v);
+        let (cpic, csnd) = (&cv.clips[0], &ca.clips[0]);
+        assert_ne!(cpic.id, pic.id);
+        assert_eq!(cpic.track_id, cv.id);
+        assert_eq!(csnd.track_id, ca.id);
+        assert_eq!(cpic.properties.link, csnd.properties.link);
+        assert_ne!(cpic.properties.link, Some(link));
+        let ct = &cv.transitions[0];
+        assert_ne!(ct.id, t.id);
+        assert_eq!((ct.clip_id, ct.kind.clone(), ct.duration_us), (cpic.id, TransitionKind::DipToColor, 500_000));
+        assert_eq!(p.duplicate_timeline(Uuid::new_v4()), None);
     }
 }
