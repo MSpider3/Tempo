@@ -125,6 +125,31 @@ impl Transition {
         (self.start_ratio + (self.end_ratio - self.start_ratio) * self.curve_at(u)).clamp(0.0, 1.0)
     }
 
+    /// True when the mix runs straight from 0 to 1 (default Inspector settings), so the
+    /// plain linear ramps already draw it exactly.
+    pub fn is_linear(&self) -> bool {
+        self.curve.is_empty() && self.ease == TransitionEase::None && self.start_ratio == 0.0 && self.end_ratio == 1.0
+    }
+
+    /// Where through the transition (0.0-1.0) the mix first reaches half: where a dip
+    /// switches from the outgoing to the incoming picture.
+    pub fn half_point(&self) -> f32 {
+        if self.curve.is_empty() && self.ease == TransitionEase::None {
+            let span = self.end_ratio - self.start_ratio;
+            return if span.abs() < f32::EPSILON { 1.0 } else { ((0.5 - self.start_ratio) / span).clamp(0.0, 1.0) };
+        }
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = (lo + hi) / 2.0;
+            if self.progress_at(mid) < 0.5 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        hi
+    }
+
     /// This transition with a Transition Curve key of `value` at `u`, replacing a key
     /// within a hundredth of it, as typing a value in Resolve's Inspector keys the playhead.
     pub fn with_curve_key(&self, u: f32, value: f32) -> Self {
@@ -167,7 +192,7 @@ pub struct EditTarget {
 }
 
 /// A full-frame solid colour drawn over a span, for dip transitions.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColorLayer {
     pub start_us: i64,
     pub end_us: i64,
@@ -177,6 +202,9 @@ pub struct ColorLayer {
     /// `fade_out_us` before `end_us`, as `Clip::fade_factor` does for clips.
     pub fade_in_us: i64,
     pub fade_out_us: i64,
+    /// The transition's shaping, when not the default straight ramp: opacity then follows
+    /// its progress (see `opacity_at`) instead of the fades above.
+    pub shape: Option<Box<Transition>>,
 }
 
 impl ColorLayer {
@@ -186,6 +214,15 @@ impl ColorLayer {
             return 0.0;
         }
         let (from_start, to_end) = (time_us - self.start_us, self.end_us - time_us);
+        if let Some(t) = &self.shape {
+            let p = t.progress_at(from_start as f32 / (self.end_us - self.start_us) as f32);
+            // Fading out only: the colour starts full; fading in only: it ends full; else a dip.
+            return match (self.fade_in_us > 0, self.fade_out_us > 0) {
+                (false, _) => 1.0 - p,
+                (_, false) => p,
+                _ => 1.0 - (2.0 * p - 1.0).abs(),
+            };
+        }
         let mut factor = 1.0f32;
         if self.fade_in_us > 0 && from_start < self.fade_in_us {
             factor = factor.min(from_start as f32 / self.fade_in_us as f32);
@@ -385,22 +422,24 @@ impl Track {
         let (mut heads, mut tails) = (HashMap::new(), HashMap::new());
         for t in self.transitions.iter().filter(|t| t.kind != TransitionKind::Cut) {
             let dip = t.dip_color();
+            // Sound mixes and a clip's own fades stay linear; only video follows the Inspector curve.
+            let shape = (self.kind == crate::types::TrackKind::Video && !t.is_linear()).then(|| Box::new(t.clone()));
             match self.shape(t) {
                 Some(Shape::Cut { outgoing, incoming, before, after }) => {
                     let before = before.min(head_room(incoming));
                     let after = after.min(tail_room(outgoing, sources));
-                    add_cut(&mut layers, outgoing, incoming, before, after, dip);
+                    add_cut(&mut layers, outgoing, incoming, (before, after), dip, shape);
                 }
                 Some(Shape::Head(clip, len)) if len > 0 => match dip {
-                    Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_in, end_us: clip.timeline_in + len, color, fade_in_us: 0, fade_out_us: len }),
+                    Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_in, end_us: clip.timeline_in + len, color, fade_in_us: 0, fade_out_us: len, shape }),
                     None => {
-                        heads.insert(clip.id, len);
+                        heads.insert(clip.id, (len, shape));
                     }
                 },
                 Some(Shape::Tail(clip, len)) if len > 0 => match dip {
-                    Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_out - len, end_us: clip.timeline_out, color, fade_in_us: len, fade_out_us: 0 }),
+                    Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_out - len, end_us: clip.timeline_out, color, fade_in_us: len, fade_out_us: 0, shape }),
                     None => {
-                        tails.insert(clip.id, len);
+                        tails.insert(clip.id, (len, shape));
                     }
                 },
                 _ => {}
@@ -411,10 +450,14 @@ impl Track {
         // clip's own fades give way to them.
         for c in &mut layers.clips {
             let dur = c.duration_us();
-            let (t_in, t_out) = (heads.get(&c.id).copied().unwrap_or(0), tails.get(&c.id).copied().unwrap_or(0));
+            let (head, tail) = (heads.remove(&c.id), tails.remove(&c.id));
+            let (t_in, t_out) = (head.as_ref().map_or(0, |h| h.0), tail.as_ref().map_or(0, |t| t.0));
             let p = &mut c.properties;
             p.fade_in_us = p.fade_in_us.max(t_in).clamp(0, (dur - t_out).max(0));
             p.fade_out_us = p.fade_out_us.max(t_out).clamp(0, (dur - p.fade_in_us).max(0));
+            // Shape the fade only when it is the transition's (a longer own fade wins, linear).
+            p.fade_in_shape = head.and_then(|h| h.1).filter(|_| p.fade_in_us == t_in);
+            p.fade_out_shape = tail.and_then(|t| t.1).filter(|_| p.fade_out_us == t_out);
         }
         layers
     }
@@ -465,7 +508,7 @@ fn before_cut(t: &Transition) -> i64 {
     }
 }
 
-fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, before: i64, after: i64, dip: Option<[f32; 3]>) {
+fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, (before, after): (i64, i64), dip: Option<[f32; 3]>, shape: Option<Box<Transition>>) {
     let d = before + after;
     if d <= 0 {
         return;
@@ -474,22 +517,30 @@ fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, befo
     let (start, end) = (cut - before, cut + after);
     let Some(color) = dip else {
         if before > 0 {
-            layers.mix.push(head_piece(incoming, before, d, 0));
+            let mut piece = head_piece(incoming, before, d, 0);
+            piece.properties.fade_in_shape = shape.clone();
+            layers.mix.push(piece);
         }
         if after > 0 {
-            layers.mix.push(tail_piece(outgoing, after, 0, d));
+            let mut piece = tail_piece(outgoing, after, 0, d);
+            piece.properties.fade_out_shape = shape;
+            layers.mix.push(piece);
         }
         return;
     };
-    // The colour is full at the middle; the picture under it switches there, not at the cut.
-    let mid = start + d / 2;
+    // The colour is full where the mix is half done; the picture under it switches there,
+    // not at the cut.
+    let mid = start + shape.as_ref().map_or(d / 2, |t| (t.half_point() as f64 * d as f64) as i64);
     if mid < cut {
         layers.mix.push(head_piece(incoming, cut - mid, 0, 0));
     }
     if mid > cut {
         layers.mix.push(tail_piece(outgoing, mid - cut, 0, 0));
     }
-    layers.color.push(ColorLayer { start_us: start, end_us: end, color, fade_in_us: mid - start, fade_out_us: end - mid });
+// Shaped, only whether a fade is zero matters (it tells a dip from a head or tail), and the
+    // dip's middle may sit on an edge.
+    let (fade_in_us, fade_out_us) = if shape.is_some() { (d, d) } else { (mid - start, end - mid) };
+    layers.color.push(ColorLayer { start_us: start, end_us: end, color, fade_in_us, fade_out_us, shape });
 }
 
 #[cfg(test)]
@@ -699,7 +750,7 @@ mod tests {
         assert!(layers.mix.is_empty());
         assert_eq!(layers.clips[0].properties.fade_in_us, S);
         assert!(close(picture(&layers, 500_000), 5.0));
-        assert_eq!(layers.color, vec![ColorLayer { start_us: 7 * S, end_us: 8 * S, color: [1.0, 0.0, 0.0], fade_in_us: S, fade_out_us: 0 }]);
+        assert_eq!(layers.color, vec![ColorLayer { start_us: 7 * S, end_us: 8 * S, color: [1.0, 0.0, 0.0], fade_in_us: S, fade_out_us: 0, shape: None }]);
         assert!(close(picture(&layers, 7_500_000), 60.0));
     }
 
@@ -977,5 +1028,64 @@ mod tests {
         tl.tracks[0].clips[1].properties.dissolve_in_us = 500_000;
         tl.tracks[0].convert_legacy_dissolves();
         assert_eq!(tl.tracks[0].transition_at_edit(b, TransitionEdge::In).map(|t| t.kind.clone()), Some(TransitionKind::Crossfade));
+    }
+
+    fn shaped_layers(kind: TransitionKind, edit: impl FnOnce(&mut Transition)) -> TransitionLayers {
+        let (mut tl, sources, _, b) = setup();
+        let mut t = Transition::new(b, TransitionEdge::In, kind, S, TransitionAlignment::Centered);
+        edit(&mut t);
+        tl.tracks[0].transitions.push(t);
+        tl.tracks[0].transition_layers(&sources)
+    }
+
+    #[test]
+    fn ease_in_gives_a_quarter_of_the_incoming_picture_at_the_middle() {
+        let layers = shaped_layers(TransitionKind::CrossDissolve, |t| t.ease = TransitionEase::In);
+        assert!(close(picture(&layers, 4 * S), 12.5));
+    }
+
+    #[test]
+    fn start_ratio_starts_the_dissolve_part_way_in() {
+        let layers = shaped_layers(TransitionKind::CrossDissolve, |t| t.start_ratio = 0.5);
+        assert!(close(picture(&layers, 3_500_000), 15.0));
+        assert!(close(picture(&layers, 4_499_000), 20.0));
+    }
+
+    #[test]
+    fn a_curve_key_shapes_the_dissolve() {
+        let layers = shaped_layers(TransitionKind::CrossDissolve, |t| *t = t.with_curve_key(0.5, 0.8));
+        assert!(close(picture(&layers, 4 * S), 18.0));
+    }
+
+    #[test]
+    fn a_dip_with_ease_in_switches_picture_later_than_the_middle() {
+        let layers = shaped_layers(TransitionKind::DipToWhite, |t| t.ease = TransitionEase::In);
+        // Mix 0.36 at 4.1 s and 0.64 at 4.3 s: colour 0.72 both times, A then B under it.
+        assert!(close(picture(&layers, 4_100_000), 10.0 * 0.28 + 72.0));
+        assert!(close(picture(&layers, 4_300_000), 20.0 * 0.28 + 72.0));
+        // Colour peaks where the mix is half done (u = sqrt(0.5)).
+        let peak = layers.color[0].opacity_at(3_500_000 + 707_107);
+        assert!(close(peak, 1.0));
+    }
+
+    #[test]
+    fn sound_crossfades_and_own_fades_stay_linear() {
+        let (mut tl, sources, _, b) = setup();
+        tl.tracks[0].kind = crate::types::TrackKind::Audio;
+        let mut t = Transition::new(b, TransitionEdge::In, TransitionKind::Crossfade, S, TransitionAlignment::Centered);
+        t.ease = TransitionEase::In;
+        tl.tracks[0].transitions.push(t);
+        let layers = tl.tracks[0].transition_layers(&sources);
+        assert!(close(picture(&layers, 4 * S), 15.0));
+
+        // An own fade-in beside a shaped video transition is still a straight ramp.
+        let (mut tl, sources, a, b) = setup();
+        tl.tracks[0].clips[0].properties.fade_in_us = S;
+        let mut t = dissolve(b, TransitionEdge::In, S, TransitionAlignment::Centered);
+        t.ease = TransitionEase::In;
+        tl.tracks[0].transitions.push(t);
+        let layers = tl.tracks[0].transition_layers(&sources);
+        let clip = layers.clips.iter().find(|c| c.id == a).unwrap();
+        assert_eq!(clip.fade_factor(500_000), 0.5);
     }
 }
