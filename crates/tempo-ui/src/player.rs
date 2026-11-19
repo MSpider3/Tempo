@@ -340,7 +340,7 @@ impl Overload {
 impl Worker {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
         // `TEMPO_NO_AUDIO=1` (automated tests) never opens a sound output.
-        let audio = if std::env::var_os("TEMPO_NO_AUDIO").is_some() { None } else { AudioOutput::start().map(Arc::new) };
+        let audio = if std::env::var("TEMPO_NO_AUDIO").as_deref() == Ok("1") { None } else { AudioOutput::start().map(Arc::new) };
         if audio.is_none() {
             tracing::warn!("no sound server found: playback will be silent");
         }

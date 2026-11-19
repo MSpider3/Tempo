@@ -20,10 +20,13 @@ class FindMixin:
     """Needs `geometry()`, `state()`, `wait_for()`, `click()`, `key()`, `type_text()`,
     `scroll()` and `settle()` from Session."""
 
-    def widgets(self, text=None, type=None, tooltip=None, css=None, contains=None, geometry=None):
-        """Mapped widgets matching all the given filters (exact `text`, substring `contains`)."""
+    def widgets(self, text=None, type=None, tooltip=None, css=None, contains=None, geometry=None, hidden=False):
+        """Mapped widgets matching all the given filters (exact `text`, substring `contains`).
+        Widgets scrolled out of their scrolled area are left out unless `hidden`."""
         found = []
         for w in (geometry or self.geometry())["widgets"]:
+            if not hidden and not w.get("visible", True):
+                continue
             if text is not None and w.get("text") != text:
                 continue
             if contains is not None and contains not in (w.get("text") or ""):
@@ -47,10 +50,10 @@ class FindMixin:
         """The `type` widgets on the same row as the label `label` (Inspector, dialogs), left
         to right: right of the label, vertical middle within the label's height."""
         geo = geometry or self.geometry()
-        for lab in self.widgets(text=label, type="GtkLabel", geometry=geo):
+        for lab in self.widgets(text=label, type="GtkLabel", geometry=geo, hidden=True):
             lx, ly, lw, lh = lab["rect"]
             cy = ly + lh / 2
-            found = [w for w in self.widgets(type=type, geometry=geo) if w["rect"][0] >= lx + lw - 2 and abs(w["rect"][1] + w["rect"][3] / 2 - cy) <= max(lh, 14)]
+            found = [w for w in self.widgets(type=type, geometry=geo, hidden=True) if w["rect"][0] >= lx + lw - 2 and abs(w["rect"][1] + w["rect"][3] / 2 - cy) <= max(lh, 14)]
             if found:
                 return sorted(found, key=lambda w: w["rect"][0])
         return []

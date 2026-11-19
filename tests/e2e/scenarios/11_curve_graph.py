@@ -1,22 +1,7 @@
 """Transition curve graph: double-click adds a key, dragging it up raises its value, right-click removes it."""
 
-from _helpers import add_transition_at_cut
+from _helpers import add_transition_at_cut, curve, graph, point
 from tempo_e2e import expect, expect_eq, expect_near
-
-PAD = 10.0  # GRAPH_PAD in crates/tempo-ui/src/inspector.rs
-
-
-def graph(s):
-    return s.scroll_into_view(lambda: s.widget(type="GtkDrawingArea", tooltip="Double-click"))
-
-
-def point(rect, u, v):
-    x, y, w, h = rect
-    return (x + PAD + u * (w - 2 * PAD), y + PAD + (1 - v) * (h - 2 * PAD))
-
-
-def curve(s):
-    return s.transitions("V1")[0]["curve"]
 
 
 def run(s):

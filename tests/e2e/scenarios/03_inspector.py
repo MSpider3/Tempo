@@ -40,7 +40,7 @@ def run(s):
     # Duration in frames (the second field on the Duration row), then Set as Default Duration.
     s.fill(s.row_widget("Duration", "GtkSpinButton", index=1), "20")
     s.wait_for(lambda: abs(s.transitions("V1")[0]["duration_us"] - frames_us(20)) < 1000, "a 20-frame duration")
-    button = s.scroll_into_view(lambda: s.widget(text="Set as Default Duration", type="GtkButton"))
+    button = s.scroll_into_view(lambda: s.widget(text="Set as Default Duration", type="GtkButton", hidden=True))
     s.click(*center(button["rect"]))
     s.wait_for(lambda: abs(s.state()["settings"]["transition_us"] - frames_us(20)) < 1000, "the default duration to become 20 frames")
 

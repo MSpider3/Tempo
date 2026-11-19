@@ -13,7 +13,7 @@ def run(s):
     s.note("viewer_rgb_on", mixed)
     expect(mixed[0] > 30 and mixed[1] > 120, f"the dissolve mixes red into lime: {mixed}")
 
-    switch = s.scroll_into_view(lambda: s.widget(type="GtkSwitch", tooltip="plays as a cut"))
+    switch = s.scroll_into_view(lambda: s.widget(type="GtkSwitch", tooltip="plays as a cut", hidden=True))
     expect(switch["active"], "the switch starts on")
     s.click(*center(switch["rect"]))
     s.wait_for(lambda: s.transitions("V1")[0]["enabled"] is False, "the transition to be switched off")

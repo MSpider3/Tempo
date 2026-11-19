@@ -35,3 +35,24 @@ def viewer_colour(s, name):
     surface = s.widget(type="TempoVideoSurface")
     cx, cy = center(surface["rect"])
     return s.screenshot(name).mean([cx - 20, cy - 20, 40, 40])
+
+
+GRAPH_PAD = 10.0  # GRAPH_PAD in crates/tempo-ui/src/inspector.rs
+
+
+def graph(s):
+    """The Inspector's transition curve graph, scrolled into view."""
+    find = lambda: next(iter(s.widgets(type="GtkDrawingArea", tooltip="Double-click", hidden=True)), None)  # noqa: E731
+    s.wait_for(find, "the curve graph")
+    return s.scroll_into_view(find)
+
+
+def point(rect, u, v):
+    """Screen point of curve coordinates (u along, v up) in the graph `rect`."""
+    x, y, w, h = rect
+    return (x + GRAPH_PAD + u * (w - 2 * GRAPH_PAD), y + GRAPH_PAD + (1 - v) * (h - 2 * GRAPH_PAD))
+
+
+def curve(s, track="V1"):
+    """The keys of the first transition on `track`."""
+    return s.transitions(track)[0]["curve"]
