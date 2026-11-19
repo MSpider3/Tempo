@@ -5,7 +5,7 @@ use rusqlite::params;
 use uuid::Uuid;
 use tempfile::NamedTempFile;
 
-use tempo_timeline::types::{
+use tempo_timeline::types::{AudioTrackType, 
     Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource, MediaType,
     Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition, TransitionAlignment,
     TransitionEase, TransitionEdge, TransitionKind, UiState,
@@ -132,8 +132,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
     for (timeline, open) in std::iter::once((&project.timeline, true)).chain(project.timelines.iter().map(|t| (t, false))) {
     let timeline_id = timeline.id.to_string();
     tx.execute(
-        "INSERT INTO timelines (id, name, is_open) VALUES (?1, ?2, ?3)",
-        params![timeline_id, timeline.name, open as i32],
+        "INSERT INTO timelines (id, name, is_open, start_tc_us, width, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![timeline_id, timeline.name, open as i32, timeline.start_tc_us, timeline.resolution.map(|r| r.0), timeline.resolution.map(|r| r.1)],
     )?;
     for track in &timeline.tracks {
         let kind_int = match track.kind {
@@ -143,8 +143,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
         tx.execute(
             "INSERT INTO tracks (
-                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id, audio_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 track.id.to_string(),
                 kind_int,
@@ -158,6 +158,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 track.color,
                 track.sort_order,
                 timeline_id,
+                matches!(track.audio_type, AudioTrackType::Stereo) as i32,
             ],
         )?;
 
@@ -235,8 +236,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
             tx.execute(
                 "INSERT INTO transitions (
-                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease,
+                    start_ratio, end_ratio, curve
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     trans.id.to_string(),
                     trans.clip_id.to_string(),
@@ -248,6 +250,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                     trans.plugin_params.as_deref().unwrap_or("{}"),
                     color_to_hex(trans.color),
                     ease_int,
+                    trans.start_ratio,
+                    trans.end_ratio,
+                    (!trans.curve.is_empty()).then(|| serde_json::to_string(&trans.curve)).transpose()?,
                 ],
             )?;
         }
@@ -266,8 +271,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
         tx.execute(
             "INSERT INTO markers (
-                id, position_us, name, color, duration_us, note, timeline_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                id, position_us, name, color, duration_us, note, timeline_id, keyword
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 marker.id.to_string(),
                 marker.position_us,
@@ -276,6 +281,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 marker.duration_us,
                 marker.note,
                 timeline_id,
+                marker.keyword,
             ],
         )?;
     }
@@ -402,7 +408,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     // 3. Load tracks
     let mut tracks = Vec::new();
     let mut track_stmt = conn.prepare(
-        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id
+        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id, audio_type
          FROM tracks ORDER BY sort_order ASC",
     )?;
 
@@ -438,6 +444,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             sort_order,
             clips: Vec::new(),
             transitions: Vec::new(),
+            audio_type: if row.get::<_, i32>(12)? == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo },
         }, row.get::<_, Option<String>>(11)?))
     })?;
 
@@ -509,7 +516,8 @@ pub fn load_project(path: &Path) -> Result<Project> {
 
     // 5. Load transitions
     let mut trans_stmt = conn.prepare(
-        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease
+        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease,
+                start_ratio, end_ratio, curve
          FROM transitions",
     )?;
 
@@ -524,6 +532,12 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let plugin_params: Option<String> = row.get(7)?;
         let color: Option<String> = row.get(8)?;
         let ease_int: i32 = row.get(9)?;
+        let curve: Option<String> = row.get(12)?;
+        let curve: Vec<[f32; 2]> = curve
+            .map(|c| serde_json::from_str(&c))
+            .transpose()
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)))?
+            .unwrap_or_default();
 
         let edge = if edge_int == 0 {
             TransitionEdge::In
@@ -569,6 +583,9 @@ pub fn load_project(path: &Path) -> Result<Project> {
             plugin_params,
             color: color.map(|c| hex_to_color(&c)).transpose().map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into()))?.unwrap_or_default(),
             ease,
+            start_ratio: row.get(10)?,
+            end_ratio: row.get(11)?,
+            curve,
         })
     })?;
 
@@ -590,7 +607,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     // 6. Load markers
     let mut markers = Vec::new();
     let mut marker_stmt = conn.prepare(
-        "SELECT id, position_us, name, color, duration_us, note, timeline_id
+        "SELECT id, position_us, name, color, duration_us, note, timeline_id, keyword
          FROM markers ORDER BY position_us ASC",
     )?;
 
@@ -618,6 +635,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             color,
             duration_us,
             note,
+            keyword: row.get(7)?,
         }, row.get::<_, Option<String>>(6)?))
     })?;
 
@@ -670,17 +688,24 @@ fn group_timelines(
     tracks: impl Iterator<Item = (Track, Option<String>)>,
     markers: impl Iterator<Item = (Marker, Option<String>)>,
 ) -> Result<(Timeline, Vec<Timeline>)> {
-    let mut stmt = conn.prepare("SELECT id, name, is_open FROM timelines ORDER BY rowid")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0)))?;
+    let mut stmt = conn.prepare("SELECT id, name, is_open, start_tc_us, width, height FROM timelines ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| {
+        let size = (row.get::<_, Option<u32>>(4)?, row.get::<_, Option<u32>>(5)?);
+        let resolution = match size {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        };
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(3)?, resolution))
+    })?;
     let mut all: Vec<(String, Timeline)> = Vec::new();
     let mut open = 0;
     for row in rows {
-        let (id, name, is_open) = row?;
+        let (id, name, is_open, start_tc_us, resolution) = row?;
         let uuid = Uuid::parse_str(&id).map_err(|e| ProjectError::InvalidProject(format!("timeline id {id}: {e}")))?;
         if is_open {
             open = all.len();
         }
-        all.push((id, Timeline { id: uuid, name, tracks: Vec::new(), markers: Vec::new() }));
+        all.push((id, Timeline { id: uuid, name, start_tc_us, resolution, ..Timeline::new() }));
     }
     if all.is_empty() {
         let t = Timeline::new();
@@ -839,11 +864,22 @@ mod tests {
             plugin_params: None,
             color: [0.0; 3],
             ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
         };
         project.timeline.tracks[0].transitions.push(trans.clone());
 
+        // Resolve's settings: ratios, curve keys, start timecode, own size, mono track, keyword.
+        let trans = Transition { start_ratio: 0.25, end_ratio: 0.75, curve: vec![[0.5, 0.9]], ..trans };
+        project.timeline.tracks[0].transitions[0] = trans.clone();
+        project.timeline.start_tc_us = tempo_timeline::RESOLVE_START_TC_US;
+        project.timeline.resolution = Some((1080, 1920));
+        project.timeline.tracks[2].audio_type = AudioTrackType::Mono;
+
         // Add markers
-        let m1 = Marker::new(10_000_000, "Scene 1", MarkerColor::Red);
+        let mut m1 = Marker::new(10_000_000, "Scene 1", MarkerColor::Red);
+        m1.keyword = "battle".into();
         let m2 = Marker::new(20_000_000, "Scene 2", MarkerColor::Green);
         project.timeline.add_marker(m1);
         project.timeline.add_marker(m2);
@@ -879,6 +915,11 @@ mod tests {
         assert_eq!(loaded_trans.id, trans.id);
         assert_eq!(loaded_trans.clip_id, clip_0_id);
         assert_eq!(loaded_trans.kind, TransitionKind::CrossDissolve);
+        assert_eq!((loaded_trans.start_ratio, loaded_trans.end_ratio, &loaded_trans.curve), (0.25, 0.75, &vec![[0.5, 0.9]]));
+        assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (tempo_timeline::RESOLVE_START_TC_US, Some((1080, 1920))));
+        assert_eq!(loaded.timeline.tracks.iter().map(|t| t.audio_type).collect::<Vec<_>>()[1..3], [AudioTrackType::Stereo, AudioTrackType::Mono]);
+        assert_eq!(loaded.timeline.markers[0].keyword, "battle");
+        assert_eq!(loaded.output_size(), (1080, 1920));
     }
 
     #[test]
@@ -944,6 +985,9 @@ mod tests {
             plugin_params: None,
             color: [0.0; 3],
             ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
         };
         let t2 = Transition {
             id: Uuid::new_v4(),
@@ -956,6 +1000,9 @@ mod tests {
             plugin_params: None,
             color: [0.0; 3],
             ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
         };
         project.timeline.tracks[0].transitions.push(t1);
         project.timeline.tracks[0].transitions.push(t2);
@@ -1297,12 +1344,19 @@ mod tests {
     #[test]
     fn schema_3_files_gain_transition_colour_and_ease() {
         let (file, _) = tampered(
-            "ALTER TABLE transitions DROP COLUMN color; ALTER TABLE transitions DROP COLUMN ease; DELETE FROM schema_version WHERE version = 4;
+            "ALTER TABLE transitions DROP COLUMN color; ALTER TABLE transitions DROP COLUMN ease; DELETE FROM schema_version WHERE version >= 4;
+             ALTER TABLE timelines DROP COLUMN start_tc_us; ALTER TABLE timelines DROP COLUMN width; ALTER TABLE timelines DROP COLUMN height;
+             ALTER TABLE tracks DROP COLUMN audio_type; ALTER TABLE markers DROP COLUMN keyword;
+             ALTER TABLE transitions DROP COLUMN start_ratio; ALTER TABLE transitions DROP COLUMN end_ratio; ALTER TABLE transitions DROP COLUMN curve;
              INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2 FROM clips;",
         );
         let loaded = load_project(file.path()).unwrap();
         let t = &loaded.timeline.tracks[0].transitions[0];
         assert_eq!((t.color, t.ease, t.edge), ([0.0; 3], TransitionEase::None, TransitionEdge::Out));
+        // Schema 5 defaults: a plain transition, a stereo track, Start Timecode 0, project size.
+        assert_eq!((t.start_ratio, t.end_ratio, t.curve.len()), (0.0, 1.0, 0));
+        assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (0, None));
+        assert!(loaded.timeline.tracks.iter().all(|t| t.audio_type == AudioTrackType::Stereo));
     }
 
     #[test]

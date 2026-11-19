@@ -9,7 +9,7 @@ use tempo_timeline::{
     ClipEffect, EditClipCommand, EditKind, EditTarget, InsertClipCommand, Marker, MarkerColor, MediaSource, MediaType, MoveClipCommand,
     OverwriteClipCommand, PropertyChange, RationalFps, ReplaceClipCommand, SetClipPropertyCommand, SetTransitionCommand, SplitClipCommand,
     TitleData, TitleType, Timeline, Track, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimClipCommand,
-    TrimEdge, RippleTrimCommand, STANDARD_TRANSITION_US,
+    TrimEdge, RippleTrimCommand,
 };
 use uuid::Uuid;
 
@@ -485,6 +485,7 @@ fn fill_edits(
     sources: &HashMap<Uuid, MediaSource>,
     fps: RationalFps,
     edits: &[(Uuid, i64, TransitionKind)],
+    length_us: i64,
 ) -> (Vec<(Uuid, Transition)>, Option<&'static str>) {
     let mut scratch = timeline.clone();
     let (mut placed, mut why) = (Vec::new(), None);
@@ -498,7 +499,7 @@ fn fill_edits(
             why = Some("There is already a transition there.");
             continue;
         }
-        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind.clone(), STANDARD_TRANSITION_US, TransitionAlignment::Centered);
+        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind.clone(), length_us, TransitionAlignment::Centered);
         match place_on(&scratch, sources, fps, *track_id, *position, &template) {
             Ok(t) => {
                 if SetTransitionCommand::set(*track_id, t.clone()).execute(&mut scratch).is_ok() {
@@ -611,7 +612,8 @@ fn add_transitions(state: &Rc<AppState>, video: Option<TransitionKind>, audio: b
             kind.map(|k| (track_id, position, k))
         })
         .collect();
-    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.fps, &wanted)) else { return };
+    let length = state.standard_transition_us();
+    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.fps, &wanted, length)) else { return };
     if placed.is_empty() {
         state.message(why.unwrap_or("There is already a transition there."));
         return;
@@ -1339,7 +1341,7 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.tracks = vec![track];
         let wanted = [(id, 4 * S, TransitionKind::CrossDissolve), (id, 4_600_000, TransitionKind::CrossDissolve)];
-        let (placed, _) = fill_edits(&timeline, &sources, FPS, &wanted);
+        let (placed, _) = fill_edits(&timeline, &sources, FPS, &wanted, tempo_timeline::STANDARD_TRANSITION_US);
         assert_eq!(placed.len(), 2);
         // What is stored is what is drawn: put both on, and each span is as long as its duration.
         let track = &mut timeline.tracks[0];

@@ -89,7 +89,50 @@ impl Transition {
             plugin_params: None,
             color: [0.0; 3],
             ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
         }
+    }
+
+    /// Resolve's Transition Curve at `u` (0.0-1.0 through the transition), 0.0-1.0: a
+    /// line through the keys when there are any (from 0 at the start to 1 at the end),
+    /// otherwise the Ease.
+    pub fn curve_at(&self, u: f32) -> f32 {
+        let u = u.clamp(0.0, 1.0);
+        if self.curve.is_empty() {
+            return match self.ease {
+                TransitionEase::None => u,
+                TransitionEase::In => u * u,
+                TransitionEase::Out => 1.0 - (1.0 - u) * (1.0 - u),
+                TransitionEase::InOut => u * u * (3.0 - 2.0 * u),
+            };
+        }
+        let points = std::iter::once([0.0, 0.0]).chain(self.curve.iter().copied()).chain(std::iter::once([1.0, 1.0]));
+        let points: Vec<[f32; 2]> = points.collect();
+        for w in points.windows(2) {
+            let ([u0, v0], [u1, v1]) = (w[0], w[1]);
+            if u <= u1 {
+                return if u1 > u0 { v0 + (v1 - v0) * (u - u0) / (u1 - u0) } else { v1 };
+            }
+        }
+        1.0
+    }
+
+    /// How far the mix has gone at `u` through the transition, 0.0-1.0: the curve
+    /// scaled between the Start Ratio and the End Ratio.
+    pub fn progress_at(&self, u: f32) -> f32 {
+        (self.start_ratio + (self.end_ratio - self.start_ratio) * self.curve_at(u)).clamp(0.0, 1.0)
+    }
+
+    /// This transition with a Transition Curve key of `value` at `u`, replacing a key
+    /// within a hundredth of it, as typing a value in Resolve's Inspector keys the playhead.
+    pub fn with_curve_key(&self, u: f32, value: f32) -> Self {
+        let (u, value) = (u.clamp(0.0, 1.0), value.clamp(0.0, 1.0));
+        let mut curve: Vec<[f32; 2]> = self.curve.iter().copied().filter(|k| (k[0] - u).abs() > 0.01).collect();
+        curve.push([u, value]);
+        curve.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        Self { curve, ..self.clone() }
     }
 
     /// The colour this transition dips through, or `None` when it mixes the pictures.
@@ -451,6 +494,23 @@ fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, befo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn curve_follows_ease_then_keys_and_ratios_scale_it() {
+        let mut t = Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::CrossDissolve, 1, TransitionAlignment::Centered);
+        assert_eq!(t.curve_at(0.25), 0.25);
+        t.ease = TransitionEase::In;
+        assert_eq!(t.curve_at(0.5), 0.25);
+        t.ease = TransitionEase::InOut;
+        assert_eq!(t.curve_at(0.5), 0.5);
+        // Keys win over the ease: 0 -> 0.8 at the middle -> 1.
+        let k = t.with_curve_key(0.5, 0.8);
+        assert!((k.curve_at(0.25) - 0.4).abs() < 1e-6 && (k.curve_at(0.75) - 0.9).abs() < 1e-6);
+        assert_eq!(k.with_curve_key(0.505, 0.2).curve, vec![[0.505, 0.2]]);
+        // Start 20 %, End 60 %.
+        let r = Transition { start_ratio: 0.2, end_ratio: 0.6, ease: TransitionEase::None, ..t };
+        assert!((r.progress_at(0.0) - 0.2).abs() < 1e-6 && (r.progress_at(0.5) - 0.4).abs() < 1e-6 && (r.progress_at(1.0) - 0.6).abs() < 1e-6);
+    }
+
     #[test]
     fn frame_floor_keeps_every_whole_frame_at_ntsc_rates() {
         for fps in [crate::RationalFps::FPS_29_97, crate::RationalFps::FPS_30] {

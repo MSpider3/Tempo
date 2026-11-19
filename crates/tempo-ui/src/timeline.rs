@@ -11,7 +11,7 @@ use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
 use tempo_timeline::{
     ClipType, EditClipCommand, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
-    Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge, STANDARD_TRANSITION_US,
+    Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
 };
 use uuid::Uuid;
 
@@ -622,7 +622,7 @@ impl TimelineCanvas {
             _ => return Err("Tempo does not know that transition."),
         };
         let reach = (3.0 * EDGE_GRAB_PX / self.pps() * 1_000_000.0) as i64;
-        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind, STANDARD_TRANSITION_US, TransitionAlignment::Centered);
+        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind, self.state().standard_transition_us(), TransitionAlignment::Centered);
         let at = self.us_at(x);
         self.state()
             .with_project(|p| {

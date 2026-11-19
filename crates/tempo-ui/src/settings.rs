@@ -20,11 +20,13 @@ pub struct Settings {
     pub hardware_encode: bool,
     /// Ids of plugins that are switched off.
     pub plugins_off: Vec<String>,
+    /// Length of a new transition, set by the Inspector's "Set as Default Duration".
+    pub transition_us: i64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { autosave_seconds: 120, playback_height: 540, auto_proxies: true, hardware_decode: false, hardware_encode: false, plugins_off: Vec::new() }
+        Self { autosave_seconds: 120, playback_height: 540, auto_proxies: true, hardware_decode: false, hardware_encode: false, plugins_off: Vec::new(), transition_us: tempo_timeline::STANDARD_TRANSITION_US }
     }
 }
 

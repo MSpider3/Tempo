@@ -480,6 +480,20 @@ pub struct Transition {
     pub color: [f32; 3],
     #[serde(default)]
     pub ease: TransitionEase,
+    /// Resolve's Start Ratio and End Ratio: how far the mix has gone at the start and end
+    /// of the transition, 0.0-1.0 (Resolve shows 0-100). 0 and 1 unless set.
+    #[serde(default)]
+    pub start_ratio: f32,
+    #[serde(default = "full_ratio")]
+    pub end_ratio: f32,
+    /// Resolve's Transition Curve keys: `[place, value]`, both 0.0-1.0, `place` through
+    /// the transition, sorted. Empty: the curve follows the Ease (see `Transition::curve_at`).
+    #[serde(default)]
+    pub curve: Vec<[f32; 2]>,
+}
+
+fn full_ratio() -> f32 {
+    1.0
 }
 
 /// Resolve's transition Ease setting: how the mix speeds up and slows down.
@@ -510,6 +524,9 @@ pub struct Marker {
     pub color: MarkerColor,
     pub duration_us: i64,
     pub note: String,
+    /// Resolve's Keyword field in the marker dialog.
+    #[serde(default)]
+    pub keyword: String,
 }
 
 impl Marker {
@@ -521,6 +538,7 @@ impl Marker {
             color,
             duration_us: 0,
             note: String::new(),
+            keyword: String::new(),
         }
     }
 }
@@ -540,6 +558,27 @@ pub struct Track {
     pub sort_order: u32,
     pub clips: Vec<Clip>,
     pub transitions: Vec<Transition>,
+    /// Resolve's Audio Track Type. Only audio tracks use it.
+    #[serde(default)]
+    pub audio_type: AudioTrackType,
+}
+
+/// Resolve's Audio Track Type: a Mono track plays its sound down the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioTrackType {
+    Mono,
+    #[default]
+    Stereo,
+}
+
+impl AudioTrackType {
+    /// What Resolve's track header shows: "1.0" or "2.0".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mono => "1.0",
+            Self::Stereo => "2.0",
+        }
+    }
 }
 
 impl Track {
@@ -563,6 +602,7 @@ impl Track {
             sort_order,
             clips: Vec::new(),
             transitions: Vec::new(),
+            audio_type: AudioTrackType::Stereo,
         }
     }
 
@@ -631,7 +671,18 @@ pub struct Timeline {
     pub name: String,
     pub tracks: Vec<Track>,
     pub markers: Vec<Marker>,
+    /// Resolve's Start Timecode: what the timeline's first frame reads as. Positions stay
+    /// 0-based; only what is shown (and typed) is moved by this. 0 for older files.
+    #[serde(default)]
+    pub start_tc_us: i64,
+    /// Width and height when "Use Project Settings" was off; `None` uses the project's.
+    /// The frame rate is always the project's.
+    #[serde(default)]
+    pub resolution: Option<(u32, u32)>,
 }
+
+/// Resolve's default Start Timecode, 01:00:00:00.
+pub const RESOLVE_START_TC_US: i64 = 3_600_000_000;
 
 /// The name a project's first timeline gets, as in Resolve.
 pub fn first_timeline_name() -> String {
@@ -651,6 +702,8 @@ impl Timeline {
             name: first_timeline_name(),
             tracks: Vec::new(),
             markers: Vec::new(),
+            start_tc_us: 0,
+            resolution: None,
         }
     }
 
@@ -672,7 +725,7 @@ impl Timeline {
                 Track::new(TrackKind::Audio, 1, "Audio 1", 2),
                 Track::new(TrackKind::Audio, 2, "Audio 2", 3),
             ],
-            markers: Vec::new(),
+            ..Self::new()
         }
     }
 
@@ -892,6 +945,11 @@ pub struct Project {
 }
 
 impl Project {
+    /// The open timeline's picture size: its own, or the project's.
+    pub fn output_size(&self) -> (u32, u32) {
+        self.timeline.resolution.unwrap_or((self.width, self.height))
+    }
+
     /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.
     pub fn timeline_list(&self) -> Vec<(Uuid, String)> {
         let mut list: Vec<_> = std::iter::once(&self.timeline).chain(&self.timelines).map(|t| (t.id, t.name.clone())).collect();

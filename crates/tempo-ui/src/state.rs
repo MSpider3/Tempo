@@ -244,6 +244,22 @@ impl AppState {
         self.with_project(|p| p.fps.to_f64()).unwrap_or(30.0)
     }
 
+    /// The timecode a timeline position reads as: moved by the timeline's Start Timecode.
+    /// Use `timecode` for lengths, which the Start Timecode does not move.
+    pub fn position_tc(&self, us: i64) -> String {
+        timecode(us + self.start_tc_us(), self.fps())
+    }
+
+    /// The open timeline's Start Timecode, 0 with no project. Subtract it from a typed timecode.
+    pub fn start_tc_us(&self) -> i64 {
+        self.with_project(|p| p.timeline.start_tc_us).unwrap_or(0)
+    }
+
+    /// Length of a new transition: the user's "Set as Default Duration", 1 s until set.
+    pub fn standard_transition_us(&self) -> i64 {
+        self.settings.borrow().transition_us.max(1)
+    }
+
     pub fn set_project(&self, project: Option<Project>, path: Option<PathBuf>) {
         self.player.pause();
         self.player.set_source(None);
