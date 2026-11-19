@@ -96,12 +96,22 @@ pub fn hint(zone: HintZone, binds: &[Keybind], show: impl Fn(&str) -> String) ->
     std::iter::once(mouse.to_string()).filter(|m| !m.is_empty()).chain(keys).collect::<Vec<_>>().join(" · ")
 }
 
+/// CSS class of a focusable widget that uses Delete and BackSpace itself (the Inspector's curve graph).
+pub const OWNS_DELETE_KEYS: &str = "owns-delete-keys";
+
+fn is_delete_accel(accel: &str) -> bool {
+    accel.ends_with("Delete") || accel.ends_with("BackSpace")
+}
+
 fn belongs_to_focus(focus: &gtk::Widget, accel: &str) -> bool {
     if focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.is::<gtk::Editable>() {
         return true;
     }
     // Anything open on top of the editor keeps all of its keys.
     if focus.ancestor(gtk::Popover::static_type()).is_some() || focus.ancestor(libadwaita::Dialog::static_type()).is_some() {
+        return true;
+    }
+    if focus.has_css_class(OWNS_DELETE_KEYS) && is_delete_accel(accel) {
         return true;
     }
     let in_list = [gtk::GridView::static_type(), gtk::ListView::static_type(), gtk::DropDown::static_type(), gtk::ListBox::static_type()]
@@ -149,6 +159,12 @@ mod tests {
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
     const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+
+    #[test]
+    fn only_the_delete_keys_are_kept_for_widgets_that_own_them() {
+        assert!(["Delete", "BackSpace", "<Shift>BackSpace"].iter().all(|a| is_delete_accel(a)));
+        assert!(!["space", "<Primary>z", "x"].iter().any(|a| is_delete_accel(a)));
+    }
 
     #[test]
     fn every_hint_names_a_bound_action() {
