@@ -14,6 +14,7 @@ use crate::state::{AppState, Change, Tool};
 use crate::timeline::{TimelineArea, TimelineCanvas, ZoomPreset, MAX_PPS, MIN_PPS, TRANSITION_PREFIX};
 use crate::util::{divider, label, text_button, text_toggle, tool_button, tool_toggle};
 use crate::viewer::Viewer;
+use tempo_timeline::TransitionKind;
 
 pub struct EditPage {
     pub root: gtk::Box,
@@ -250,14 +251,29 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
     };
 
     let standard = actions::STANDARD_TRANSITION_S;
-    heading("Transitions", "Drag onto a cut or the start or end of a clip, or click to apply to the selected clip");
+    heading("Video Transitions", "Drag onto a cut or the start or end of a clip, or click to add to the selected edit or clip (Ctrl+T)");
+    let group = |text: &str| {
+        let g = label(text, &["tempo-small", "tempo-dim"]);
+        g.set_xalign(0.0);
+        g.set_margin_top(4);
+        list.append(&g);
+    };
+    group("Dissolve");
     item(
         "Cross Dissolve",
-        "Dissolve from the previous clip into the selected clip (Ctrl+T). On a clip edge with no clip next to it, fades from or to black",
-        "media-seek-backward-symbolic",
+        "Dissolve from the previous clip into the next. Drag onto a cut or the start or end of a clip; on a clip edge with no clip next to it, fades from or to transparent",
+        "view-dual-symbolic",
         Some("cross-dissolve"),
-        Box::new(move |s| actions::cross_dissolve(s, standard)),
+        Box::new(|s| actions::add_transition(s, TransitionKind::CrossDissolve)),
     );
+    item(
+        "Dip To Color Dissolve",
+        "Dissolve to a colour and then from it into the next clip (pick the colour in the Inspector). Drag onto a cut or the start or end of a clip",
+        "media-record-symbolic",
+        Some("dip-to-color"),
+        Box::new(|s| actions::add_transition(s, TransitionKind::DipToColor)),
+    );
+    group("Clip Fades");
     item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some("fade-in"), Box::new(move |s| actions::set_fade(s, true, standard)));
     item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some("fade-out"), Box::new(move |s| actions::set_fade(s, false, standard)));
     item(
