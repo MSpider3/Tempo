@@ -318,7 +318,7 @@ impl Inspector {
         // Audio transitions (Cross Fade) have no type choice and no colour.
         let video = has_video_controls(view.track_kind);
         if video {
-            Self::row_label(&grid, 0, "Type");
+            Self::row_label(&grid, 0, "Transition Type");
             let kinds = gtk::DropDown::from_strings(&["Cross Dissolve", "Dip To Color Dissolve"]);
             kinds.set_selected(u32::from(t.kind == TransitionKind::DipToColor));
             let s = state.clone();
@@ -331,12 +331,16 @@ impl Inspector {
 
         Self::row_label(&grid, 1, "Duration");
         let frames = us_to_frame(t.duration_us, view.fps);
-        let seconds = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(t.duration_us as f64 / 1e6, 0.0, 3600.0, 0.1, 1.0, 0.0)).digits(2).numeric(true).hexpand(true).build();
+        let seconds = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(t.duration_us as f64 / 1e6, 0.0, 3600.0, 0.1, 1.0, 0.0)).digits(1).numeric(true).hexpand(true).build();
         seconds.update_property(&[gtk::accessible::Property::Label("Duration in seconds")]);
         let frame_spin = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(frames as f64, 1.0, 1_000_000.0, 1.0, 10.0, 0.0)).numeric(true).build();
         frame_spin.update_property(&[gtk::accessible::Property::Label("Duration in frames")]);
-        let (s, fps) = (state.clone(), view.fps);
+        let (s, fps, shown_tenths) = (state.clone(), view.fps, (t.duration_us as f64 / 1e5).round());
         seconds.connect_value_changed(move |sp| {
+            // Showing one decimal rounds the value; only a real edit changes the length.
+            if (sp.value() * 10.0).round() == shown_tenths {
+                return;
+            }
             let frames = seconds_to_frames(sp.value(), fps);
             edit_transition(&s, sel, |t| t.duration_us = frame_to_us(frames, fps));
         });
@@ -350,10 +354,8 @@ impl Inspector {
         durations.append(&label("s", &["tempo-dim"]));
         durations.append(&frame_spin);
         durations.append(&label("frames", &["tempo-dim"]));
+        durations.set_tooltip_text(Some(&format!("Longest {:.2} s ({} frames)", view.max_us as f64 / 1e6, us_to_frame(view.max_us, view.fps))));
         grid.attach(&durations, 1, 1, 1, 1);
-        let longest = label(&format!("Longest {:.2} s ({} frames)", view.max_us as f64 / 1e6, us_to_frame(view.max_us, view.fps)), &["tempo-small", "tempo-dim"]);
-        longest.set_xalign(0.0);
-        grid.attach(&longest, 1, 2, 1, 1);
 
         let default_button = gtk::Button::builder().label("Set as Default Duration").halign(gtk::Align::Start).tooltip_text("New transitions get this length").build();
         let (s, duration_us) = (state.clone(), t.duration_us);
@@ -372,8 +374,9 @@ impl Inspector {
         Self::row_label(&grid, 4, "Alignment");
         let aligns = gtk::Box::builder().css_classes(["linked"]).build();
         let mut group: Option<gtk::ToggleButton> = None;
-        for (name, alignment) in [("Start on Edit", TransitionAlignment::StartAtCut), ("Center on Edit", TransitionAlignment::Centered), ("End on Edit", TransitionAlignment::EndAtCut)] {
-            let button = gtk::ToggleButton::builder().label(name).hexpand(true).sensitive(alignment_enabled(view.edit_kind, alignment)).build();
+        for (name, icon, alignment) in [("Start on Edit", "format-justify-left-symbolic", TransitionAlignment::StartAtCut), ("Center on Edit", "format-justify-center-symbolic", TransitionAlignment::Centered), ("End on Edit", "format-justify-right-symbolic", TransitionAlignment::EndAtCut)] {
+            let button = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(name).hexpand(true).sensitive(alignment_enabled(view.edit_kind, alignment)).build();
+            button.update_property(&[gtk::accessible::Property::Label(name)]);
             button.set_group(group.as_ref());
             button.set_active(t.alignment == alignment);
             let s = state.clone();
@@ -388,8 +391,8 @@ impl Inspector {
         grid.attach(&aligns, 1, 4, 1, 1);
 
         if video {
-            Self::ratio_row(&grid, 5, "Start Ratio", t.start_ratio, sel, state, |t, r| t.start_ratio = r);
-            Self::ratio_row(&grid, 6, "End Ratio", t.end_ratio, sel, state, |t, r| t.end_ratio = r);
+            Self::ratio_row(&grid, 5, "Start Ratio", t.start_ratio, sel, state, |t, r| t.start_ratio = r, 0.0);
+            Self::ratio_row(&grid, 6, "End Ratio", t.end_ratio, sel, state, |t, r| t.end_ratio = r, 1.0);
             Self::ease_row(&grid, 7, t, sel, state);
             Self::curve_row(&grid, 8, t, sel, state);
         }
@@ -407,17 +410,53 @@ impl Inspector {
         true
     }
 
-    /// Start / End Ratio: percent field for a 0.0-1.0 ratio.
-    fn ratio_row(grid: &gtk::Grid, row: i32, name: &str, ratio: f32, sel: TransitionRef, state: &Rc<AppState>, set: fn(&mut Transition, f32)) {
+    /// Slider and field sharing one adjustment, with a reset arrow. Returns the adjustment,
+    /// a flag that is set while the program (not the user) moves it, and the row.
+    /// `commit` runs once the user has been still for a moment, so a drag is one undo step.
+    fn slider_row(adj: &gtk::Adjustment, digits: u32, label_text: &str, commit: impl Fn(f64) + 'static) -> (Rc<Cell<bool>>, gtk::Box, gtk::Button) {
+        const QUIET_MS: u64 = 300;
+        let spin = gtk::SpinButton::builder().adjustment(adj).digits(digits).numeric(true).build();
+        spin.update_property(&[gtk::accessible::Property::Label(label_text)]);
+        let scale = gtk::Scale::builder().adjustment(adj).hexpand(true).draw_value(false).build();
+        scale.update_property(&[gtk::accessible::Property::Label(label_text)]);
+        let reset = tool_button("edit-undo-symbolic", &format!("Reset {label_text}"));
+        let refreshing = Rc::new(Cell::new(false));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+        let commit = Rc::new(commit);
+        let (flag, adj_value) = (refreshing.clone(), adj.clone());
+        adj.connect_value_changed(move |_| {
+            if flag.get() {
+                return;
+            }
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let (commit, pending_slot, adj) = (commit.clone(), pending.clone(), adj_value.clone());
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(QUIET_MS), move || {
+                pending_slot.borrow_mut().take();
+                commit(adj.value());
+            });
+            *pending.borrow_mut() = Some(id);
+        });
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&scale);
+        row.append(&spin);
+        row.append(&reset);
+        (refreshing, row, reset)
+    }
+
+    /// Start / End Ratio: percent field and slider for a 0.0-1.0 ratio.
+    fn ratio_row(grid: &gtk::Grid, row: i32, name: &str, ratio: f32, sel: TransitionRef, state: &Rc<AppState>, set: fn(&mut Transition, f32), default_ratio: f32) {
         Self::row_label(grid, row, name);
-        let spin = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(f64::from(ratio_to_percent(ratio)), 0.0, 100.0, 1.0, 10.0, 0.0)).numeric(true).hexpand(true).build();
-        spin.update_property(&[gtk::accessible::Property::Label(name)]);
+        let adj = gtk::Adjustment::new(f64::from(ratio_to_percent(ratio)), 0.0, 100.0, 1.0, 10.0, 0.0);
         let s = state.clone();
-        spin.connect_value_changed(move |sp| {
-            let ratio = percent_to_ratio(sp.value());
+        let (_, cell, reset) = Self::slider_row(&adj, 0, name, move |v| {
+            let ratio = percent_to_ratio(v);
             edit_transition(&s, sel, |t| set(t, ratio));
         });
-        grid.attach(&spin, 1, row, 1, 1);
+        let s = state.clone();
+        reset.connect_clicked(move |_| edit_transition(&s, sel, |t| set(t, default_ratio)));
+        grid.attach(&cell, 1, row, 1, 1);
     }
 
     fn ease_row(grid: &gtk::Grid, row: i32, t: &Transition, sel: TransitionRef, state: &Rc<AppState>) {
@@ -441,54 +480,47 @@ impl Inspector {
     /// Transition Curve at the playhead: shows the mix there; typing keys it.
     fn curve_row(grid: &gtk::Grid, row: i32, t: &Transition, sel: TransitionRef, state: &Rc<AppState>) {
         const OUTSIDE: &str = "Move the playhead into the transition to key its curve.";
-        Self::row_label(grid, row, "Curve");
-        let spin = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(0.0, 0.0, 1.0, 0.01, 0.1, 0.0)).digits(3).numeric(true).hexpand(true).build();
-        spin.update_property(&[gtk::accessible::Property::Label("Transition curve")]);
-        let reset = tool_button("edit-undo-symbolic", "Reset Curve");
+        Self::row_label(grid, row, "Transition Curve");
+        let adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 0.01, 0.1, 0.0);
+        let s = state.clone();
+        let (refreshing, cell, reset) = Self::slider_row(&adj, 3, "Transition Curve", move |value| {
+            let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) else { return };
+            edit_transition(&s, sel, |t| *t = t.with_curve_key(u, value as f32));
+        });
+        reset.set_tooltip_text(Some("Reset Curve"));
         reset.set_sensitive(!t.curve.is_empty());
         let s = state.clone();
         reset.connect_clicked(move |_| edit_transition(&s, sel, |t| t.curve.clear()));
-        let refreshing = Rc::new(Cell::new(false));
         // Show the curve where the playhead is; insensitive outside the transition.
         let refresh = {
-            let (spin, refreshing, s) = (spin.clone(), refreshing.clone(), state.clone());
+            let (cell, adj, refreshing, s) = (cell.clone(), adj.clone(), refreshing.clone(), state.clone());
             move || {
                 let view = TransitionView::read(&s, sel);
                 let u = view.as_ref().and_then(|v| playhead_fraction(s.playhead_us(), v.span?));
-                spin.set_sensitive(u.is_some());
-                spin.set_tooltip_text(if u.is_some() { None } else { Some(OUTSIDE) });
+                for child in std::iter::successors(cell.first_child(), |w| w.next_sibling()).filter(|w| !w.is::<gtk::Button>()) {
+                    child.set_sensitive(u.is_some());
+                }
+                cell.set_tooltip_text(if u.is_some() { None } else { Some(OUTSIDE) });
                 if let (Some(u), Some(v)) = (u, view) {
-                    if spin.focus_child().is_none() {
+                    if cell.focus_child().is_none() {
                         refreshing.set(true);
-                        spin.set_value(f64::from(v.transition.curve_at(u)));
+                        adj.set_value(f64::from(v.transition.curve_at(u)));
                         refreshing.set(false);
                     }
                 }
             }
         };
         refresh();
-        let s = state.clone();
-        spin.connect_value_changed(move |sp| {
-            if refreshing.get() {
-                return;
-            }
-            let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) else { return };
-            let value = sp.value() as f32;
-            edit_transition(&s, sel, |t| *t = t.with_curve_key(u, value));
-        });
-        // The panel is rebuilt on every edit; the poll ends with the field.
-        let weak = spin.downgrade();
+        // The panel is rebuilt on every edit; the poll ends with the row.
+        let weak = cell.downgrade();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || match weak.upgrade() {
-            Some(sp) if sp.is_mapped() => {
+            Some(c) if c.is_mapped() => {
                 refresh();
                 glib::ControlFlow::Continue
             }
             Some(_) => glib::ControlFlow::Continue,
             None => glib::ControlFlow::Break,
         });
-        let cell = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        cell.append(&spin);
-        cell.append(&reset);
         grid.attach(&cell, 1, row, 1, 1);
     }
 
