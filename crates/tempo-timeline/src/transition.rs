@@ -62,7 +62,13 @@ pub fn frame_floor_us(us: i64, fps: RationalFps) -> i64 {
         return us.max(0);
     }
     let frames = (us as i128 * fps.num as i128 / (1_000_000 * fps.den as i128)) as i64;
-    frame_to_us(frames, fps)
+    // frame_to_us rounds to the nearest microsecond, so a whole frame count can sit a
+    // microsecond under its exact time and floor one frame short; take the next frame if it fits.
+    if frame_to_us(frames + 1, fps) <= us {
+        frame_to_us(frames + 1, fps)
+    } else {
+        frame_to_us(frames, fps)
+    }
 }
 
 impl Transition {
@@ -400,6 +406,16 @@ fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, befo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_floor_keeps_every_whole_frame_at_ntsc_rates() {
+        for fps in [crate::RationalFps::FPS_29_97, crate::RationalFps::FPS_30] {
+            for n in 0..2000 {
+                let us = crate::frame_to_us(n, fps);
+                assert_eq!(frame_floor_us(us, fps), us, "{n} frames at {}/{}", fps.num, fps.den);
+            }
+        }
+    }
+
     use super::*;
     use crate::command::*;
     use crate::types::{MediaType, Timeline};
