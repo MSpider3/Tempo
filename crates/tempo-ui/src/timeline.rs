@@ -1013,7 +1013,7 @@ impl TimelineCanvas {
                 c.drop_on_new_tracks(id, at, lanes)
             } else {
                 let track = c.row_at(y).map(|r| r.track_id);
-                actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
+                actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track, true);
                 true
             };
             // The first clip on an empty timeline zooms the view to fit it, as Resolve does.

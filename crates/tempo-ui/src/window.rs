@@ -976,7 +976,7 @@ impl MainWindow {
                     .flatten()
                 });
                 if let (Some(source), Some(at)) = (source, num(1)) {
-                    actions::place_source(&self.state, source, Place::Overwrite, Some((at * 1e6) as i64), track);
+                    actions::place_source(&self.state, source, Place::Overwrite, Some((at * 1e6) as i64), track, true);
                 }
             }
             // Open the nth Media Pool clip in the viewer, as a double click would.

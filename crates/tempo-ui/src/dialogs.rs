@@ -399,15 +399,7 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         if !empty.is_active() {
             match state.media_selection.get() {
                 Some(source) => {
-                    // place_source honours the viewer's marks on this clip; off means the whole clip.
-                    let (src_in, src_out) = (state.src_in.get(), state.src_out.get());
-                    if !use_marks.is_active() {
-                        state.src_in.set(None);
-                        state.src_out.set(None);
-                    }
-                    actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None);
-                    state.src_in.set(src_in);
-                    state.src_out.set(src_out);
+                    actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None, use_marks.is_active());
                 }
                 None => state.message("No clip is selected in the Media Pool, so the timeline is empty."),
             }
