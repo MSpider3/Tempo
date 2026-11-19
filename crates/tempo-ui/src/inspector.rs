@@ -24,6 +24,7 @@ pub struct Inspector {
     state: Rc<AppState>,
     title: gtk::Label,
     body: gtk::Box,
+    scroller: gtk::ScrolledWindow,
     /// Set while an edit from the Inspector itself is applied, so the fields are
     /// not rebuilt under the user's hands.
     busy: Rc<Cell<bool>>,
@@ -56,13 +57,20 @@ impl Inspector {
             .build();
         root.append(&title);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.append(&gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
+        let scroller = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
+        root.append(&scroller);
 
-        let inspector = Rc::new(Self { root, state: state.clone(), title, body, busy: Rc::new(Cell::new(false)) });
+        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, busy: Rc::new(Cell::new(false)) });
         let i = inspector.clone();
         state.connect(move |change| {
             if matches!(change, Change::Selection | Change::Timeline | Change::Project) {
+                let at = i.scroller.vadjustment().value();
                 i.rebuild();
+                // An edit keeps the panel where the user is; a new selection starts at the top.
+                if matches!(change, Change::Timeline) {
+                    let adjustment = i.scroller.vadjustment();
+                    glib::idle_add_local_once(move || adjustment.set_value(at));
+                }
             }
         });
         inspector.rebuild();
