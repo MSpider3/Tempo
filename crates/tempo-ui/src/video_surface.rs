@@ -16,6 +16,7 @@ use crate::player::Layer;
 struct Drawn {
     texture: Option<gdk::Texture>,
     title: Option<TitleData>,
+    solid: Option<[f32; 3]>,
     props: ClipProperties,
 }
 
@@ -101,6 +102,9 @@ mod imp {
                         }
                     }
                 }
+                if let Some([r, g, b]) = layer.solid {
+                    snapshot.append_color(&gdk::RGBA::new(r, g, b, 1.0), &graphene::Rect::new(-fw / 2.0, -fh / 2.0, fw, fh));
+                }
                 if let Some(title) = &layer.title {
                     super::draw_title(&widget, snapshot, title, scale, fh);
                 }
@@ -181,7 +185,7 @@ impl VideoSurface {
                     let bytes = glib::Bytes::from_owned(SharedPixels(frame.data));
                     gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::R8g8b8a8, &bytes, stride).upcast::<gdk::Texture>()
                 });
-                Drawn { texture, title: l.title, props: l.props }
+                Drawn { texture, title: l.title, solid: l.solid, props: l.props }
             })
             .collect();
         *self.imp().layers.borrow_mut() = drawn;
