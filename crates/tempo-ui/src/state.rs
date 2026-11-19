@@ -58,6 +58,16 @@ pub enum EditSelection {
     Edit { track_id: Uuid, position_us: i64 },
 }
 
+impl EditSelection {
+    /// Whether the transition or edit point is still on the timeline.
+    pub fn exists_in(&self, t: &Timeline) -> bool {
+        match *self {
+            Self::Transition { track_id, clip_id, edge } => t.find_track(track_id).is_some_and(|tr| tr.transition_at_edit(clip_id, edge).is_some()),
+            Self::Edit { track_id, position_us } => t.find_track(track_id).is_some_and(|tr| tr.edit_at(position_us).is_some()),
+        }
+    }
+}
+
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
@@ -318,6 +328,12 @@ impl AppState {
         let before = self.selected_ids();
         // An edit may have filled or moved the gap, so it is not kept.
         let had_gap = self.gap.take().is_some();
+        // Nor a transition or edit point that is gone.
+        let edit_gone = self.edit_selection.get().is_some_and(|sel| !self.with_timeline(|t| sel.exists_in(t)).unwrap_or(false));
+        if edit_gone {
+            self.edit_selection.set(None);
+        }
+        let had_gap = had_gap || edit_gone;
         self.extra_selection.borrow_mut().retain(|id| !gone(id));
         if self.selection.get().is_some_and(|id| gone(&id)) {
             let next = self.extra_selection.borrow_mut().pop();

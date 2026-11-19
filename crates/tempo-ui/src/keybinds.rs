@@ -53,7 +53,7 @@ pub enum HintZone {
     ClipBody,
     ClipEdge,
     FadeHandle,
-    /// The start of a cross dissolve on the timeline.
+    /// A transition box on the timeline.
     TransitionEdge,
     Ruler,
     Viewer,
@@ -67,9 +67,15 @@ fn hint_actions(zone: HintZone) -> (&'static str, &'static [(&'static str, &'sta
             "Drag to move",
             &[("win.tool-blade", "Blade"), ("win.split-clip", "Split"), ("win.delete", "Delete"), ("win.ripple-delete", "Delete and close gap")],
         ),
-        HintZone::ClipEdge => ("Drag to trim · Shift+drag in Trim mode rolls", &[("win.tool-trim", "Trim mode (ripples)"), ("win.tool-select", "Selection mode"), ("win.snap-toggle", "Snapping")]),
+        HintZone::ClipEdge => (
+            "Click to select the edit · drag to trim · Shift+drag in Trim mode rolls",
+            &[("win.transition-add", "Add transition"), ("win.paste", "Paste transition"), ("win.tool-trim", "Trim mode (ripples)"), ("win.snap-toggle", "Snapping")],
+        ),
         HintZone::FadeHandle => ("Drag toward the middle to fade", &[("win.fade-in-to-playhead", "Fade in to playhead"), ("win.fade-out-to-playhead", "Fade out to playhead")]),
-        HintZone::TransitionEdge => ("Drag to make the dissolve longer or shorter", &[("win.transition-add", "Add dissolve"), ("win.undo", "Undo")]),
+        HintZone::TransitionEdge => (
+            "Click to select · drag an edge to change its length",
+            &[("win.copy", "Copy"), ("win.delete", "Delete"), ("win.clip-prev", "Previous edit"), ("win.clip-next", "Next edit")],
+        ),
         HintZone::Ruler => ("Click or drag to move the playhead", &[("win.mark-in", "Mark In"), ("win.mark-out", "Mark Out"), ("win.marker-add", "Marker")]),
         HintZone::Viewer => ("", &[("win.play-toggle", "Play"), ("win.play-reverse", "Reverse"), ("win.stop", "Stop"), ("win.play-forward", "Forward"), ("win.viewer-toggle", "Source / timeline")]),
         HintZone::MediaPool => (
@@ -161,6 +167,16 @@ mod tests {
         // Resolve's split is Ctrl+\, not Ctrl+B; the hint must say what the key really is.
         assert!(text.contains("[<Primary>backslash] Split"), "{text}");
         assert!(text.contains("[<Shift>BackSpace] Delete and close gap"), "{text}");
+        let text = hint(HintZone::ClipEdge, &load(), |k| format!("[{k}]"));
+        assert!(text.contains("[<Primary>t] Add transition"), "{text}");
+    }
+
+    #[test]
+    fn transition_keys_follow_resolve() {
+        let key = |action: &str| load().into_iter().find(|b| b.action == action).and_then(|b| b.keys.first().cloned());
+        assert_eq!(key("win.transition-add").as_deref(), Some("<Primary>t"));
+        assert_eq!(key("win.transition-add-video").as_deref(), Some("<Alt>t"));
+        assert_eq!(key("win.transition-add-audio").as_deref(), Some("<Shift>t"));
     }
 
     #[test]
