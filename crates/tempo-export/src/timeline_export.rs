@@ -119,30 +119,42 @@ fn effect_filters(props: &ClipProperties, sy: f32) -> String {
     out
 }
 
-/// Fade filters for a piece. A fade is applied only where the piece still has
-/// that end of its clip (an export range may have cut it off).
-fn fade_filters(p: &Piece, r0: i64, audio: bool) -> String {
+/// Sound fade of a piece as a per-frame `volume`, measured against the whole clip so an export
+/// range that starts or ends inside a fade still hears the rest of the ramp.
+fn audio_fade_filters(p: &Piece, r0: i64) -> String {
     let props = &p.clip.properties;
-    let len = p.end - p.start;
-    let (name, alpha) = if audio { ("afade", "") } else { ("fade", ":alpha=1") };
-    let mut out = String::new();
-    if props.fade_in_us > 0 && p.start + r0 == p.clip.timeline_in {
-        // Longer than the piece is fine for video: a handle piece of a dissolve ends part-way up.
-        let d = if audio { props.fade_in_us.min(len) } else { props.fade_in_us };
-        out.push_str(&format!(",{name}=t=in:st=0:d={}{alpha}", secs(d)));
+    let abs = p.start + r0;
+    let mut terms = Vec::new();
+    if props.fade_in_us > 0 {
+        terms.push(format!("clip((t+({}))/{},0,1)", secs(abs - p.clip.timeline_in), secs(props.fade_in_us)));
     }
-    if props.fade_out_us > 0 && p.end + r0 == p.clip.timeline_out {
-        if !audio && props.fade_out_us > len {
-            // A handle piece of a dissolve starts part-way down its ramp. `fade` cannot start
-            // before 0, so pad the front by the missing time, fade, and cut the padding off.
-            let pad = secs(props.fade_out_us - len);
-            out.push_str(&format!(",tpad=start_duration={pad}:start_mode=clone,fade=t=out:st=0:d={}{alpha},trim=start={pad},setpts=PTS-STARTPTS", secs(props.fade_out_us)));
-        } else {
-            let d = props.fade_out_us.min(len);
-            out.push_str(&format!(",{name}=t=out:st={}:d={}{alpha}", secs(len - d), secs(d)));
+    if props.fade_out_us > 0 {
+        terms.push(format!("clip(({}-t)/{},0,1)", secs(p.clip.timeline_out - abs), secs(props.fade_out_us)));
+    }
+    match terms.len() {
+        0 => String::new(),
+        1 => format!(",volume='{}':eval=frame", terms[0]),
+        _ => format!(",volume='min({},{})':eval=frame", terms[0], terms[1]),
+    }
+}
+
+/// Per-frame opacity of a picture: `opacity_at` takes the absolute timeline time of each of
+/// the `frames` output frames from output frame `first`, and the value is set only where it
+/// changes. Same functions as the player uses, so a ranged export shows what the player shows.
+/// Needs rgba input. Empty when the opacity stays 1.
+fn opacity_filters(name: &str, first: i64, frames: i64, r0: i64, project: &Project, opacity_at: impl Fn(i64) -> f32) -> String {
+    let (mut cmds, mut last) = (String::new(), 1.0f32);
+    for i in 0..frames {
+        let v = opacity_at(r0 + frame_time(first + i, project)).clamp(0.0, 1.0);
+        if (v - last).abs() > 1e-4 {
+            cmds.push_str(&format!("{} colorchannelmixer@{name} aa {v:.4};", secs(frame_time(i, project))));
+            last = v;
         }
     }
-    out
+    if cmds.is_empty() {
+        return String::new();
+    }
+    format!(",sendcmd=c='{cmds}',colorchannelmixer@{name}=aa=1")
 }
 
 /// Gain ramps of audio transitions as `volume` filters evaluated per frame.
@@ -159,8 +171,7 @@ fn ramp_filters(p: &Piece, r0: i64, ramps: &std::collections::HashMap<uuid::Uuid
 }
 
 /// A full-frame solid colour over `layer`'s span with its opacity ramps, as a strip as long
-/// as the output. Returns its label. (shortcut: ramps are not applied when the export range
-/// cuts into them.)
+/// as the output. Returns its label.
 fn color_strip(
     graph: &mut Vec<String>,
     ti: usize,
@@ -175,16 +186,8 @@ fn color_strip(
     if frames <= 0 {
         return None;
     }
-    let len = frame_time(frames, project);
     let [r, g, b] = layer.color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-    let mut fades = String::new();
-    if layer.fade_in_us > 0 && layer.start_us >= r0 {
-        fades.push_str(&format!(",fade=t=in:st=0:d={}:alpha=1", secs(layer.fade_in_us.min(len))));
-    }
-    if layer.fade_out_us > 0 && layer.end_us <= r1 {
-        let d = layer.fade_out_us.min(len);
-        fades.push_str(&format!(",fade=t=out:st={}:d={}:alpha=1", secs(len - d), secs(d)));
-    }
+    let fades = opacity_filters(&format!("dip{ti}"), first, frames, r0, project, |t| layer.opacity_at(t));
     let solid = format!("color=c=0x{r:02x}{g:02x}{b:02x}:s={w}x{h}:r={fps},trim=end_frame={frames},format=rgba{fades}");
     let out = format!("vt{ti}");
     if first > 0 {
@@ -273,8 +276,8 @@ fn build_args(
     // A size limit always uses the processor's encoder, which keeps to a bitrate.
     let hardware = e.hardware && e.max_video_kbps.is_none();
     let mut text_files: Vec<(PathBuf, String)> = Vec::new();
-    let sx = ((e.width.max(16) + 1) & !1) as f32 / project.width.max(1) as f32;
-    let sy = ((e.height.max(16) + 1) & !1) as f32 / project.height.max(1) as f32;
+    let sx = ((e.width.max(16) + 1) & !1) as f32 / project.output_size().0.max(1) as f32;
+    let sy = ((e.height.max(16) + 1) & !1) as f32 / project.output_size().1.max(1) as f32;
     let timeline_end = project.timeline.tracks.iter().map(|t| t.duration_us()).max().unwrap_or(0);
     let (r0, r1) = e.range.unwrap_or((0, timeline_end));
     let (r0, r1) = (r0.max(0), r1.min(timeline_end));
@@ -351,7 +354,7 @@ fn build_args(
                 segs.push(label);
             }
             let len = p.end - p.start;
-            let fades = fade_filters(p, r0, false);
+            let fades = opacity_filters(&format!("fd{ti}_{}", segs.len()), first, frames, r0, project, |t| p.clip.fade_factor(t));
             if p.clip.clip_type == ClipType::Title {
                 let Some(title) = &p.clip.title_data else { continue };
                 let file = std::env::temp_dir().join(format!("tempo-title-{}-{}-{}.txt", std::process::id(), r0, text_files.len()));
@@ -446,15 +449,16 @@ fn build_args(
     let mut audio_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled).collect();
     audio_tracks.sort_by_key(|t| t.kind_index);
     // Audio transitions are gain ramps on the clips (see `audio_mix`).
-    let mut audio_strips: Vec<(Vec<Clip>, f32)> = Vec::new();
+    let mut audio_strips: Vec<(Vec<Clip>, f32, bool)> = Vec::new();
     let mut ramps = std::collections::HashMap::new();
     for track in &audio_tracks {
         let built = crate::audio_mix::audio_strips(track, &project.sources);
-        audio_strips.extend(built.strips.into_iter().map(|s| (s, track.volume)));
+        let mono = track.audio_type == tempo_timeline::types::AudioTrackType::Mono;
+        audio_strips.extend(built.strips.into_iter().map(|s| (s, track.volume, mono)));
         ramps.extend(built.ramps);
     }
     let mut audio_labels = Vec::new();
-    for (ti, (strip, track_volume)) in audio_strips.iter().enumerate() {
+    for (ti, (strip, track_volume, mono)) in audio_strips.iter().enumerate() {
         let parts = pieces(strip, r0, r1, &[ClipType::Audio]);
         if parts.is_empty() {
             continue;
@@ -479,11 +483,13 @@ fn build_args(
             let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track_volume.max(0.0) };
             let (left, right) = (1.0 - props.pan.max(0.0), 1.0 + props.pan.min(0.0));
             let label = format!("ac{ti}_{}", segs.len());
+            // A Mono track plays centred: both sides get the average.
+            let centre = if *mono { ",pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1" } else { "" };
             graph.push(format!(
-                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
+                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo{centre},atrim=duration={},asetpts=PTS-STARTPTS,\
                  volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}{}[{label}]",
                 secs(len),
-                fade_filters(p, r0, true),
+                audio_fade_filters(p, r0),
                 ramp_filters(p, r0, &ramps)
             ));
             segs.push(label);
@@ -996,7 +1002,7 @@ mod tests {
         let out = std::env::temp_dir().join(format!("tempo-export-title-{}.mp4", std::process::id()));
         let (args, _, files) = build_ffmpeg_args(&project, &settings(out.clone()), None).unwrap();
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
-        assert!(graph.contains("drawtext=textfile=") && graph.contains("fade=t=in") && graph.contains("afade=t=out"));
+        assert!(graph.contains("drawtext=textfile=") && graph.contains("colorchannelmixer@fd") && graph.contains("volume='min(") || graph.contains("volume='clip("));
         assert_eq!(files.len(), 1);
         // Awkward characters in the title must not break the filter graph.
         export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
@@ -1122,6 +1128,49 @@ mod tests {
         assert!(start[0] < 25, "{start:?}");
         assert!((90..170).contains(&half[0]), "{half:?}");
         assert!(full[0] > 200, "{full:?}");
+    }
+
+    /// An export that starts inside a ramp still shows the rest of it.
+    #[test]
+    fn ranged_export_keeps_the_fade_it_starts_inside() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::{CrossDissolve, DipToColor}};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("ranged");
+        // Head fade 0-1 s on the first clip; range 0.5-1.5 s starts half way up the ramp.
+        let Some(mut project) = two_clip_project(&dir, TrackKind::Video, |_| None) else { return };
+        let track = project.timeline.tracks.iter_mut().find(|t| t.kind == TrackKind::Video).unwrap();
+        let first = track.clips[0].id;
+        let second = track.clips[1].id;
+        track.transitions.extend(transition(CrossDissolve, In)(first));
+        let mut dip = transition(DipToColor, In)(second).unwrap();
+        dip.color = [0.0, 1.0, 0.0];
+        track.transitions.push(dip);
+        let settings = TimelineExport { range: Some((500_000, 2_200_000)), ..settings(dir.join("out.mp4")) };
+        export_timeline(&project, &settings, &AtomicBool::new(false), |_| {}).unwrap();
+        let out = dir.join("out.mp4");
+        // Export time 0 is 0.5 s on the timeline: red at about half. 1.5 s on the timeline
+        // (export 1.0) is where the dip starts; export 1.5 is the dip's middle.
+        let (start, mid) = (pixel_at(&out, 0.0), pixel_at(&out, 1.5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!((70..180).contains(&start[0]), "{start:?}");
+        assert!(mid[1] > 150 && mid[0] < 80, "{mid:?}");
+    }
+
+    #[test]
+    fn mono_audio_track_is_centred_in_the_graph() {
+        let Some(path) = sample() else { return };
+        let mut project = project_with_clip(path);
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        let out = std::env::temp_dir().join("tempo-export-mono.mp4");
+        let graph_of = |project: &Project| {
+            let (args, _, _) = build_ffmpeg_args(project, &settings(out.clone()), None).unwrap();
+            args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone()
+        };
+        assert!(!graph_of(&project).contains("c0=0.5*c0+0.5*c1"));
+        project.timeline.find_track_mut(a).unwrap().audio_type = tempo_timeline::types::AudioTrackType::Mono;
+        assert!(graph_of(&project).contains("c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"));
     }
 
     #[test]

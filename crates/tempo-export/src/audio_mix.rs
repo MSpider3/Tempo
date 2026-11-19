@@ -116,6 +116,8 @@ pub fn audio_strips(track: &Track, sources: &HashMap<Uuid, MediaSource>) -> Audi
             tails.push(p);
         }
     }
+    heads.sort_by_key(|p: &Clip| p.timeline_in);
+    tails.sort_by_key(|p: &Clip| p.timeline_in);
     out.strips[1] = heads;
     out.strips[2] = tails;
     out.strips.retain(|s| !s.is_empty());
@@ -161,5 +163,38 @@ mod tests {
             assert!((0.9..=1.1).contains(&power(t)), "{t}: {}", power(t));
         }
         assert!((power(3_999_999) - power(4_000_000)).abs() < 0.05, "{} vs {}", power(3_999_999), power(4_000_000));
+    }
+
+    /// A short clip B between A and C with a cross fade on both cuts: each side gets its own
+    /// handle piece, pieces in a strip are in order and never overlap, and power stays level.
+    #[test]
+    fn short_clip_with_cross_fades_on_both_cuts_keeps_power_level() {
+        use tempo_timeline::{MediaType, Project, RationalFps, Transition, TransitionAlignment, TrackKind};
+        for short in [400_000, 600_000, 1_000_000] {
+            let mut project = Project::new("t", 320, 180, RationalFps::FPS_30);
+            let source = MediaSource::new(std::env::temp_dir().join("x.wav"), MediaType::Audio, 20_000_000);
+            let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+            let track = project.timeline.find_track_mut(a).unwrap();
+            let (ab, bc) = (4_000_000, 4_000_000 + short);
+            track.clips.push(Clip::new(a, source.id, ClipType::Audio, "a", 0, ab, 2_000_000, 2_000_000 + ab));
+            track.clips.push(Clip::new(a, source.id, ClipType::Audio, "b", ab, bc, 2_000_000, 2_000_000 + short));
+            track.clips.push(Clip::new(a, source.id, ClipType::Audio, "c", bc, bc + 4_000_000, 2_000_000, 6_000_000));
+            let (b, c) = (track.clips[1].id, track.clips[2].id);
+            // Added later cut first: the strips must not depend on the order.
+            for id in [c, b] {
+                track.transitions.push(Transition::new(id, TransitionEdge::In, TransitionKind::Crossfade, 1_000_000, TransitionAlignment::Centered));
+            }
+            let sources = HashMap::from([(source.id, source)]);
+            let strips = audio_strips(project.timeline.find_track_mut(a).unwrap(), &sources);
+            for strip in &strips.strips {
+                assert!(strip.windows(2).all(|w| w[0].timeline_out <= w[1].timeline_in), "{short}: strip out of order or overlapping");
+            }
+            let power = |t: i64| -> f32 {
+                strips.strips.iter().flatten().filter(|c| c.timeline_in <= t && t < c.timeline_out).map(|c| AudioStrips::gain(&strips.ramps, c, t).powi(2)).sum()
+            };
+            for t in (ab - 400_000..bc + 400_000).step_by(20_000) {
+                assert!((0.9..=1.1).contains(&power(t)), "{short} at {t}: {}", power(t));
+            }
+        }
     }
 }
