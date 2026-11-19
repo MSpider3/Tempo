@@ -20,6 +20,10 @@
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
 >
+> **Updated 2026-11-19.** The schema is now **version 4**. Migration 4 adds `color` and
+> `ease` to `transitions` and kind 9 (Dip To Color); old cross dissolves load as
+> transitions (§9).
+>
 > **Updated 2026-10-21 (0.2.0 alpha).** The schema is now **version 2**. Migration 2 rebuilds
 > `clips` without the rule that source and timeline lengths are equal, because a retimed clip
 > (speed ≠ 1.0) covers `speed ×` its timeline length of source (§8, §15). New in this release:
@@ -89,7 +93,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **3**
+Current schema version: **4**
 
 ---
 
@@ -364,20 +368,34 @@ The interface then points the user to the project's backups (§18).
 
 ## 9. Transitions
 
+A transition sits on one clip edge (at most one per edge) and loads into the track of its
+clip; a row whose clip is gone is dropped on load. On a cut between two clips it is stored on
+the incoming clip's In edge; at a clip head or tail with nothing touching, on that edge. The
+rules for where it lies and how it is drawn are in `crates/tempo-timeline/src/transition.rs`.
+
 ```sql
 CREATE TABLE transitions (
     id              TEXT PRIMARY KEY,    -- UUID
     clip_id         TEXT NOT NULL,       -- FK → clips(id)
     edge            INTEGER NOT NULL,    -- 0=in 1=out
-    kind            INTEGER NOT NULL,    -- 0=cut 1=cross_dissolve 2=dip_black 3=dip_white 4=fade_in 5=fade_out 6=plugin
-    duration_us     INTEGER NOT NULL,
+    kind            INTEGER NOT NULL,    -- 0=cut 1=cross_dissolve 2=dip_black 3=dip_white 4=fade_in
+                                         -- 5=fade_out 6=plugin 7=fade_from_white 8=fade_to_white
+                                         -- 9=dip_to_color
+    duration_us     INTEGER NOT NULL,    -- whole frames
     alignment       INTEGER NOT NULL,    -- 0=centered 1=start_at_cut 2=end_at_cut
     plugin_id       TEXT,                -- NULL unless kind=6
     plugin_params   TEXT DEFAULT '{}',  -- JSON, plugin-specific parameters
+    color           TEXT,                -- migration 4: '#rrggbb' for dip_to_color, NULL = black
+    ease            INTEGER NOT NULL DEFAULT 0,  -- migration 4: 0=none 1=in 2=out 3=in_out
 
     UNIQUE (clip_id, edge)
 );
 ```
+
+Files from before schema 4 kept a cross dissolve in the incoming clip's `properties` as
+`dissolve_in_us`. On load, each one whose clip has another clip ending at its start becomes a
+cross dissolve transition (edge In, end at cut, same length, limited to the footage before the
+clip's In point) and `dissolve_in_us` is set to 0; the next save stores the transition.
 
 ---
 
