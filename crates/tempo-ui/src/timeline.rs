@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
 use tempo_timeline::{
-    AddTrackCommand, Clip, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
+    AddTrackCommand, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
     Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
 };
 use uuid::Uuid;
@@ -32,6 +32,8 @@ fn marker_tip(timecode: &str, name: &str) -> String {
 }
 
 pub const RULER_H: f32 = 48.0;
+/// Empty space above the top video track, where a clip dragged there gets a new track.
+const GHOST_BAND_H: f32 = 40.0;
 const VIDEO_H: f32 = 60.0;
 const AUDIO_H: f32 = 54.0;
 const DIVIDER_H: f32 = 2.0;
@@ -61,7 +63,7 @@ fn lerp_i(from: i64, to: i64, e: f64) -> i64 {
 
 /// A clip dragged over the ruler, above the top video track, asks for new tracks.
 fn over_ghost_tracks(y: f64) -> bool {
-    y < RULER_H as f64
+    (RULER_H as f64..(RULER_H + GHOST_BAND_H) as f64).contains(&y)
 }
 
 /// What a transition dragged from the Effects panel carries, before its kind.
@@ -97,7 +99,7 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
     audio.sort_by_key(|t| t.kind_index);
 
     let mut out = Vec::new();
-    let mut y = RULER_H;
+    let mut y = RULER_H + GHOST_BAND_H;
     for (list, h) in [(video, VIDEO_H), (audio, AUDIO_H)] {
         for t in list {
             out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled, solo: t.solo });
@@ -988,24 +990,20 @@ impl TimelineCanvas {
         let Some(sound) = self.ghost_sound(id) else { return false };
         let next = |kind: TrackKind| state.with_timeline(|t| t.tracks.iter().filter(|tr| tr.kind == kind).map(|tr| tr.kind_index).max().unwrap_or(0) + 1).unwrap_or(1);
         let at = state.frame_floor(at);
-        let Some((name, duration, media_type)) = state.with_project(|p| {
-            p.sources.get(&id).map(|s| (s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), s.duration_us.max(1), s.media_type))
-        }).flatten() else { return false };
-        let len = if media_type == MediaType::Image { 5_000_000 } else { duration };
         let mut commands: Vec<Box<dyn Command>> = Vec::new();
-        let mut clips = Vec::new();
-        for (kind, clip_type) in [(TrackKind::Video, ClipType::Video), (TrackKind::Audio, ClipType::Audio)] {
-            if kind == TrackKind::Audio && !sound {
-                continue;
-            }
-            let (n, clip_type) = (next(kind), if media_type == MediaType::Image { ClipType::Image } else { clip_type });
+        let mut new_track = |kind: TrackKind| {
+            let n = next(kind);
             let add = AddTrackCommand::new(Track::new(kind, n, format!("{} {n}", if kind == TrackKind::Video { "Video" } else { "Audio" }), 0));
-            clips.push(Clip::new(add.track_id(), id, clip_type, name.clone(), at, at + len, 0, len));
+            let id = add.track_id();
             commands.push(Box::new(add));
-        }
-        if clips.len() > 1 {
-            let link = Some(Uuid::new_v4());
-            clips.iter_mut().for_each(|c| c.properties.link = link);
+            id
+        };
+        let video = new_track(TrackKind::Video);
+        let audio = sound.then(|| new_track(TrackKind::Audio));
+        // Built as a normal drop is: In/Out marks, still length and links.
+        let clips = actions::clips_for_source(&state, id, at, Some(video), audio);
+        if clips.is_empty() {
+            return false;
         }
         let first = clips[0].id;
         commands.extend(clips.into_iter().map(|c| Box::new(InsertClipCommand::new(c)) as Box<dyn Command>));
@@ -1028,7 +1026,7 @@ impl TimelineCanvas {
             s.append_border(&gsk::RoundedRect::from_rect(area, 0.0), &[1.0; 4], &[accent; 4]);
             self.text(s, &text, 8.0, y + h / 2.0 - 8.0, &accent, true, 160.0);
         };
-        lane(0.0, RULER_H, format!("V{v}  Video {v}"));
+        lane(RULER_H, GHOST_BAND_H, format!("V{v}  Video {v}"));
         if sound {
             lane(audio_y, AUDIO_H, format!("A{a}  Audio {a}"));
         }
@@ -1739,7 +1737,12 @@ impl TimelineCanvas {
                 }
             }
             let Some((start, end)) = track.transition_span(&t) else { continue };
-            let (x0, x1) = (self.x_of(start) as f32, self.x_of(end) as f32);
+            // The transition rides on the clip edge it belongs to while that eases.
+            let shift = track.find_clip(t.clip_id).map_or(0, |c| {
+                let (a, b) = self.tweened(c.id, c.timeline_in, c.timeline_out);
+                if t.edge == TransitionEdge::In { a - c.timeline_in } else { b - c.timeline_out }
+            });
+            let (x0, x1) = (self.x_of(start + shift) as f32, self.x_of(end + shift) as f32);
             if x1 < 0.0 || x0 > view_w {
                 continue;
             }
@@ -1770,7 +1773,11 @@ impl TimelineCanvas {
     /// Resolve's green bracket on a selected edit point: a bar on the edit, with feet
     /// toward the clip ending there and the clip starting there.
     fn draw_edit_bracket(&self, s: &gtk::Snapshot, row: &Row, track: &Track, at: i64) {
-        let x = self.x_of(at) as f32;
+        let shift = track.clips.iter().find_map(|c| {
+            let (a, b) = self.tweened(c.id, c.timeline_in, c.timeline_out);
+            (c.timeline_in == at).then_some(a - at).or((c.timeline_out == at).then_some(b - at))
+        });
+        let x = self.x_of(at + shift.unwrap_or(0)) as f32;
         let green = css_color(self, "tempo_ok");
         let (top, bottom) = (row.y + 1.0, row.y + row.h - 2.0);
         let bar = |x: f32, y: f32, w: f32, h: f32| s.append_color(&green, &graphene::Rect::new(x, y, w, h));
@@ -1928,6 +1935,7 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
         container.remove(&child);
     }
     let rows = state.with_timeline(rows).unwrap_or_default();
+    container.append(&gtk::Box::builder().height_request(GHOST_BAND_H as i32).build());
     let mut divider_done = false;
     for row in rows {
         if row.kind == TrackKind::Audio && !divider_done {
@@ -2080,8 +2088,9 @@ mod tests {
 
     #[test]
     fn ghost_lanes_only_above_the_top_track() {
-        assert!(over_ghost_tracks(0.0) && over_ghost_tracks(RULER_H as f64 - 1.0));
-        assert!(!over_ghost_tracks(RULER_H as f64 + 1.0));
+        assert!(!over_ghost_tracks(RULER_H as f64 - 1.0));
+        assert!(over_ghost_tracks(RULER_H as f64 + 1.0));
+        assert!(!over_ghost_tracks((RULER_H + GHOST_BAND_H) as f64 + 1.0));
     }
 
     #[test]

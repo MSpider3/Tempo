@@ -27,7 +27,7 @@ pub enum Place {
 }
 
 /// Build the clip(s) a source produces: picture on a video track, sound on an audio track.
-fn clips_for_source(
+pub(crate) fn clips_for_source(
     state: &AppState,
     source_id: Uuid,
     at_us: i64,
