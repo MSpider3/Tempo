@@ -7,7 +7,7 @@ class E2EError(AssertionError):
 
 
 # Widgets that take the mouse wheel for themselves.
-CONTROLS = ("GtkScale", "GtkSpinButton", "GtkDropDown", "GtkEntry", "GtkButton", "GtkToggleButton", "GtkSwitch", "GtkDrawingArea", "GtkTextView")
+CONTROLS = ("GtkScale", "GtkSpinButton", "GtkDropDown", "GtkEntry", "GtkButton", "GtkToggleButton", "GtkSwitch", "GtkCheckButton", "GtkDrawingArea", "GtkTextView")
 
 
 def center(rect):

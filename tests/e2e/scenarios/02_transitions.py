@@ -28,7 +28,11 @@ def run(s):
     longer = s.wait_for(lambda: s.transitions("V1")[0]["duration_us"] > length and s.transitions("V1")[0], "the transition to get longer")
     expect_near((s.transition_geo("V1", 0)["start_us"] + s.transition_geo("V1", 0)["end_us"]) / 2, 8_000_000, FRAME_US, "still centred after the edge drag")
 
-    # 3. Click it, Ctrl+C, Up (to the edit at 4 s), Ctrl+V.
+    # 3. As in the recording: playhead on the 8 s cut, click the transition, Ctrl+C,
+    #    Up (previous edit from the playhead: 4 s; the selection follows), Ctrl+V.
+    for k in ("Home", "Down", "Down"):
+        s.key(k)
+    s.wait_for(lambda: s.state()["playhead_us"] == 8_000_000, "the playhead on the 8 s cut")
     s.click(*center(s.transition_geo("V1", 0)["rect"]))
     s.wait_for(lambda: s.state()["selected_transition"], "the transition to be selected")
     s.key("ctrl+c")
