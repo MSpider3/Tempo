@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use tempo_timeline::{Clip, Command, CommandLog, Project, Timeline, TrackKind};
+use tempo_timeline::{Clip, Command, CommandLog, Project, Timeline, TrackKind, Transition, TransitionEdge};
 use uuid::Uuid;
 
 use crate::player::{Player, Snapshot};
@@ -48,6 +48,16 @@ pub struct Gap {
     pub end: i64,
 }
 
+/// What `AppState::edit_selection` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditSelection {
+    /// The transition stored on `clip_id`'s `edge` (see `Track::transition_at_edit`).
+    Transition { track_id: Uuid, clip_id: Uuid, edge: TransitionEdge },
+    /// The edit point at `position_us` on a track: a cut, or a clip's head or tail
+    /// (see `Track::edit_at`). Up/Down move it along with the playhead.
+    Edit { track_id: Uuid, position_us: i64 },
+}
+
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
@@ -84,6 +94,12 @@ pub struct AppState {
     pub clipboard: RefCell<Vec<Clip>>,
     /// The selected gap, if a gap rather than a clip is selected.
     pub gap: Cell<Option<Gap>>,
+    /// A transition (Resolve's red outline) or an edit point (green bracket) selected
+    /// instead of clips. Selecting clips or a gap clears it, and selecting it clears them.
+    pub edit_selection: Cell<Option<EditSelection>>,
+    /// The transition last copied (Ctrl+C with a transition selected); Ctrl+V puts it on
+    /// the selected edit point. Kept apart from the clip clipboard, as in Resolve.
+    pub transition_clipboard: RefCell<Option<Transition>>,
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
@@ -126,6 +142,8 @@ impl AppState {
             media_selection: Cell::new(None),
             clipboard: RefCell::new(Vec::new()),
             gap: Cell::new(None),
+            edit_selection: Cell::new(None),
+            transition_clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
             filters: RefCell::new(Vec::new()),
@@ -224,6 +242,7 @@ impl AppState {
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
         self.gap.set(None);
+        self.edit_selection.set(None);
         self.clipboard.borrow_mut().clear();
         self.source_clip.set(None);
         self.waveforms.borrow_mut().clear();
@@ -272,6 +291,7 @@ impl AppState {
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
         self.gap.set(None);
+        self.edit_selection.set(None);
         self.mark_in.set(None);
         self.mark_out.set(None);
         self.dest_video.set(1);
@@ -419,7 +439,7 @@ impl AppState {
     /// Select one clip (and what is linked to it), or nothing.
     pub fn select(&self, clip: Option<Uuid>) {
         let before = self.selected_ids();
-        let had_gap = self.gap.take().is_some();
+        let had_gap = self.gap.take().is_some() | self.edit_selection.take().is_some();
         self.selection.set(clip);
         *self.extra_selection.borrow_mut() = clip.map(|id| self.linked_to(id)).unwrap_or_default();
         if had_gap || before != self.selected_ids() {
@@ -431,7 +451,17 @@ impl AppState {
     pub fn select_gap(&self, gap: Gap) {
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
+        self.edit_selection.set(None);
         self.gap.set(Some(gap));
+        self.emit(Change::Selection);
+    }
+
+    /// Select a transition or an edit point (or nothing) in place of clips and gaps.
+    pub fn select_edit(&self, edit: Option<EditSelection>) {
+        self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
+        self.gap.set(None);
+        self.edit_selection.set(edit);
         self.emit(Change::Selection);
     }
 
