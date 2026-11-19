@@ -149,7 +149,8 @@ fn length_tip(from: i64, to: i64, left_edge: bool, both_free: bool, fps: f64) ->
 }
 
 /// A centred transition moves both edges, so its length changes in whole 2-frame steps
-/// (each edge on a frame line); an odd step falls back one frame toward `from`.
+/// (each edge moves whole frames); an odd step falls back one frame toward `from`. The
+/// caller still caps the result at the longest length the footage allows.
 fn even_steps(from: i64, to: i64, both_free: bool, frame_us: i64) -> i64 {
     let frames = ((to - from) as f64 / frame_us.max(1) as f64).round() as i64;
     if both_free && frames % 2 != 0 { to - frames.signum() * frame_us } else { to }
@@ -1114,9 +1115,8 @@ impl TimelineCanvas {
                     let (w, h) = thumbnail_size(data.len())?;
                     Some(gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(data), w * 4).upcast::<gdk::Texture>())
                 });
-            if let Some(t) = texture {
-                cache.insert(id, Some(t));
-            }
+            // A blob is there: cache even an unreadable one, so a bad size isn't re-copied every draw.
+            cache.insert(id, texture);
         }
         Some((cache.get(&id).cloned().flatten(), name))
     }
@@ -1417,7 +1417,7 @@ impl TimelineCanvas {
             }
             Some(Drag::Transition { left, both, from, to, max, .. }) => {
                 let fps = state.with_project(|p| p.timeline_fps()).unwrap_or_default();
-                *to = even_steps(*from, actions::dragged_length(*from, delta_us, *left, *both, *max, fps), *both, state.frame_us());
+                *to = even_steps(*from, actions::dragged_length(*from, delta_us, *left, *both, *max, fps), *both, state.frame_us()).min(*max);
                 *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, *left, *both, state.fps())));
             }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {

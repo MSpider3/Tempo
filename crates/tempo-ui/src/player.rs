@@ -340,10 +340,16 @@ impl Overload {
 impl Worker {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
         // `TEMPO_NO_AUDIO=1` (automated tests) never opens a sound output.
-        let audio = if std::env::var("TEMPO_NO_AUDIO").as_deref() == Ok("1") { None } else { AudioOutput::start().map(Arc::new) };
-        if audio.is_none() {
-            tracing::warn!("no sound server found: playback will be silent");
-        }
+        let audio = if std::env::var("TEMPO_NO_AUDIO").as_deref() == Ok("1") {
+            tracing::info!("TEMPO_NO_AUDIO=1: no sound output");
+            None
+        } else {
+            let out = AudioOutput::start().map(Arc::new);
+            if out.is_none() {
+                tracing::warn!("no sound server found: playback will be silent");
+            }
+            out
+        };
         let (feeder, feed_rx) = unbounded();
         if let Some(out) = audio.clone() {
             let spawned = std::thread::Builder::new().name("tempo-audio-feed".into()).spawn(move || feed_audio(feed_rx, out));

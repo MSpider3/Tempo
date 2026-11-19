@@ -375,7 +375,7 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
     let marker = text_button("Marker", "Add a marker at the playhead (M)");
     let s = state.clone();
     marker.connect_clicked(move |_| {
-        actions::add_marker(&s);
+        actions::add_marker(&s, false);
     });
 
     // Zoom: the three presets, minus, slider (logarithmic), plus.

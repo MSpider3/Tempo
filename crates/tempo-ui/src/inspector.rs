@@ -70,7 +70,15 @@ impl Inspector {
                 // Editing keeps the panel where the user is; something else selected starts at the top.
                 let now = Some((i.state.edit_selection.get(), i.state.selected_ids().first().copied()));
                 let at = if i.shown.replace(now) == now { i.scroller.vadjustment().value() } else { 0.0 };
+                // An edit from the curve graph rebuilds the panel; keep the keyboard on the new graph
+                // so the next Delete removes a key, not the transition.
+                let graph_focused = i.root.root().and_then(|r| r.focus()).is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
                 i.rebuild();
+                if graph_focused {
+                    if let Some(graph) = descendant_with_class(i.body.upcast_ref(), crate::keybinds::OWNS_DELETE_KEYS) {
+                        graph.grab_focus();
+                    }
+                }
                 let adjustment = i.scroller.vadjustment();
                 glib::idle_add_local_once(move || adjustment.set_value(at));
             }
@@ -739,6 +747,21 @@ fn add_key(keys: &[[f32; 2]], u: f32, v: f32) -> Option<Vec<[f32; 2]>> {
 
 /// The curve editor under the Transition Curve row. Edits are one undo step each
 /// (a drag commits on release); the panel is rebuilt afterwards.
+/// The first widget under `w` (or `w` itself) with the CSS class.
+fn descendant_with_class(w: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+    if w.has_css_class(class) {
+        return Some(w.clone());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(found) = descendant_with_class(&c, class) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
 fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::builder().content_height(GRAPH_HEIGHT).hexpand(true).focusable(true).can_focus(true).css_classes([crate::keybinds::OWNS_DELETE_KEYS]).build();
     area.set_tooltip_text(Some("Drag a key to move it. Double-click to add one. Right-click or Delete removes the selected key."));

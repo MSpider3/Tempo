@@ -1178,13 +1178,15 @@ pub fn default_marker_name(others: &[Marker]) -> String {
         .unwrap_or_default()
 }
 
-pub fn add_marker(state: &Rc<AppState>) -> Option<Marker> {
+/// `named`: Ctrl+M (the popup) names it "Marker N" from the start, as Resolve does; M and
+/// the Marker button leave it unnamed, an editing note that is never exported as a chapter.
+pub fn add_marker(state: &Rc<AppState>, named: bool) -> Option<Marker> {
     if let Some(existing) = marker_at_playhead(state) {
         return Some(existing);
     }
-    // Named "Marker N" from the start, so the overlay, ruler and popup agree.
     let others = state.with_timeline(|t| t.markers.clone()).unwrap_or_default();
-    let marker = Marker::new(state.frame_floor(state.playhead_us()), default_marker_name(&others), MarkerColor::Blue);
+    let name = if named { default_marker_name(&others) } else { String::new() };
+    let marker = Marker::new(state.frame_floor(state.playhead_us()), name, MarkerColor::Blue);
     state.execute(Box::new(AddMarkerCommand::new(marker.clone()))).then_some(marker)
 }
 
@@ -1472,5 +1474,21 @@ mod tests {
         assert_eq!(edit_group(&t, v1, 4 * S, true), vec![(v1, TrackKind::Video), (a1, TrackKind::Audio)]);
         assert_eq!(edit_group(&t, a1, 0, true), vec![(a1, TrackKind::Audio), (v1, TrackKind::Video)]);
         assert_eq!(edit_group(&t, v1, 4 * S, false), vec![(v1, TrackKind::Video)]);
+    }
+
+    #[test]
+    fn only_a_marker_added_for_the_popup_gets_a_default_name() {
+        // Arrange: unnamed markers are editing notes and never become chapters (UI_SPEC 7.4).
+        let state = AppState::new();
+        *state.project.borrow_mut() = Some(tempo_timeline::Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30));
+
+        // Act
+        let note = add_marker(&state, false).map(|m| m.name);
+        state.player.seek_timeline(1_000_000);
+        let popup = add_marker(&state, true).map(|m| m.name);
+
+        // Assert
+        assert_eq!(note.as_deref(), Some(""));
+        assert_eq!(popup.as_deref(), Some("Marker 2"));
     }
 }

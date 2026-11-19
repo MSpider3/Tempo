@@ -1154,10 +1154,10 @@ impl MainWindow {
 
             // Markers
             "win.marker-add" => {
-                actions::add_marker(state);
+                actions::add_marker(state, false);
             }
             "win.marker-add-modify" => {
-                if let Some(m) = actions::add_marker(state) {
+                if let Some(m) = actions::add_marker(state, true) {
                     dialogs::edit_marker(&self.window, state, m);
                 }
             }

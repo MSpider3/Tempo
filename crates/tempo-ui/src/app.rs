@@ -191,6 +191,11 @@ async fn serve_test_client(app: adw::Application, win: Rc<MainWindow>, connectio
     loop {
         while let Some(end) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
+            if line.len() > MAX_TEST_LINE + 1 {
+                let reply = serde_json::json!({ "ok": false, "error": format!("line longer than {MAX_TEST_LINE} bytes") });
+                let _ = output.write_all_future(format!("{reply}\n").into_bytes(), glib::Priority::DEFAULT).await;
+                return;
+            }
             let reply = match std::str::from_utf8(&line) {
                 Ok(text) => match test_command(&app, &win, text.trim()).await {
                     Ok(result) => serde_json::json!({ "ok": true, "result": result }),
