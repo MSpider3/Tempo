@@ -1226,41 +1226,29 @@ pub fn goto_marker(state: &Rc<AppState>, forward: bool) {
 /// becomes the selection, so Up, Ctrl+V, Up, Ctrl+V… pastes on every cut. Otherwise
 /// the playhead goes to the next or previous cut on any track.
 pub fn goto_edit(state: &Rc<AppState>, forward: bool) {
-    // The selected edit or transition only says which track to follow; the step is from the playhead.
-    let from = match state.edit_selection.get() {
+    // Previous / Next Edit are timeline commands: they count from the timeline playhead and
+    // move it, whatever the viewer shows. A selected edit or transition only says which
+    // track to follow; without one every track counts.
+    let at = state.playhead_us();
+    let track = match state.edit_selection.get() {
         Some(EditSelection::Edit { track_id, .. } | EditSelection::Transition { track_id, .. }) => Some(track_id),
         None => None,
     };
-    if let Some(track_id) = from {
-        let at = state.player.position_us();
-        let next = state
-            .with_timeline(|t| {
-                let points = t.find_track(track_id)?.edit_points().into_iter().map(|e| e.position_us);
-                neighbour_edit(points, at, t.duration_us(), forward)
-            })
-            .flatten();
-        if let Some(pos) = next {
-            state.select_edit(Some(EditSelection::Edit { track_id, position_us: pos }));
-            state.player.pause();
-            state.player.seek(pos, true);
-        }
-        return;
-    }
-    let pos = state.player.position_us();
-    let target = state
+    let next = state
         .with_timeline(|t| {
-            let points = t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]);
-            if forward {
-                points.filter(|p| *p > pos).min()
-            } else {
-                points.filter(|p| *p < pos).max()
-            }
+            let points: Vec<i64> = match track {
+                Some(id) => t.find_track(id)?.edit_points().into_iter().map(|e| e.position_us).collect(),
+                None => t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]).collect(),
+            };
+            neighbour_edit(points, at, t.duration_us(), forward)
         })
         .flatten();
-    if let Some(t) = target {
-        state.player.pause();
-        state.player.seek(t, true);
+    let Some(pos) = next else { return };
+    if let Some(track_id) = track {
+        state.select_edit(Some(EditSelection::Edit { track_id, position_us: pos }));
     }
+    state.player.pause();
+    state.player.seek_timeline(pos);
 }
 
 pub fn step_frames(state: &Rc<AppState>, frames: i64) {
@@ -1430,6 +1418,22 @@ mod tests {
         // Past the end of the last clip: only within reach.
         assert_eq!(at(9 * S, S / 2), None);
         assert_eq!(at(9 * S, 3 * S / 2), Some((8 * S, EditKind::Tail)));
+    }
+
+    #[test]
+    fn a_copied_transition_is_placed_by_the_edit_it_lands_on_not_the_timeline_it_came_from() {
+        let (track, sources) = cut(2 * S);
+        let mut timeline = Timeline::new();
+        let track_id = track.id;
+        let b_id = track.clips[1].id;
+        timeline.tracks.push(track);
+        // Copied on another timeline: its clip id means nothing here.
+        let copied = Transition::new(Uuid::new_v4(), TransitionEdge::Out, TransitionKind::DipToColor, S, TransitionAlignment::EndAtCut);
+        let t = place_on(&timeline, &sources, FPS, track_id, 4 * S, &copied).expect("fits");
+        assert_eq!((t.clip_id, t.kind.clone(), t.duration_us), (b_id, TransitionKind::DipToColor, S));
+        // An audio transition does not go on a video track.
+        let fade = Transition::new(Uuid::new_v4(), TransitionEdge::In, TransitionKind::Crossfade, S, TransitionAlignment::Centered);
+        assert_eq!(place_on(&timeline, &sources, FPS, track_id, 4 * S, &fade), Err("Audio transitions go on audio tracks."));
     }
 
     #[test]

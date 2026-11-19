@@ -963,7 +963,11 @@ impl TimelineCanvas {
                 _ => None,
             };
             c.set_ghost(ghost);
-            c.imp().drop_source.set(text.as_deref().and_then(|s| Uuid::parse_str(s).ok()));
+            // On Wayland the dragged value can arrive a motion or two late: keep the last source
+            // until it does, so the landing box never loses its thumbnail and name meanwhile.
+            if let Some(id) = text.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
+                c.imp().drop_source.set(Some(id));
+            }
             let preview = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
                 (None, Some(id)) => c.preview_for(id, x, y),
                 _ => None,
@@ -985,6 +989,7 @@ impl TimelineCanvas {
         drop.connect_leave(move |_| {
             if let Some(c) = c.upgrade() {
                 c.set_ghost(None);
+                c.imp().drop_source.set(None);
                 if c.imp().drop_at.take().is_some() | c.imp().preview.take().is_some() {
                     c.redraw();
                 }
@@ -994,6 +999,7 @@ impl TimelineCanvas {
         drop.connect_drop(move |_, value, x, y| {
             let Some(c) = c.upgrade() else { return false };
             c.imp().drop_at.set(None);
+            c.imp().drop_source.set(None);
             c.set_ghost(None);
             c.imp().preview.set(None);
             let Ok(text) = value.get::<String>() else { return false };
