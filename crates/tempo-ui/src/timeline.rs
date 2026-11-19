@@ -61,9 +61,16 @@ fn lerp_i(from: i64, to: i64, e: f64) -> i64 {
     from + ((to - from) as f64 * e).round() as i64
 }
 
-/// A clip dragged over the ruler, above the top video track, asks for new tracks.
-fn over_ghost_tracks(y: f64) -> bool {
-    (RULER_H as f64..(RULER_H + GHOST_BAND_H) as f64).contains(&y)
+/// The new tracks a Media Pool source dragged to `y` asks for, as (video, audio):
+/// a source with a picture over the band above the top video track, an audio-only
+/// source below the last row. `rows_bottom` is where the last track row ends.
+fn ghost_lanes(y: f64, rows_bottom: f64, media: MediaType, has_audio: bool) -> Option<(bool, bool)> {
+    let in_band = (RULER_H as f64..(RULER_H + GHOST_BAND_H) as f64).contains(&y);
+    match media {
+        MediaType::Audio => (y >= rows_bottom).then_some((false, true)),
+        MediaType::Video => in_band.then_some((true, has_audio)),
+        MediaType::Image => in_band.then_some((true, false)),
+    }
 }
 
 /// What a transition dragged from the Effects panel carries, before its kind.
@@ -203,9 +210,8 @@ mod imp {
         pub snap_line: Cell<Option<i64>>,
         /// Where something dragged from the Effects panel would land: track, start, end.
         pub drop_at: Cell<Option<(Uuid, i64, i64)>>,
-        /// A Media Pool clip is over the space above the top video track: whether its
-        /// sound also gets a new audio track.
-        pub ghost: Cell<Option<bool>>,
+        /// A Media Pool clip is over where new tracks would be made for it: (video, audio).
+        pub ghost: Cell<Option<(bool, bool)>>,
         /// Edit animation: 1.0 at rest, else how far the move from the `from` values has run.
         pub tween_e: Cell<f64>,
         pub tween_t0: Cell<i64>,
@@ -932,7 +938,7 @@ impl TimelineCanvas {
             // Show where the transition would land; where it cannot go, refuse it
             // (Resolve's no-entry sign, over audio tracks for instance).
             let ghost = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
-                (None, Some(id)) if over_ghost_tracks(y) => c.ghost_sound(id),
+                (None, Some(id)) => c.ghost_for(id, y),
                 _ => None,
             };
             if c.imp().ghost.replace(ghost) != ghost {
@@ -967,8 +973,8 @@ impl TimelineCanvas {
             }
             let Ok(id) = Uuid::parse_str(&text) else { return false };
             let (at, _) = c.snap(c.us_at(x), &[]);
-            if over_ghost_tracks(y) && c.ghost_sound(id).is_some() {
-                return c.drop_on_new_tracks(id, at);
+            if let Some(lanes) = c.ghost_for(id, y) {
+                return c.drop_on_new_tracks(id, at, lanes);
             }
             let track = c.row_at(y).map(|r| r.track_id);
             actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
@@ -977,31 +983,36 @@ impl TimelineCanvas {
         self.add_controller(drop);
     }
 
-    /// Whether a Media Pool source dropped above the top video track brings sound along:
-    /// `None` when it has no picture, so there is nothing to put on a new video track.
-    fn ghost_sound(&self, id: Uuid) -> Option<bool> {
-        let (kind, sound) = self.state().with_project(|p| p.sources.get(&id).map(|s| (s.media_type, s.audio_channels.is_some()))).flatten()?;
-        (kind != MediaType::Audio).then_some(kind == MediaType::Video && sound)
+    /// The new tracks a source dropped at `y` would get, if any.
+    fn ghost_for(&self, id: Uuid, y: f64) -> Option<(bool, bool)> {
+        let (media, sound) = self.state().with_project(|p| p.sources.get(&id).map(|s| (s.media_type, s.audio_channels.is_some()))).flatten()?;
+        let bottom = self.state().with_timeline(|t| rows(t).last().map_or(0.0, |r| (r.y + r.h) as f64))?;
+        ghost_lanes(y, bottom, media, sound)
     }
 
     /// Drop a source onto new tracks made for it (Resolve's ghost tracks): one undo step.
-    fn drop_on_new_tracks(&self, id: Uuid, at: i64) -> bool {
+    fn drop_on_new_tracks(&self, id: Uuid, at: i64, (video, sound): (bool, bool)) -> bool {
         let state = self.state();
-        let Some(sound) = self.ghost_sound(id) else { return false };
         let next = |kind: TrackKind| state.with_timeline(|t| t.tracks.iter().filter(|tr| tr.kind == kind).map(|tr| tr.kind_index).max().unwrap_or(0) + 1).unwrap_or(1);
         let at = state.frame_floor(at);
         let mut commands: Vec<Box<dyn Command>> = Vec::new();
+        // New audio tracks copy the existing ones' type (Stereo when there are none).
+        let audio_type = state.with_timeline(|t| t.tracks.iter().find(|tr| tr.kind == TrackKind::Audio).map(|tr| tr.audio_type)).flatten();
         let mut new_track = |kind: TrackKind| {
             let n = next(kind);
-            let add = AddTrackCommand::new(Track::new(kind, n, format!("{} {n}", if kind == TrackKind::Video { "Video" } else { "Audio" }), 0));
+            let mut track = Track::new(kind, n, format!("{} {n}", if kind == TrackKind::Video { "Video" } else { "Audio" }), 0);
+            if let (TrackKind::Audio, Some(t)) = (kind, audio_type) {
+                track.audio_type = t;
+            }
+            let add = AddTrackCommand::new(track);
             let id = add.track_id();
             commands.push(Box::new(add));
             id
         };
-        let video = new_track(TrackKind::Video);
+        let video = video.then(|| new_track(TrackKind::Video));
         let audio = sound.then(|| new_track(TrackKind::Audio));
         // Built as a normal drop is: In/Out marks, still length and links.
-        let clips = actions::clips_for_source(&state, id, at, Some(video), audio);
+        let clips = actions::clips_for_source(&state, id, at, video, audio);
         if clips.is_empty() {
             return false;
         }
@@ -1015,7 +1026,7 @@ impl TimelineCanvas {
     }
 
     /// The temporary track lanes shown while a clip is dragged above the top video track.
-    fn draw_ghost_lanes(&self, s: &gtk::Snapshot, rows: &[Row], sound: bool, w: f32) {
+    fn draw_ghost_lanes(&self, s: &gtk::Snapshot, rows: &[Row], (video, sound): (bool, bool), w: f32) {
         let next = |kind: TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
         let (v, a) = (next(TrackKind::Video), next(TrackKind::Audio));
         let audio_y = rows.last().map_or(RULER_H, |r| r.y + r.h);
@@ -1026,7 +1037,9 @@ impl TimelineCanvas {
             s.append_border(&gsk::RoundedRect::from_rect(area, 0.0), &[1.0; 4], &[accent; 4]);
             self.text(s, &text, 8.0, y + h / 2.0 - 8.0, &accent, true, 160.0);
         };
-        lane(RULER_H, GHOST_BAND_H, format!("V{v}  Video {v}"));
+        if video {
+            lane(RULER_H, GHOST_BAND_H, format!("V{v}  Video {v}"));
+        }
         if sound {
             lane(audio_y, AUDIO_H, format!("A{a}  Audio {a}"));
         }
@@ -1670,8 +1683,8 @@ impl TimelineCanvas {
                 s.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.06), &rect(0.0, row.y, w, row.h));
             }
         }
-        if let Some(sound) = imp.ghost.get() {
-            self.draw_ghost_lanes(s, &rows, sound, w);
+        if let Some(lanes) = imp.ghost.get() {
+            self.draw_ghost_lanes(s, &rows, lanes, w);
         }
         // Divider between video and audio tracks.
         if let Some(first_audio) = rows.iter().find(|r| r.kind == TrackKind::Audio) {
@@ -2087,10 +2100,16 @@ mod tests {
     use tempo_timeline::{Marker, MarkerColor};
 
     #[test]
-    fn ghost_lanes_only_above_the_top_track() {
-        assert!(!over_ghost_tracks(RULER_H as f64 - 1.0));
-        assert!(over_ghost_tracks(RULER_H as f64 + 1.0));
-        assert!(!over_ghost_tracks((RULER_H + GHOST_BAND_H) as f64 + 1.0));
+    fn ghost_lanes_follow_drop_position_and_source_kind() {
+        let (band, below, mid) = (RULER_H as f64 + 1.0, 500.0, 200.0);
+        assert_eq!(ghost_lanes(RULER_H as f64 - 1.0, below, MediaType::Video, true), None);
+        assert_eq!(ghost_lanes(band, below, MediaType::Video, true), Some((true, true)));
+        assert_eq!(ghost_lanes(band, below, MediaType::Video, false), Some((true, false)));
+        assert_eq!(ghost_lanes(band, below, MediaType::Image, false), Some((true, false)));
+        assert_eq!(ghost_lanes(band, below, MediaType::Audio, true), None);
+        assert_eq!(ghost_lanes(mid, below, MediaType::Audio, true), None);
+        assert_eq!(ghost_lanes(below, below, MediaType::Audio, true), Some((false, true)));
+        assert_eq!(ghost_lanes(below, below, MediaType::Video, true), None);
     }
 
     #[test]
