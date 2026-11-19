@@ -317,13 +317,25 @@ impl Inspector {
         let Some(view) = TransitionView::read(&self.state, (track_id, clip_id, edge)) else { return false };
         let t = &view.transition;
         self.title.set_text(&format!("Transition - {}", kind_name(&t.kind)));
-        let header = gtk::Box::builder().css_classes(["inspector-section"]).build();
-        header.append(&label("Transition", &["tempo-heading"]));
-        self.body.append(&header);
-        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(8).margin_top(10).margin_bottom(12).margin_start(12).margin_end(12).build();
-        self.body.append(&grid);
         let sel = (track_id, clip_id, edge);
         let state = &self.state;
+        // Resolve's section header with an on/off switch; off plays the edit as a cut.
+        let header = gtk::Box::builder().css_classes(["inspector-section"]).build();
+        let heading = label(if view.track_kind == TrackKind::Audio { "Audio" } else { "Video" }, &["tempo-heading"]);
+        heading.set_hexpand(true);
+        heading.set_xalign(0.0);
+        header.append(&heading);
+        let switch = gtk::Switch::builder().active(t.enabled).valign(gtk::Align::Center).tooltip_text("Off: this edit plays as a cut").build();
+        switch.update_property(&[gtk::accessible::Property::Label("Transition on or off")]);
+        let s = state.clone();
+        switch.connect_active_notify(move |sw| {
+            let on = sw.is_active();
+            edit_transition(&s, sel, |t| t.enabled = on);
+        });
+        header.append(&switch);
+        self.body.append(&header);
+        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(8).margin_top(10).margin_bottom(12).margin_start(12).margin_end(12).sensitive(t.enabled).build();
+        self.body.append(&grid);
 
         // Audio transitions (Cross Fade) have no type choice and no colour.
         let video = has_video_controls(view.track_kind);
@@ -405,9 +417,10 @@ impl Inspector {
             Self::ratio_row(&grid, 6, "End Ratio", t.end_ratio, sel, state, |t, r| t.end_ratio = r, 1.0);
             Self::ease_row(&grid, 7, t, sel, state);
             Self::curve_row(&grid, 8, t, sel, state);
+            grid.attach(&curve_graph(t, sel, state), 0, 9, 2, 1);
         }
         if video && t.kind == TransitionKind::DipToColor {
-            Self::row_label(&grid, 9, "Color");
+            Self::row_label(&grid, 10, "Color");
             let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
             button.set_rgba(&gtk::gdk::RGBA::new(t.color[0], t.color[1], t.color[2], 1.0));
             let s = state.clone();
@@ -415,7 +428,7 @@ impl Inspector {
                 let c = b.rgba();
                 edit_transition(&s, sel, |t| t.color = [c.red(), c.green(), c.blue()]);
             });
-            grid.attach(&button, 1, 9, 1, 1);
+            grid.attach(&button, 1, 10, 1, 1);
         }
         true
     }
@@ -675,6 +688,202 @@ fn kind_name(kind: &TransitionKind) -> &'static str {
     }
 }
 
+const GRAPH_HEIGHT: i32 = 110;
+const GRAPH_PAD: f64 = 10.0;
+const KEY_HIT_PX: f64 = 9.0;
+/// Keys closer than this in place would be merged by `with_curve_key`.
+const MIN_KEY_GAP: f32 = 0.02;
+
+/// Pixel of a (place, value) point in a graph `w` x `h` px; value 1 is at the top.
+fn graph_point(u: f32, v: f32, w: f64, h: f64) -> (f64, f64) {
+    (GRAPH_PAD + f64::from(u) * (w - 2.0 * GRAPH_PAD), GRAPH_PAD + (1.0 - f64::from(v)) * (h - 2.0 * GRAPH_PAD))
+}
+
+/// The (place, value) under a pixel, clamped to 0..1.
+fn graph_value(x: f64, y: f64, w: f64, h: f64) -> (f32, f32) {
+    let u = (x - GRAPH_PAD) / (w - 2.0 * GRAPH_PAD).max(1.0);
+    let v = 1.0 - (y - GRAPH_PAD) / (h - 2.0 * GRAPH_PAD).max(1.0);
+    (u.clamp(0.0, 1.0) as f32, v.clamp(0.0, 1.0) as f32)
+}
+
+/// The key nearest to the pixel, if within reach.
+fn hit_key(keys: &[[f32; 2]], x: f64, y: f64, w: f64, h: f64) -> Option<usize> {
+    let dist = |k: &[f32; 2]| {
+        let (kx, ky) = graph_point(k[0], k[1], w, h);
+        (kx - x).hypot(ky - y)
+    };
+    keys.iter().enumerate().map(|(i, k)| (i, dist(k))).filter(|(_, d)| *d <= KEY_HIT_PX).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
+}
+
+/// Key `index` moved to (u, v), clamped to 0..1 and kept between its neighbours.
+fn move_key(keys: &[[f32; 2]], index: usize, u: f32, v: f32) -> Vec<[f32; 2]> {
+    let mut moved = keys.to_vec();
+    if let Some(key) = moved.get_mut(index) {
+        let low = if index == 0 { 0.0 } else { keys[index - 1][0] + MIN_KEY_GAP };
+        let high = keys.get(index + 1).map_or(1.0, |n| n[0] - MIN_KEY_GAP);
+        *key = [u.clamp(low, high.max(low)), v.clamp(0.0, 1.0)];
+    }
+    moved
+}
+
+/// A key added at (u, v); `None` when another key is too close.
+fn add_key(keys: &[[f32; 2]], u: f32, v: f32) -> Option<Vec<[f32; 2]>> {
+    if keys.iter().any(|k| (k[0] - u).abs() < MIN_KEY_GAP) {
+        return None;
+    }
+    let mut added = keys.to_vec();
+    added.push([u, v]);
+    added.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    Some(added)
+}
+
+/// The curve editor under the Transition Curve row. Edits are one undo step each
+/// (a drag commits on release); the panel is rebuilt afterwards.
+fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().content_height(GRAPH_HEIGHT).hexpand(true).focusable(true).can_focus(true).build();
+    area.set_tooltip_text(Some("Drag a key to move it. Double-click to add one. Right-click or Delete removes the selected key."));
+    area.update_property(&[gtk::accessible::Property::Label("Transition curve graph")]);
+    let shape = Rc::new(RefCell::new(t.clone()));
+    let selected: Rc<Cell<Option<usize>>> = Rc::default();
+    let size = |a: &gtk::DrawingArea| (f64::from(a.width()), f64::from(a.height()));
+
+    let (sh, selected_draw, s) = (shape.clone(), selected.clone(), state.clone());
+    area.set_draw_func(move |a, cr, w, h| {
+        let (w, h) = (f64::from(w), f64::from(h));
+        let paint = |name: &str| {
+            let c = crate::util::css_color(a, name);
+            cr.set_source_rgba(f64::from(c.red()), f64::from(c.green()), f64::from(c.blue()), f64::from(c.alpha()));
+        };
+        paint("tempo_bg_inset");
+        cr.rectangle(0.0, 0.0, w, h);
+        let _ = cr.fill();
+        let (x0, y0) = graph_point(0.0, 1.0, w, h);
+        let (x1, y1) = graph_point(1.0, 0.0, w, h);
+        paint("tempo_line_soft");
+        cr.set_line_width(1.0);
+        cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+        let _ = cr.stroke();
+        let shape = sh.borrow();
+        if let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) {
+            paint("tempo_accent");
+            let (px, _) = graph_point(u, 0.0, w, h);
+            cr.move_to(px.round() + 0.5, y0);
+            cr.line_to(px.round() + 0.5, y1);
+            let _ = cr.stroke();
+        }
+        paint("tempo_text");
+        cr.set_line_width(2.0);
+        for i in 0..=64 {
+            let u = i as f32 / 64.0;
+            let (x, y) = graph_point(u, shape.curve_at(u), w, h);
+            if i == 0 { cr.move_to(x, y) } else { cr.line_to(x, y) }
+        }
+        let _ = cr.stroke();
+        for (i, k) in shape.curve.iter().enumerate() {
+            let (x, y) = graph_point(k[0], k[1], w, h);
+            paint(if selected_draw.get() == Some(i) { "tempo_accent" } else { "tempo_text_bright" });
+            cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    });
+
+    // Redraw for the playhead; ends with the widget.
+    let weak = area.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || match weak.upgrade() {
+        Some(a) => {
+            if a.is_mapped() {
+                a.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        }
+        None => glib::ControlFlow::Break,
+    });
+
+    let commit = {
+        let s = state.clone();
+        move |keys: Vec<[f32; 2]>| edit_transition(&s, sel, |t| t.curve = keys)
+    };
+
+    // Drag a key; commit on release.
+    let drag = gtk::GestureDrag::builder().button(1).build();
+    let moving: Rc<Cell<Option<(usize, f64, f64)>>> = Rc::default();
+    let (sh, mv, selected_c, a) = (shape.clone(), moving.clone(), selected.clone(), area.clone());
+    drag.connect_drag_begin(move |_, x, y| {
+        let (w, h) = size(&a);
+        let hit = hit_key(&sh.borrow().curve, x, y, w, h);
+        mv.set(hit.map(|i| (i, x, y)));
+        selected_c.set(hit);
+        a.grab_focus();
+        a.queue_draw();
+    });
+    let (sh, mv, a) = (shape.clone(), moving.clone(), area.clone());
+    drag.connect_drag_update(move |_, dx, dy| {
+        let Some((i, x, y)) = mv.get() else { return };
+        let (w, h) = size(&a);
+        let (u, v) = graph_value(x + dx, y + dy, w, h);
+        let moved = move_key(&sh.borrow().curve, i, u, v);
+        sh.borrow_mut().curve = moved;
+        a.queue_draw();
+    });
+    let (sh, mv, commit_drag, original) = (shape.clone(), moving, commit.clone(), t.curve.clone());
+    drag.connect_drag_end(move |_, dx, dy| {
+        let Some(_) = mv.take() else { return };
+        let keys = sh.borrow().curve.clone();
+        if (dx != 0.0 || dy != 0.0) && keys != original {
+            commit_drag(keys);
+        }
+    });
+    area.add_controller(drag);
+
+    // Double-click on empty space adds a key on the curve there.
+    let click = gtk::GestureClick::builder().button(1).build();
+    let (sh, a, commit_add) = (shape.clone(), area.clone(), commit.clone());
+    click.connect_pressed(move |_, presses, x, y| {
+        let (w, h) = size(&a);
+        let shape = sh.borrow();
+        if presses != 2 || hit_key(&shape.curve, x, y, w, h).is_some() {
+            return;
+        }
+        let (u, _) = graph_value(x, y, w, h);
+        if let Some(keys) = add_key(&shape.curve, u, shape.curve_at(u)) {
+            drop(shape);
+            commit_add(keys);
+        }
+    });
+    area.add_controller(click);
+
+    // Right-click on a key removes it.
+    let right = gtk::GestureClick::builder().button(3).build();
+    let (sh, a, commit_remove) = (shape.clone(), area.clone(), commit.clone());
+    right.connect_pressed(move |_, _, x, y| {
+        let (w, h) = size(&a);
+        let hit = hit_key(&sh.borrow().curve, x, y, w, h);
+        if let Some(i) = hit {
+            let mut keys = sh.borrow().curve.clone();
+            keys.remove(i);
+            commit_remove(keys);
+        }
+    });
+    area.add_controller(right);
+
+    // Delete or BackSpace removes the selected key.
+    let keys_ctl = gtk::EventControllerKey::new();
+    let sh = shape;
+    keys_ctl.connect_key_pressed(move |_, key, _, _| {
+        use gtk::gdk::Key;
+        let Some(i) = selected.get().filter(|_| matches!(key, Key::Delete | Key::BackSpace)) else { return glib::Propagation::Proceed };
+        let mut keys = sh.borrow().curve.clone();
+        if i < keys.len() {
+            keys.remove(i);
+            selected.set(None);
+            commit(keys);
+        }
+        glib::Propagation::Stop
+    });
+    area.add_controller(keys_ctl);
+    area
+}
+
 /// The Type dropdown and Color are video-only.
 fn has_video_controls(kind: TrackKind) -> bool {
     kind == TrackKind::Video
@@ -720,6 +929,43 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn graph_pixels_map_both_ways_and_clamp() {
+        let (x, y) = graph_point(0.5, 0.25, 220.0, 110.0);
+        assert_eq!((x, y), (110.0, 10.0 + 0.75 * 90.0));
+        let (u, v) = graph_value(x, y, 220.0, 110.0);
+        assert!((u - 0.5).abs() < 1e-6 && (v - 0.25).abs() < 1e-6);
+        assert_eq!(graph_value(-50.0, 500.0, 220.0, 110.0), (0.0, 0.0));
+        assert_eq!(graph_value(900.0, -5.0, 220.0, 110.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn hit_key_picks_the_nearest_key_within_reach() {
+        let keys = [[0.25, 0.5], [0.75, 0.5]];
+        let (x, y) = graph_point(0.75, 0.5, 220.0, 110.0);
+        assert_eq!(hit_key(&keys, x + 3.0, y - 2.0, 220.0, 110.0), Some(1));
+        assert_eq!(hit_key(&keys, x + 30.0, y, 220.0, 110.0), None);
+        assert_eq!(hit_key(&[], x, y, 220.0, 110.0), None);
+    }
+
+    #[test]
+    fn a_key_stays_between_its_neighbours_and_inside_the_graph() {
+        let keys = [[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]];
+        assert_eq!(move_key(&keys, 1, 0.9, 2.0)[1], [0.8 - MIN_KEY_GAP, 1.0]);
+        assert_eq!(move_key(&keys, 1, 0.0, -1.0)[1], [0.2 + MIN_KEY_GAP, 0.0]);
+        assert_eq!(move_key(&keys, 0, -1.0, 0.4)[0], [0.0, 0.4]);
+        assert_eq!(move_key(&keys, 2, 2.0, 0.4)[2], [1.0, 0.4]);
+        assert_eq!(move_key(&keys, 9, 0.5, 0.5), keys.to_vec());
+    }
+
+    #[test]
+    fn adding_a_key_keeps_order_and_refuses_a_crowded_place() {
+        let keys = [[0.2, 0.3], [0.8, 0.7]];
+        assert_eq!(add_key(&keys, 0.5, 0.5), Some(vec![[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]]));
+        assert_eq!(add_key(&keys, 0.21, 0.5), None);
+        assert_eq!(add_key(&[], 0.5, 0.5), Some(vec![[0.5, 0.5]]));
+    }
 
     const FPS_30: RationalFps = RationalFps { num: 30, den: 1 };
 
