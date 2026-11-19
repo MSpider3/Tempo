@@ -18,8 +18,16 @@ All notable changes to Tempo are recorded here. The format follows
   - Click a transition to select it (red outline). Drag its free edge to change its length
     in whole frames; a centred one changes on both sides. A tooltip shows the change and the
     new length. Lengths never go past the footage the clips have.
-  - The Inspector shows Type, Duration in seconds and frames, Alignment (Start, Center, End
-    on Edit) and, for Dip To Color, the colour.
+  - The Inspector shows, in Resolve's order: Transition Type; Duration in seconds and
+    frames; **Set as Default Duration** (new transitions from drops and `Ctrl+T` get that
+    length); Alignment (Start, Center, End on Edit); **Start Ratio** and **End Ratio**;
+    **Ease** (None, In, Out, In & Out); **Transition Curve**; and, for Dip To Color, the
+    colour. Ratios and the curve have sliders and reset arrows.
+  - Transition Curve shows the curve at the playhead. Typing a value (or dragging its
+    slider) keys the curve there, and the mix follows a line through the keys. Ease is
+    off while the curve has keys.
+  - Playback and export both follow the ratios, ease and curve. Sound cross fades and a
+    clip's own fades stay straight.
   - Click a clip edge to select the edit point (green bracket). `Up` and `Down` move the
     selected edit point with the playhead.
   - `Ctrl+C` on a selected transition copies just the transition, and `Ctrl+V` puts it on the
@@ -29,7 +37,7 @@ All notable changes to Tempo are recorded here. The format follows
     `Alt+T` adds it to the picture only and `Shift+T` to the sound only (a Cross Fade).
   - Right-click a transition for Copy, Delete and Change Transition Duration….
   - Sound cross fades are equal power. Video transitions leave the sound alone.
-  - Project files now use schema 4. Older dissolves open as transitions.
+  - Project files now use schema 5. Older dissolves open as transitions.
 - **Several timelines per project.**
   - `Ctrl+N` opens Create New Timeline, with a name and the number of video and audio tracks.
   - The Media Pool right-click menu has Create New Timeline too.
@@ -37,9 +45,10 @@ All notable changes to Tempo are recorded here. The format follows
     open it. The playhead goes to the start.
   - Each timeline keeps its own clips, markers and undo history.
   - Project files now use schema 3. Older files open as one timeline named "Timeline 1".
-- **Edit a marker** by double-clicking it in the timeline ruler. The Marker dialog sets its
-  time, duration, name, colour and note, and removes it, as in Resolve. New markers are named
-  "Marker N", and `Esc` keeps the marker.
+- **Edit a marker** by double-clicking it in the timeline ruler. The Markers dialog sets its
+  time, duration (as a timecode), name, notes, **keyword** and colour, and removes it, as in
+  Resolve. New markers are named "Marker N" with the name selected, so `Ctrl+M`, type,
+  `Enter` names it. `Esc` keeps the marker.
 - **Markers on the ruler**: hover one to see its time and name; drag it to move it (it snaps
   to cuts and the playhead). A marker with a duration shows as a bar.
 - **Marker overlay on the viewer**: with the playhead on a marker, the viewer shows its time
@@ -51,6 +60,19 @@ All notable changes to Tempo are recorded here. The format follows
   delete one.
 - Create New Timeline has **Empty Timeline**. Turn it off to start the timeline with the clip
   selected in the Media Pool.
+- Create New Timeline has **Start Timecode** (01:00:00:00 by default), **Audio Track Type**
+  (Mono or Stereo) and **Use Project Settings**. Turn that off to give the timeline its own
+  width and height; the frame rate stays the project's. The ruler, viewer, timecode label,
+  marker times and EDL export count from the Start Timecode.
+- Audio track headers show "2.0" (stereo) or "1.0" (mono). A mono track plays down the
+  middle, in playback and export.
+- **Ghost tracks**: dragging a clip from the Media Pool into the space above the top video
+  track shows a new V2 (and A2 for clips with sound) with headers. Drop there to make the
+  tracks and place the clip in one undo step. An audio-only clip dragged below the last
+  audio track makes a new audio track. A box shows where the clip will land, the drag shows
+  the clip's thumbnail, and the first drop on an empty timeline zooms to fit.
+- **Edit animations**: trims, deletes and ripples slide clips, transitions, the playhead and
+  the view into place over about 120 ms instead of jumping.
 - **Upload from the Export page**, as Resolve's "Upload directly to YouTube": when an uploader
   plugin is on, Render Settings has Title, Description, Upload Thumbnail, Privacy and Category.
   They are kept per job, and the job uploads once it has rendered. Plugins receive the
@@ -63,10 +85,18 @@ All notable changes to Tempo are recorded here. The format follows
 - New transitions are one second long, Resolve's standard transition duration. This was half
   a second.
 - Right-click Fade In and Fade Out are one second long, like the Effects panel.
+- `Shift+[` and `Shift+]` (Trim Start / Trim End) with nothing selected trim the clip under
+  the playhead, as in Resolve.
 
 ### Fixed
 
 - A dissolve no longer stops working when the clip before it moves.
+- An export whose range starts or ends inside a fade or a Dip To Color keeps the ramp. Audio
+  fades are smooth in exports.
+- Two sound transitions on one short clip no longer get their handle footage mixed up.
+- `Ctrl+T` on a short clip fits its two transitions together.
+- A new timeline shows in the Media Pool at once, and the viewer and timecode show its start
+  straight away.
 - The icon column of the Effects panel items stretched across half the row.
 - Fedora 45 (FFmpeg 9):
   - Export failed for titles containing `%`.
