@@ -533,11 +533,17 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let color: Option<String> = row.get(8)?;
         let ease_int: i32 = row.get(9)?;
         let curve: Option<String> = row.get(12)?;
-        let curve: Vec<[f32; 2]> = curve
-            .map(|c| serde_json::from_str(&c))
-            .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)))?
+        // A damaged curve costs only the curve, not the project; keys are kept in range and in order.
+        let mut curve: Vec<[f32; 2]> = curve
+            .and_then(|c| {
+                serde_json::from_str(&c).map_err(|e| tracing::warn!(transition = %id_str, error = %e, "unreadable transition curve dropped")).ok()
+            })
             .unwrap_or_default();
+        curve.retain(|k| k.iter().all(|v| v.is_finite()));
+        for k in &mut curve {
+            *k = [k[0].clamp(0.0, 1.0), k[1].clamp(0.0, 1.0)];
+        }
+        curve.sort_by(|a, b| a[0].total_cmp(&b[0]));
 
         let edge = if edge_int == 0 {
             TransitionEdge::In
@@ -1357,6 +1363,21 @@ mod tests {
         assert_eq!((t.start_ratio, t.end_ratio, t.curve.len()), (0.0, 1.0, 0));
         assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (0, None));
         assert!(loaded.timeline.tracks.iter().all(|t| t.audio_type == AudioTrackType::Stereo));
+    }
+
+    #[test]
+    fn loaded_curve_keys_are_ordered_and_in_range_and_a_damaged_curve_is_dropped() {
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, curve) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2, '[[0.9, 0.1], [0.2, 2.0]]' FROM clips;",
+        );
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].transitions[0].curve, vec![[0.2, 1.0], [0.9, 0.1]]);
+
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, curve) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2, 'nope' FROM clips;",
+        );
+        let loaded = load_project(file.path()).expect("a bad curve must not stop the project opening");
+        assert!(loaded.timeline.tracks[0].transitions[0].curve.is_empty());
     }
 
     #[test]

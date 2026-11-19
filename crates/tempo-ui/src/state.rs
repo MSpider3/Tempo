@@ -257,7 +257,11 @@ impl AppState {
 
     /// Length of a new transition: the user's "Set as Default Duration", 1 s until set.
     pub fn standard_transition_us(&self) -> i64 {
-        self.settings.borrow().transition_us.max(1)
+        // A hand-edited settings file can hold anything; outside a frame..an hour means unset.
+        match self.settings.borrow().transition_us {
+            us if (1..=3_600_000_000).contains(&us) => us,
+            _ => tempo_timeline::STANDARD_TRANSITION_US,
+        }
     }
 
     pub fn set_project(&self, project: Option<Project>, path: Option<PathBuf>) {

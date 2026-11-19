@@ -20,7 +20,13 @@
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
 >
-> **Updated 2026-11-19.** The schema is now **version 4**. Migration 4 adds `color` and
+> **Updated 2026-11-19.** The schema is now **version 5**. Migration 5 adds `start_tc_us`,
+> `width` and `height` to `timelines` (Start Timecode; own size when "Use Project Settings"
+> was off, NULL = the project's), `audio_type` to `tracks` (0 mono, 1 stereo), `keyword` to
+> `markers`, and `start_ratio`, `end_ratio` and `curve` (JSON `[[place, value], ...]`) to
+> `transitions`.
+>
+> **Earlier on 2026-11-19.** The schema became **version 4**. Migration 4 adds `color` and
 > `ease` to `transitions` and kind 9 (Dip To Color); old cross dissolves load as
 > transitions (§9).
 >
@@ -93,7 +99,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **4**
+Current schema version: **5**
 
 ---
 
