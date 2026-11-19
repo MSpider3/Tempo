@@ -13,18 +13,16 @@ use crate::state::{timecode, AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
 
-const MARKER_CLASSES: [&str; 6] = ["marker-blue", "marker-green", "marker-yellow", "marker-red", "marker-orange", "marker-purple"];
+const MARKER_CLASSES: [&str; 17] = [
+    "marker-blue", "marker-cyan", "marker-green", "marker-yellow", "marker-red", "marker-pink", "marker-purple", "marker-fuchsia",
+    "marker-rose", "marker-lavender", "marker-sky", "marker-mint", "marker-lemon", "marker-sand", "marker-cocoa", "marker-cream",
+    "marker-orange",
+];
 
+/// The overlay's CSS class for a colour: "marker-" and the colour's name.
 fn marker_class(color: tempo_timeline::MarkerColor) -> &'static str {
-    use tempo_timeline::MarkerColor as C;
-    match color {
-        C::Blue => MARKER_CLASSES[0],
-        C::Green => MARKER_CLASSES[1],
-        C::Yellow => MARKER_CLASSES[2],
-        C::Red => MARKER_CLASSES[3],
-        C::Orange => MARKER_CLASSES[4],
-        C::Purple => MARKER_CLASSES[5],
-    }
+    let name = format!("marker-{}", color.name().to_lowercase());
+    MARKER_CLASSES.iter().copied().find(|c| *c == name).unwrap_or(MARKER_CLASSES[0])
 }
 
 pub struct Viewer {
@@ -348,7 +346,7 @@ impl Viewer {
                 .with_project(|p| {
                     p.sources.get(&id).map(|s| {
                         let has_video = s.media_type != tempo_timeline::MediaType::Audio;
-                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.fps, has_video, s.audio_channels.is_some())
+                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.timeline_fps(), has_video, s.audio_channels.is_some())
                     })
                 })
                 .flatten()

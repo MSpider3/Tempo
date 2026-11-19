@@ -253,13 +253,13 @@ pub fn build_ffmpeg_args(
 /// The picture is laid out in whole frames, so cuts that are not on a frame
 /// never add up to a drift between picture and sound.
 fn to_frame(us: i64, project: &Project) -> i64 {
-    let (num, den) = (project.fps.num.max(1) as i128, project.fps.den.max(1) as i128);
+    let (num, den) = (project.timeline_fps().num.max(1) as i128, project.timeline_fps().den.max(1) as i128);
     ((us as i128 * num + den * 500_000) / (den * 1_000_000)) as i64
 }
 
 /// The time at which an output frame starts.
 fn frame_time(frame: i64, project: &Project) -> i64 {
-    let (num, den) = (project.fps.num.max(1) as i128, project.fps.den.max(1) as i128);
+    let (num, den) = (project.timeline_fps().num.max(1) as i128, project.timeline_fps().den.max(1) as i128);
     ((frame as i128 * den * 1_000_000 + num / 2) / num) as i64
 }
 
@@ -291,7 +291,7 @@ fn build_args(
     let total = if section.is_some() { whole_frames(r1 - r0, project) } else { r1 - r0 };
 
     let (w, h) = ((e.width.max(16) + 1) & !1, (e.height.max(16) + 1) & !1);
-    let fps = format!("{}/{}", project.fps.num.max(1), project.fps.den.max(1));
+    let fps = format!("{}/{}", project.timeline_fps().num.max(1), project.timeline_fps().den.max(1));
     let mut inputs: Vec<String> = Vec::new();
     let mut graph: Vec<String> = Vec::new();
     let mut n_inputs = 0usize;

@@ -84,7 +84,7 @@ pub fn audio_strips(track: &Track, sources: &HashMap<Uuid, MediaSource>) -> Audi
     let mut out = AudioStrips { strips: vec![track.clips.clone(), Vec::new(), Vec::new()], ramps: HashMap::new() };
     let mut ramp = |id: Uuid, r: Ramp| out.ramps.entry(id).or_default().push(r);
     let (mut heads, mut tails) = (Vec::new(), Vec::new());
-    for t in track.transitions.iter().filter(|t| t.kind != TransitionKind::Cut) {
+    for t in track.transitions.iter().filter(|t| t.enabled && t.kind != TransitionKind::Cut) {
         let Some(clip) = track.find_clip(t.clip_id) else { continue };
         let Some((start_us, end_us)) = track.transition_span(t) else { continue };
         if end_us <= start_us {

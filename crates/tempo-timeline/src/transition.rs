@@ -92,6 +92,7 @@ impl Transition {
             start_ratio: 0.0,
             end_ratio: 1.0,
             curve: Vec::new(),
+            enabled: true,
         }
     }
 
@@ -424,7 +425,7 @@ impl Track {
         let mut layers = TransitionLayers { clips: self.clips.clone(), ..TransitionLayers::default() };
         // Head and tail transition lengths per clip, folded into its fades below.
         let (mut heads, mut tails) = (HashMap::new(), HashMap::new());
-        for t in self.transitions.iter().filter(|t| t.kind != TransitionKind::Cut) {
+        for t in self.transitions.iter().filter(|t| t.enabled && t.kind != TransitionKind::Cut) {
             let dip = t.dip_color();
             // Sound mixes and a clip's own fades stay linear; only video follows the Inspector curve.
             let shape = (self.kind == crate::types::TrackKind::Video && !t.is_linear()).then(|| Box::new(t.clone()));

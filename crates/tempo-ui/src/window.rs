@@ -1318,7 +1318,7 @@ impl MainWindow {
     fn change_transition_duration(&self) {
         let state = &self.state;
         let Some((track, t)) = actions::selected_transition(state) else { return };
-        let Some(fps) = state.with_project(|p| p.fps) else { return };
+        let Some(fps) = state.with_project(|p| p.timeline_fps()) else { return };
         let frames = gtk::SpinButton::with_range(1.0, 100_000.0, 1.0);
         frames.set_value(tempo_timeline::us_to_frame(t.duration_us, fps) as f64);
         frames.set_activates_default(true);

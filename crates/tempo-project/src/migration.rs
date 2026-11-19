@@ -2,7 +2,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use crate::error::{ProjectError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 pub struct Migration {
     pub version: u32,
@@ -35,6 +35,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         description: "Start timecode, timeline size, audio track type, marker keyword, transition ratios and curve",
         sql: include_str!("migrations/005_resolve_settings.sql"),
+    },
+    Migration {
+        version: 6,
+        description: "Timeline frame rate and the transition switch",
+        sql: include_str!("migrations/006_timeline_fps_transition_switch.sql"),
     },
 ];
 

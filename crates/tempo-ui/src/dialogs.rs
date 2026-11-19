@@ -326,7 +326,7 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     }
     let Some((fps, limits)) = state.with_project(|p| {
         let limits = p.sources.iter().filter(|(_, s)| s.duration_us > 0).map(|(id, s)| (*id, s.duration_us)).collect::<std::collections::HashMap<_, _>>();
-        (p.fps, limits)
+        (p.timeline_fps(), limits)
     }) else {
         return;
     };

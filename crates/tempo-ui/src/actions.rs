@@ -455,7 +455,7 @@ pub fn selected_transition(state: &AppState) -> Option<(Uuid, Transition)> {
 /// `template` fitted to the edit at `position_us` on a track (see `fit_transition`), or
 /// why it cannot go there.
 fn placed_transition(state: &AppState, track_id: Uuid, position_us: i64, template: &Transition) -> Result<Transition, &'static str> {
-    state.with_project(|p| place_on(&p.timeline, &p.sources, p.fps, track_id, position_us, template)).unwrap_or(Err("Open a project first."))
+    state.with_project(|p| place_on(&p.timeline, &p.sources, p.timeline_fps(), track_id, position_us, template)).unwrap_or(Err("Open a project first."))
 }
 
 fn place_on(
@@ -547,8 +547,8 @@ pub fn set_transition_length(state: &Rc<AppState>, track_id: Uuid, clip_id: Uuid
         .with_project(|p| {
             let track = p.timeline.find_track(track_id)?;
             let mut t = track.transition_at_edit(clip_id, edge)?.clone();
-            let max = track.max_transition_us(clip_id, edge, t.alignment, &p.sources, p.fps);
-            t.duration_us = dragged_length(length_us, 0, false, false, max, p.fps);
+            let max = track.max_transition_us(clip_id, edge, t.alignment, &p.sources, p.timeline_fps());
+            t.duration_us = dragged_length(length_us, 0, false, false, max, p.timeline_fps());
             Some(t)
         })
         .flatten();
@@ -613,7 +613,7 @@ fn add_transitions(state: &Rc<AppState>, video: Option<TransitionKind>, audio: b
         })
         .collect();
     let length = state.standard_transition_us();
-    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.fps, &wanted, length)) else { return };
+    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.timeline_fps(), &wanted, length)) else { return };
     if placed.is_empty() {
         state.message(why.unwrap_or("There is already a transition there."));
         return;

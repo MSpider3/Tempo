@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
 use tempo_timeline::{
-    AddTrackCommand, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
+    AddTrackCommand, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
     Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
 };
 use uuid::Uuid;
@@ -770,7 +770,7 @@ impl TimelineCanvas {
             .with_project(|p| {
                 let track = p.timeline.find_track(row.track_id).ok_or(WHERE)?;
                 let edit = actions::nearest_edit(track, at, reach).ok_or(WHERE)?;
-                actions::fit_transition(track, &edit, &template, &p.sources, p.fps)
+                actions::fit_transition(track, &edit, &template, &p.sources, p.timeline_fps())
             })
             .unwrap_or(Err(WHERE))
             .map(|t| DropPlan::Transition(row, t))
@@ -1150,7 +1150,7 @@ impl TimelineCanvas {
             state.select_edit(Some(EditSelection::Transition { track_id: row.track_id, clip_id: t.clip_id, edge: t.edge }));
             if let Some((left, both)) = edge.filter(|_| !row.locked) {
                 let max = state
-                    .with_project(|p| p.timeline.find_track(row.track_id).map(|tr| tr.max_transition_us(t.clip_id, t.edge, t.alignment, &p.sources, p.fps)))
+                    .with_project(|p| p.timeline.find_track(row.track_id).map(|tr| tr.max_transition_us(t.clip_id, t.edge, t.alignment, &p.sources, p.timeline_fps())))
                     .flatten()
                     .unwrap_or(t.duration_us);
                 let from = t.duration_us;
@@ -1350,7 +1350,7 @@ impl TimelineCanvas {
                 *to = (*from + if *edge == FadeEdge::In { delta_us } else { -delta_us }).max(0);
             }
             Some(Drag::Transition { left, both, from, to, max, .. }) => {
-                let fps = state.with_project(|p| p.fps).unwrap_or_default();
+                let fps = state.with_project(|p| p.timeline_fps()).unwrap_or_default();
                 *to = actions::dragged_length(*from, delta_us, *left, *both, *max, fps);
                 *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, state.fps())));
             }
@@ -1454,7 +1454,7 @@ impl TimelineCanvas {
                 }
             }
             Some(Drag::Fade { clip, edge, from, to }) if to != from => {
-                let edited = state.with_project(|p| p.timeline.find_clip(clip).map(|(_, c)| c.with_fade(edge, to, p.fps))).flatten();
+                let edited = state.with_project(|p| p.timeline.find_clip(clip).map(|(_, c)| c.with_fade(edge, to, p.timeline_fps()))).flatten();
                 if let Some(edited) = edited {
                     state.execute(Box::new(EditClipCommand::new(if edge == FadeEdge::In { "Fade In" } else { "Fade Out" }, edited)));
                 }
@@ -1696,7 +1696,7 @@ impl TimelineCanvas {
                 let (mut fade_in, mut fade_out) = (clip.properties.fade_in_us, clip.properties.fade_out_us);
                 if let Some(Drag::Fade { clip: id, edge, to, .. }) = &dragging {
                     if *id == clip.id {
-                        let preview = clip.with_fade(*edge, *to, state.with_project(|p| p.fps).unwrap_or_default());
+                        let preview = clip.with_fade(*edge, *to, state.with_project(|p| p.timeline_fps()).unwrap_or_default());
                         (fade_in, fade_out) = (preview.properties.fade_in_us, preview.properties.fade_out_us);
                     }
                 }
@@ -1776,14 +1776,7 @@ impl TimelineCanvas {
             if x < -10.0 || x > w + 10.0 {
                 continue;
             }
-            let c = color(match m.color {
-                MarkerColor::Blue => "tempo_marker_blue",
-                MarkerColor::Green => "tempo_marker_green",
-                MarkerColor::Yellow => "tempo_marker_yellow",
-                MarkerColor::Red => "tempo_marker_red",
-                MarkerColor::Orange => "tempo_marker_orange",
-                MarkerColor::Purple => "tempo_marker_purple",
-            });
+            let c = gdk::RGBA::parse(m.color.hex()).unwrap_or(gdk::RGBA::WHITE);
             // A marker with a length is a bar from its start to its end, as in Resolve.
             if m.duration_us > 0 {
                 let end = self.x_of(at + m.duration_us) as f32;

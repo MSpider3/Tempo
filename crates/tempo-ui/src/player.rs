@@ -110,7 +110,7 @@ impl Snapshot {
                 .map(|t| t.duration_us())
                 .max()
                 .unwrap_or(0),
-            fps: project.fps,
+            fps: project.timeline_fps(),
         }
     }
 

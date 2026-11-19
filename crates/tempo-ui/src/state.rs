@@ -216,12 +216,12 @@ impl AppState {
     /// of the next frame counts as that frame, so positions stored to the
     /// microsecond never read one frame low.
     fn frame_index(&self, us: i64) -> i128 {
-        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        let (num, den) = self.with_project(|p| (p.timeline_fps().num.max(1) as i128, p.timeline_fps().den.max(1) as i128)).unwrap_or((30, 1));
         (us.max(0) as i128 * num * 10 + den * 1_000_000) / (den * 10_000_000)
     }
 
     fn frame_start(&self, frame: i128) -> i64 {
-        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        let (num, den) = self.with_project(|p| (p.timeline_fps().num.max(1) as i128, p.timeline_fps().den.max(1) as i128)).unwrap_or((30, 1));
         ((frame.max(0) * den * 1_000_000 + num / 2) / num) as i64
     }
 
@@ -237,11 +237,11 @@ impl AppState {
     }
 
     pub fn frame_us(&self) -> i64 {
-        self.with_project(|p| p.fps.frame_duration_us()).unwrap_or(33_333).max(1)
+        self.with_project(|p| p.timeline_fps().frame_duration_us()).unwrap_or(33_333).max(1)
     }
 
     pub fn fps(&self) -> f64 {
-        self.with_project(|p| p.fps.to_f64()).unwrap_or(30.0)
+        self.with_project(|p| p.timeline_fps().to_f64()).unwrap_or(30.0)
     }
 
     /// The timecode a timeline position reads as: moved by the timeline's Start Timecode.

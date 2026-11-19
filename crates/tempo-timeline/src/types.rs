@@ -500,6 +500,10 @@ pub struct Transition {
     /// the transition, sorted. Empty: the curve follows the Ease (see `Transition::curve_at`).
     #[serde(default)]
     pub curve: Vec<[f32; 2]>,
+    /// The switch on the Inspector's Video section: off, the transition stays on the
+    /// timeline but plays as a cut.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
 }
 
 fn full_ratio() -> f32 {
@@ -522,8 +526,88 @@ pub enum MarkerColor {
     Green,
     Blue,
     Yellow,
+    /// Not one of Resolve's; kept so markers from older Tempo files keep their colour.
     Orange,
     Purple,
+    Cyan,
+    Pink,
+    Fuchsia,
+    Rose,
+    Lavender,
+    Sky,
+    Mint,
+    Lemon,
+    Sand,
+    Cocoa,
+    Cream,
+}
+
+impl MarkerColor {
+    /// Resolve's 16 marker colours, in the order its marker popup shows them.
+    pub const RESOLVE: [MarkerColor; 16] = [
+        Self::Blue,
+        Self::Cyan,
+        Self::Green,
+        Self::Yellow,
+        Self::Red,
+        Self::Pink,
+        Self::Purple,
+        Self::Fuchsia,
+        Self::Rose,
+        Self::Lavender,
+        Self::Sky,
+        Self::Mint,
+        Self::Lemon,
+        Self::Sand,
+        Self::Cocoa,
+        Self::Cream,
+    ];
+
+    /// The name Resolve shows for the colour.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Yellow => "Yellow",
+            Self::Orange => "Orange",
+            Self::Purple => "Purple",
+            Self::Cyan => "Cyan",
+            Self::Pink => "Pink",
+            Self::Fuchsia => "Fuchsia",
+            Self::Rose => "Rose",
+            Self::Lavender => "Lavender",
+            Self::Sky => "Sky",
+            Self::Mint => "Mint",
+            Self::Lemon => "Lemon",
+            Self::Sand => "Sand",
+            Self::Cocoa => "Cocoa",
+            Self::Cream => "Cream",
+        }
+    }
+
+    /// The colour as `#rrggbb`: the one place marker colours are defined.
+    pub fn hex(self) -> &'static str {
+        match self {
+            Self::Red => "#e0443e",
+            Self::Green => "#3cb44b",
+            Self::Blue => "#3a7bd5",
+            Self::Yellow => "#f2c12e",
+            Self::Orange => "#e0893a",
+            Self::Purple => "#8e44ad",
+            Self::Cyan => "#1fc6d6",
+            Self::Pink => "#ff6fa8",
+            Self::Fuchsia => "#d633a5",
+            Self::Rose => "#e8a0a8",
+            Self::Lavender => "#b39ddb",
+            Self::Sky => "#8ecae6",
+            Self::Mint => "#98e0b5",
+            Self::Lemon => "#f7f08a",
+            Self::Sand => "#c8ad7f",
+            Self::Cocoa => "#7b5a43",
+            Self::Cream => "#f3e9d2",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +773,9 @@ pub struct Timeline {
     /// The frame rate is always the project's.
     #[serde(default)]
     pub resolution: Option<(u32, u32)>,
+    /// The frame rate when "Use Project Settings" was off; `None` uses the project's.
+    #[serde(default)]
+    pub fps: Option<RationalFps>,
 }
 
 /// Resolve's default Start Timecode, 01:00:00:00.
@@ -714,6 +801,7 @@ impl Timeline {
             markers: Vec::new(),
             start_tc_us: 0,
             resolution: None,
+            fps: None,
         }
     }
 
@@ -958,6 +1046,12 @@ impl Project {
     /// The open timeline's picture size: its own, or the project's.
     pub fn output_size(&self) -> (u32, u32) {
         self.timeline.resolution.unwrap_or((self.width, self.height))
+    }
+
+    /// The open timeline's frame rate: its own, or the project's. Everything about the
+    /// timeline (frames, timecode, snapping, playback, export) counts in this.
+    pub fn timeline_fps(&self) -> RationalFps {
+        self.timeline.fps.unwrap_or(self.fps)
     }
 
     /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.

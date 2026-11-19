@@ -627,9 +627,9 @@ impl TransitionView {
                 let transition = track.transition_at_edit(clip_id, edge)?.clone();
                 let clip = track.find_clip(clip_id)?;
                 let edit_kind = if edge == TransitionEdge::Out { EditKind::Tail } else { track.edit_at(clip.timeline_in)?.kind };
-                let max_us = track.max_transition_us(clip_id, edge, transition.alignment, &p.sources, p.fps);
+                let max_us = track.max_transition_us(clip_id, edge, transition.alignment, &p.sources, p.timeline_fps());
                 let span = track.transition_span(&transition);
-                Some(Self { transition, span, max_us, edit_kind, track_kind: track.kind, fps: p.fps })
+                Some(Self { transition, span, max_us, edit_kind, track_kind: track.kind, fps: p.timeline_fps() })
             })
             .flatten()
     }
@@ -642,7 +642,7 @@ fn edit_transition(state: &Rc<AppState>, (track_id, clip_id, edge): TransitionRe
     let mut edited = view.transition.clone();
     change(&mut edited);
     let max_us = state
-        .with_project(|p| p.timeline.find_track(track_id).map_or(0, |t| t.max_transition_us(clip_id, edge, edited.alignment, &p.sources, p.fps)))
+        .with_project(|p| p.timeline.find_track(track_id).map_or(0, |t| t.max_transition_us(clip_id, edge, edited.alignment, &p.sources, p.timeline_fps())))
         .unwrap_or(0);
     if max_us <= 0 {
         state.message("No room for a transition here");

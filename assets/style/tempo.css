@@ -2,6 +2,24 @@
  * Colours marked "sampled" come from DaVinci Resolve 20 screenshots in EX/DVR_UI. */
 
 /* ---- Tokens ---------------------------------------------------------- */
+/* Marker colours: keep equal to MarkerColor::hex in tempo-timeline. */
+@define-color tempo_marker_blue     #3a7bd5;
+@define-color tempo_marker_cyan     #1fc6d6;
+@define-color tempo_marker_green    #3cb44b;
+@define-color tempo_marker_yellow   #f2c12e;
+@define-color tempo_marker_red      #e0443e;
+@define-color tempo_marker_pink     #ff6fa8;
+@define-color tempo_marker_purple   #8e44ad;
+@define-color tempo_marker_fuchsia  #d633a5;
+@define-color tempo_marker_rose     #e8a0a8;
+@define-color tempo_marker_lavender #b39ddb;
+@define-color tempo_marker_sky      #8ecae6;
+@define-color tempo_marker_mint     #98e0b5;
+@define-color tempo_marker_lemon    #f7f08a;
+@define-color tempo_marker_sand     #c8ad7f;
+@define-color tempo_marker_cocoa    #7b5a43;
+@define-color tempo_marker_cream    #f3e9d2;
+@define-color tempo_marker_orange   #e0893a;
 @define-color tempo_bg_bar       #17181a;
 @define-color tempo_bg_deep      #1b1b1f;
 @define-color tempo_bg_panel     #212126;
@@ -36,12 +54,6 @@
 @define-color tempo_track_edge_audio #356d4d;
 @define-color tempo_clip_text        #ffffff;
 
-@define-color tempo_marker_blue   #4f8fd6;
-@define-color tempo_marker_green  #4caf7a;
-@define-color tempo_marker_yellow #d8b93a;
-@define-color tempo_marker_red    #d6504a;
-@define-color tempo_marker_orange #e0893a;
-@define-color tempo_marker_purple #9a72d0;
 
 /* Map libadwaita's own names onto the tokens so stock widgets follow. */
 @define-color window_bg_color     @tempo_bg_panel;
@@ -178,12 +190,6 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .viewer-header   { background-color: @tempo_bg_panel; min-height: 30px; padding: 0 8px; }
 .viewer-transport{ background-color: @tempo_bg_panel; min-height: 40px; padding: 0 8px; }
 .marker-overlay { background-color: alpha(black, 0.75); border-left: 4px solid @tempo_accent; border-radius: 3px; padding: 6px 10px; margin: 12px; color: @tempo_text_bright; }
-.marker-overlay.marker-blue   { border-left-color: @tempo_marker_blue; }
-.marker-overlay.marker-green  { border-left-color: @tempo_marker_green; }
-.marker-overlay.marker-yellow { border-left-color: @tempo_marker_yellow; }
-.marker-overlay.marker-red    { border-left-color: @tempo_marker_red; }
-.marker-overlay.marker-orange { border-left-color: @tempo_marker_orange; }
-.marker-overlay.marker-purple { border-left-color: @tempo_marker_purple; }
 .badge { background-color: alpha(black, 0.7); border-radius: 9999px; padding: 1px 8px;
          font-size: 0.8em; font-weight: 600; margin: 8px; }
 .badge.warn { color: @tempo_warn; }
@@ -262,3 +268,21 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .empty-hint { color: @tempo_text_dim; }
 
 .tempo .media-thumb.pool-open-timeline { border: 2px solid @tempo_accent; }
+
+.marker-overlay.marker-blue { border-left-color: @tempo_marker_blue; }
+.marker-overlay.marker-cyan { border-left-color: @tempo_marker_cyan; }
+.marker-overlay.marker-green { border-left-color: @tempo_marker_green; }
+.marker-overlay.marker-yellow { border-left-color: @tempo_marker_yellow; }
+.marker-overlay.marker-red { border-left-color: @tempo_marker_red; }
+.marker-overlay.marker-pink { border-left-color: @tempo_marker_pink; }
+.marker-overlay.marker-purple { border-left-color: @tempo_marker_purple; }
+.marker-overlay.marker-fuchsia { border-left-color: @tempo_marker_fuchsia; }
+.marker-overlay.marker-rose { border-left-color: @tempo_marker_rose; }
+.marker-overlay.marker-lavender { border-left-color: @tempo_marker_lavender; }
+.marker-overlay.marker-sky { border-left-color: @tempo_marker_sky; }
+.marker-overlay.marker-mint { border-left-color: @tempo_marker_mint; }
+.marker-overlay.marker-lemon { border-left-color: @tempo_marker_lemon; }
+.marker-overlay.marker-sand { border-left-color: @tempo_marker_sand; }
+.marker-overlay.marker-cocoa { border-left-color: @tempo_marker_cocoa; }
+.marker-overlay.marker-cream { border-left-color: @tempo_marker_cream; }
+.marker-overlay.marker-orange { border-left-color: @tempo_marker_orange; }
