@@ -46,6 +46,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gio, GLib, Gst  # noqa: E402
 
+import e2e_audio  # noqa: E402
 from e2e_find import E2EError, FindMixin, center  # noqa: E402  (re-exported for scenarios)
 
 HERE = Path(__file__).resolve().parent
@@ -218,12 +219,14 @@ class Control:
 class Session(FindMixin):
     """Compositor + app + input + screenshots for one test. Use as a context manager."""
 
-    def __init__(self, project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None, start_timeout=60.0):
+    def __init__(self, project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None, start_timeout=60.0, audio=False, data_files=None):
         self.project = Path(project).resolve() if project else None
         self.report_dir = Path(report_dir) if report_dir else None
         self.size = size
         self.app_bin = Path(app or os.environ.get("TEMPO_E2E_APP", DEFAULT_APP)).resolve()
         self.extra_env = extra_env or {}
+        self.data_files = data_files or {}  # {path under XDG_DATA_HOME: text} written before the app starts (e.g. a plugin)
+        self.audio = audio  # sound on, routed only to the session's private PipeWire (see e2e_audio.py)
         self.start_timeout = start_timeout
         self.procs: list[tuple[str, subprocess.Popen]] = []
         self.logs: dict[str, Path] = {}
@@ -351,6 +354,15 @@ class Session(FindMixin):
             env["TEMPO_OPEN"] = str(copy)
             self.project_copy = copy
         env.update(self.extra_env)
+        for rel, text in self.data_files.items():
+            path = (self.tmp / "data" / rel).resolve()
+            if not path.is_relative_to(self.tmp / "data"):
+                raise E2EError(f"data file {rel!r} leaves the session's data dir")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        if self.audio:
+            env.pop("TEMPO_NO_AUDIO", None)
+            e2e_audio.make_sink(self)
         self.app = self._spawn("app", [str(self.app_bin)], env)
         self._wait_path(self.run_dir / "control.sock", "the app's control socket", self.start_timeout)
         self.control = Control(str(self.run_dir / "control.sock"))
@@ -639,6 +651,12 @@ class Session(FindMixin):
         """Process id of a part of the session: "app", "mutter", "pipewire", "wireplumber", "dbus"."""
         return next(p.pid for n, p in self.procs if n == name)
 
+    def record_audio(self, name="audio"):
+        """Start recording what the app plays (needs `AUDIO = True` in the scenario); `.stop()` gives [left, right]."""
+        if not self.audio:
+            raise E2EError("set AUDIO = True in the scenario to record sound")
+        return e2e_audio.Recording(self, name)
+
     def note(self, key, value):
         """Record a measurement; it is written to the scenario's result.json."""
         self.notes[key] = value
@@ -721,7 +739,7 @@ def run_scenarios(specs, project, report, app=None):
         result = {"scenario": name, "description": (module.__doc__ or "").strip().splitlines()[0] if module.__doc__ else "", "passed": False}
         print(f"[ RUN  ] {name}", flush=True)
         try:
-            with Session(project=getattr(module, "PROJECT", project), report_dir=out, app=app, extra_env=getattr(module, "ENV", None)) as session:
+            with Session(project=getattr(module, "PROJECT", project), report_dir=out, app=app, extra_env=getattr(module, "ENV", None), audio=getattr(module, "AUDIO", False), data_files=getattr(module, "DATA_FILES", None)) as session:
                 try:
                     module.run(session)
                 except BaseException:

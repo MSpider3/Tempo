@@ -48,8 +48,10 @@ Report: <dir>`; the report holds everything to look at (see [Results](#results))
 * **Screenshots are what the compositor shows**, from `org.gnome.Mutter.ScreenCast` on the
   private PipeWire (connected by file descriptor, never through the environment). Menus,
   popovers and drag icons are in them; the pointer is not drawn.
-* **No sound, no background transcodes.** `TEMPO_NO_AUDIO=1` makes the player skip its
-  audio output (only the value `1` counts); `TEMPO_NO_PROXY=1` stops proxy generation.
+* **No sound by default, no background transcodes.** `TEMPO_NO_AUDIO=1` makes the player skip
+  its audio output (only the value `1` counts); `TEMPO_NO_PROXY=1` stops proxy generation.
+  A scenario with `AUDIO = True` runs the app with sound on: it still can only reach the
+  session's private PipeWire (its `XDG_RUNTIME_DIR`), see [Sound](#sound).
 * **Nothing is left running.** A session stops its children in order when it ends, even
   after a failure, then kills their whole process group. SIGTERM and Ctrl+C stop a run
   the same way. If the harness is killed outright (SIGKILL), every child gets SIGKILL
@@ -63,7 +65,7 @@ Report: <dir>`; the report holds everything to look at (see [Results](#results))
 ## Needs
 
 `mutter` (with `--headless`), `dbus-daemon`, `pipewire`, `wireplumber`,
-`gst-launch-1.0` with the PipeWire plugin (`pipewiresrc`), `ffmpeg`, `python3` with
+`gst-launch-1.0` with the PipeWire plugin (`pipewiresrc`), `pw-cli` and `pw-record`, `ffmpeg`, `ffprobe`, `python3` with
 PyGObject (`gi`: Gio, GLib, Gst), and `ss` (iproute2). `scripts/e2e.sh` checks and names
 anything missing. No root, no X server, no other compositor.
 
@@ -75,7 +77,9 @@ anything missing. No root, no X server, no other compositor.
    by other checkouts, which run this script too). The binary must contain this
    checkout's `crates/tempo-ui` path (the test channel's `ping` reply); if another
    checkout's build was copied, the copy is redone.
-2. Makes three 6 s solid-colour clips with a tone in `target/e2e-media/` (`red-6s.mp4`,
+2. Also makes the sound scenarios' project `audio.tempo` from three grey clips with tones
+   (330 Hz stereo, 660 Hz stereo, 440 Hz mono), laid out like the main fixture.
+   Makes three 6 s solid-colour clips with a tone in `target/e2e-media/` (`red-6s.mp4`,
    `lime-6s.mp4`, `blue-6s.mp4`) and the fixture `fixture.tempo` next to the copied binary:
    one 30 fps 1920x1080 timeline, tracks V1 and A1 only, the three clips back to back at
    0-4, 4-8, 8-12 s, each using the middle 4 s of its file (1 s handles, so centred
@@ -105,6 +109,26 @@ anything missing. No root, no X server, no other compositor.
 | `15_landing_box` | dragging a Media Pool clip over V1 draws the landing box in the video clip colour (not green) on V1, green on A1 |
 | `16_drop_across_audio` | a Cross Dissolve dragged across the A1 cut and onto the V1 cut is accepted and centred |
 | `17_curve_delete_key` | click a curve key, Delete removes the key and not the transition; BackSpace too |
+| `18_sound` | (`AUDIO`) records the private PipeWire's output: a Cross Fade on A1 blends 330 Hz into 660 Hz with constant power (squares of the levels add to about 1), a mono clip plays with L = R, a gap is silent; the app's only socket out is the private PipeWire |
+| `19_landing_thumbnail` | dragging a Media Pool clip over V1: the landing box shows the clip's thumbnail (lime pixels for the lime clip; none there before) |
+| `20_deliver_upload` | Export page with a stand-in YouTube uploader plugin (`DATA_FILES`): "Upload directly to YouTube" shows Title, Description, Upload Thumbnail + path row, Privacy, Category; a job with its own title/description renders to the session dir (file exists, ffprobe 12 s); the upload stops at the "needs a token" dialog (token comes from `secret-tool`, which finds nothing on the private bus), the plugin script never runs and the app has no TCP connection. Notes record that Chapters has no colour filter yet |
+| `21_paste_transition_other_timeline` | Duplicate Timeline from the Media Pool menu; Ctrl+C a transition on timeline 1, switch with the dropdown above the viewer, select the 8 s edit, Ctrl+V: same kind and length, centred there |
+
+## Sound
+
+Set `AUDIO = True` in a scenario module. The session then (1) creates a null sink
+`e2e-sink` in its private PipeWire with `pw-cli` (the private WirePlumber links Tempo to
+it, so nothing can reach a real sound card, and the policy profile has none), and (2) starts
+the app without `TEMPO_NO_AUDIO`. `s.record_audio("name")` starts `pw-record` on the sink's
+monitor (48 kHz, 2 channels, 16 bit); `.stop()` returns `[left, right]` as lists of floats
+(-1..1) and saves `<report>/<scenario>/name.wav`. `e2e_audio.py` has `onset`, `windows`,
+`tone_level` (Goertzel, per frequency) and `rms`. Every child process gets the session
+environment, so `pw-cli` and `pw-record` use the private socket too. Recording starts before
+playback, so find where the sound begins with `onset()` and compare windows, not absolute
+times; keep tolerances generous (AAC, output latency, a partial last window).
+
+`DATA_FILES = {"tempo/plugins/x/plugin.toml": "..."}` writes files under the session's
+`XDG_DATA_HOME` before the app starts (used to give the Export page an uploader plugin).
 
 ## Results
 
@@ -162,7 +186,8 @@ Rules that keep scenarios honest and stable:
   are not scenarios.
 * Times in the state are microseconds; the fixture is 30 fps (a frame is 33 334 µs).
 * A different project: set `PROJECT = "/path/to.tempo"` in the scenario module; extra
-  variables for the app: `ENV = {"GDK_DEBUG": "dnd"}`.
+  variables for the app: `ENV = {"GDK_DEBUG": "dnd"}`; `AUDIO = True` for sound (see
+  [Sound](#sound)); `DATA_FILES = {...}` for files in `XDG_DATA_HOME`.
 * `geometry()` widgets carry `visible` (false when scrolled out of their scrolled area)
   and `visible_rect`. `widget()`/`widgets()` skip invisible ones unless `hidden=True`;
   pass `hidden=True` in the finder you give `scroll_into_view`.
@@ -180,7 +205,7 @@ EOF
 
 ## API reference (`tests/e2e/tempo_e2e.py`, finders in `tests/e2e/e2e_find.py`)
 
-`Session(project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None)` —
+`Session(project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None, audio=False, data_files=None)` —
 context manager. `extra_env` adds variables for the app (e.g. `{"GDK_DEBUG": "events,dnd"}`).
 After start: `s.tmp`, `s.run_dir`, `s.display`, `s.project_copy` (the file the app opened),
 `s.pid(name)`.
@@ -216,6 +241,7 @@ Looking:
 | `clip("V1", i)`, `transition_geo("V1", i)`, `cut_point("V1", i)` | from `geometry()`, left to right |
 | `wait_for(fn, what, timeout=5)`, `wait_idle()`, `settle(quiet=0.25, timeout=5)` | waiting; `settle` returns when two frames `quiet` apart have the same pixels |
 | `action(step)` | setup only: a GAction name (`win.zoom-fit`) or a `TEMPO_ACTIONS` step (`seek:2.5`) |
+| `record_audio(name)` | start recording the sink (`AUDIO = True` only); `.stop()` returns `[left, right]` |
 | `note(key, value)` | put a measurement in `result.json` |
 
 Assertions: `expect(cond, msg)`, `expect_eq(actual, expected, what)`,
@@ -248,7 +274,7 @@ All in `crates/tempo-ui/src/app.rs`, active only when the variable is set:
 * One monitor, scale 1, no Xwayland (X11-only code paths are not exercised).
 * The pointer is not drawn in screenshots (hover effects still are).
 * No `xdg-desktop-portal`: file choosers and similar portal dialogs cannot be tested.
-* No sound is played or checked; audio code runs only as far as the timeline model.
+* Sound is checked only in `AUDIO = True` scenarios, through a null sink (no hardware, no timing guarantee beyond the generous tolerances).
 * Pixel checks assume Tempo's fixed dark theme and the solid-colour fixture.
 * Each scenario starts its own compositor and app; a scenario takes 4–40 s (start-up is
   about 3 s of that, more on a busy machine). Keep scenarios focused.
