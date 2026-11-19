@@ -87,13 +87,13 @@ pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject
     dialog.present(Some(parent));
 }
 
-const MARKER_COLORS: [(&str, MarkerColor); 6] = [
-    ("Blue", MarkerColor::Blue),
-    ("Green", MarkerColor::Green),
-    ("Yellow", MarkerColor::Yellow),
-    ("Red", MarkerColor::Red),
-    ("Orange", MarkerColor::Orange),
-    ("Purple", MarkerColor::Purple),
+const MARKER_COLORS: [(&str, MarkerColor, &str); 6] = [
+    ("Blue", MarkerColor::Blue, "#4a90e2"),
+    ("Green", MarkerColor::Green, "#3cb371"),
+    ("Yellow", MarkerColor::Yellow, "#e6c229"),
+    ("Red", MarkerColor::Red, "#e04848"),
+    ("Orange", MarkerColor::Orange, "#f08a24"),
+    ("Purple", MarkerColor::Purple, "#9b59b6"),
 ];
 
 /// Edit a marker's name, colour and note.
@@ -103,54 +103,76 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
     let default_name = if marker.name.is_empty() { actions::default_marker_name(&others) } else { marker.name.clone() };
     let name = gtk::Entry::builder().text(&default_name).activates_default(true).build();
     let note = gtk::Entry::builder().text(&marker.note).activates_default(true).build();
-    let color = gtk::DropDown::from_strings(&MARKER_COLORS.map(|c| c.0));
-    color.set_selected(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0) as u32);
+    // Resolve has 16 marker colours; Tempo has these six.
+    let selected_color = Rc::new(std::cell::Cell::new(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0)));
+    let color = gtk::Box::builder().spacing(4).build();
+    let mut first: Option<gtk::ToggleButton> = None;
+    for (i, (name, _, hex)) in MARKER_COLORS.iter().enumerate() {
+        let dot = gtk::Label::new(None);
+        dot.set_markup(&format!("<span foreground=\"{hex}\" size=\"x-large\">●</span>"));
+        let button = gtk::ToggleButton::builder().child(&dot).css_classes(["flat"]).tooltip_text(*name).build();
+        button.update_property(&[gtk::accessible::Property::Label(name)]);
+        button.set_focus_on_click(false);
+        match &first {
+            Some(f) => button.set_group(Some(f)),
+            None => first = Some(button.clone()),
+        }
+        button.set_active(i == selected_color.get());
+        let chosen = selected_color.clone();
+        button.connect_toggled(move |b| {
+            if b.is_active() {
+                chosen.set(i);
+            }
+        });
+        color.append(&button);
+    }
 
     let fps = state.fps();
     let time = gtk::Entry::builder().text(state.position_tc(marker.position_us)).activates_default(true).build();
     let keyword = gtk::Entry::builder().text(&marker.keyword).activates_default(true).build();
-    let frame_us = state.frame_us();
-    let duration = gtk::SpinButton::with_range(0.0, 1_000_000.0, 1.0);
-    duration.set_value((marker.duration_us / frame_us) as f64);
-    duration.set_activates_default(true);
-    duration.set_tooltip_text(Some("Length in frames; 0 marks a single frame"));
-    duration.update_property(&[gtk::accessible::Property::Label("Duration in frames")]);
+    // A length, so no Start Timecode: 00:00:00:00 marks a single frame.
+    let duration = gtk::Entry::builder().text(timecode(marker.duration_us, fps)).activates_default(true).build();
+    duration.set_tooltip_text(Some("Length as a timecode; 00:00:00:00 marks a single frame"));
 
     let grid = form_grid();
     form_row(&grid, 0, "Time", &time);
     form_row(&grid, 1, "Duration", &duration);
     form_row(&grid, 2, "Name", &name);
-    form_row(&grid, 3, "Colour", &color);
-    form_row(&grid, 4, "Note", &note);
-    form_row(&grid, 5, "Keyword", &keyword);
+    form_row(&grid, 3, "Notes", &note);
+    form_row(&grid, 4, "Keyword", &keyword);
+    form_row(&grid, 5, "Colour", &color);
     let hint = label("Named markers become chapters when you export.", &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
     grid.attach(&hint, 1, 6, 1, 1);
 
-    let dialog = adw::AlertDialog::builder().heading("Marker").extra_child(&grid).build();
-    dialog.add_responses(&[("remove", "Remove Marker"), ("cancel", "Cancel"), ("done", "Done")]);
+    let dialog = adw::AlertDialog::builder().heading("Markers").extra_child(&grid).build();
+    dialog.add_responses(&[("remove", "Remove Marker"), ("done", "Done")]);
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("done"));
-    dialog.set_close_response("cancel");
+    dialog.set_close_response("close");
     let state = state.clone();
+    let name_field = name.clone();
     dialog.connect_response(None, move |_, response| match response {
         "remove" => actions::delete_marker(&state, marker.id),
         "done" => {
             let mut edited = marker.clone();
-            edited.name = name.text().trim().to_string();
+            edited.name = name_field.text().trim().to_string();
             edited.note = note.text().trim().to_string();
             edited.keyword = keyword.text().trim().to_string();
-            edited.color = MARKER_COLORS[color.selected() as usize].1;
+            edited.color = MARKER_COLORS[selected_color.get()].1;
             // A time that does not parse leaves the marker where it was.
             if let Some(us) = typed_position_us(&time.text(), fps, state.start_tc_us()) {
                 edited.position_us = state.frame_floor(us);
             }
-            edited.duration_us = duration.value_as_int().max(0) as i64 * frame_us;
+            // A duration that does not parse stays as it was.
+            if let Some(us) = parse_timecode(&duration.text(), fps) {
+                edited.duration_us = state.frame_floor(us);
+            }
             if edited != marker {
                 actions::update_marker(&state, edited);
             }
         }
-        // Esc or Cancel: the marker stays, with its default name if it had none.
+        // Esc: the marker stays, with its default name if it had none.
         _ if marker.name.is_empty() => {
             let mut named = marker.clone();
             named.name = default_name.clone();
@@ -159,6 +181,9 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
         _ => {}
     });
     dialog.present(Some(parent));
+    // Resolve opens with the name selected: type it and press Enter.
+    name.grab_focus();
+    name.select_region(0, -1);
 }
 
 /// `HH:MM:SS:FF` (also `MM:SS:FF` or `SS:FF`, `;` as well as `:`) to microseconds.
@@ -808,6 +833,17 @@ mod marker_time_tests {
         assert_eq!(typed_position_us("01:00:01:00", 24.0, start), Some(1_000_000));
         assert_eq!(typed_position_us("01:00:00:00", 24.0, start), Some(0));
         assert_eq!(typed_position_us("00:59:59:00", 24.0, start), None);
+    }
+
+    #[test]
+    fn marker_duration_timecode_round_trips_without_start_offset() {
+        for fps in [24.0, 25.0, 29.97] {
+            let one_frame = (1_000_000.0 / fps) as i64;
+            let text = crate::state::timecode(one_frame, fps);
+            assert_eq!(text, "00:00:00:01");
+            assert_eq!(parse_timecode(&text, fps), Some(one_frame));
+        }
+        assert_eq!(parse_timecode("00:00:00:00", 24.0), Some(0));
     }
 
     #[test]

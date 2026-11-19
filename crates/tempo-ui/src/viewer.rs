@@ -214,7 +214,8 @@ impl Viewer {
         // a few atomics unless a new picture or position has arrived.
         let v = viewer.clone();
         let last_serial = Cell::new(0u64);
-        let last_pos = Cell::new(-1i64);
+        // Position plus the Start Timecode: a timeline switch can change the label with the playhead still at 0.
+        let last_pos = Cell::new((-1i64, 0i64, false));
         let last_playing = Cell::new(false);
         let last_duration = Cell::new(-1i64);
         viewer.surface.add_tick_callback(move |_, _| {
@@ -230,9 +231,9 @@ impl Viewer {
                 v.scrub.set_range(0.0, duration.max(1) as f64);
             }
             let pos = player.position_us();
-            if pos != last_pos.replace(pos) {
-                // Only timeline positions carry the Start Timecode; a source's own time does not.
-                let on_timeline = !v.source_only && !v.state.source_mode();
+            // Only timeline positions carry the Start Timecode; a source's own time does not.
+            let on_timeline = !v.source_only && !v.state.source_mode();
+            if (pos, v.state.start_tc_us(), on_timeline) != last_pos.replace((pos, v.state.start_tc_us(), on_timeline)) {
                 tc.set_text(&if on_timeline { v.state.position_tc(pos) } else { timecode(pos, v.state.fps()) });
                 v.update_marker_box();
                 v.scrub.set_value(pos as f64);
