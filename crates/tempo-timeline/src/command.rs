@@ -2939,3 +2939,81 @@ mod tests {
         assert_eq!(log.cursor(), 1);
     }
 }
+
+// ----------------------------------------------------------------------------
+// AddTrackCommand — a new track after the last one of its kind
+// ----------------------------------------------------------------------------
+
+/// Adds a track: a video track goes after the last video track, an audio track last,
+/// so videos stay before audios. Tracks after it move up one in sort order.
+#[derive(Debug)]
+pub struct AddTrackCommand {
+    track: Track,
+    description: String,
+}
+
+impl AddTrackCommand {
+    pub fn new(track: Track) -> Self {
+        let description = format!("Add {}", track.name);
+        Self { track, description }
+    }
+
+    /// The id the new track will have, so clips can be put on it in the same step.
+    pub fn track_id(&self) -> Uuid {
+        self.track.id
+    }
+}
+
+impl Command for AddTrackCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let index = match self.track.kind {
+            crate::types::TrackKind::Video => timeline.tracks.iter().rposition(|t| t.kind == crate::types::TrackKind::Video).map_or(0, |i| i + 1),
+            crate::types::TrackKind::Audio => timeline.tracks.len(),
+        };
+        let sort_order = if index == 0 { 0 } else { timeline.tracks[index - 1].sort_order + 1 };
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order >= sort_order) {
+            t.sort_order += 1;
+        }
+        self.track.sort_order = sort_order;
+        timeline.tracks.insert(index, self.track.clone());
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let index = timeline.tracks.iter().position(|t| t.id == self.track.id).ok_or(TimelineError::TrackNotFound(self.track.id))?;
+        let removed = timeline.tracks.remove(index);
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order > removed.sort_order) {
+            t.sort_order -= 1;
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(test)]
+mod add_track_tests {
+    use super::*;
+    use crate::types::TrackKind;
+
+    fn orders(t: &Timeline) -> Vec<(TrackKind, u32, u32)> {
+        t.tracks.iter().map(|t| (t.kind, t.kind_index, t.sort_order)).collect()
+    }
+
+    #[test]
+    fn add_track_keeps_videos_before_audios_and_undo_restores() {
+        let mut timeline = Timeline::with_tracks("T", 2, 2);
+        let before = timeline.clone();
+        let mut video = AddTrackCommand::new(Track::new(TrackKind::Video, 3, "Video 3", 0));
+        let mut audio = AddTrackCommand::new(Track::new(TrackKind::Audio, 3, "Audio 3", 0));
+        video.execute(&mut timeline).unwrap();
+        audio.execute(&mut timeline).unwrap();
+        use TrackKind::{Audio as A, Video as V};
+        assert_eq!(orders(&timeline), vec![(V, 1, 0), (V, 2, 1), (V, 3, 2), (A, 1, 3), (A, 2, 4), (A, 3, 5)]);
+        audio.undo(&mut timeline).unwrap();
+        video.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+    }
+}
