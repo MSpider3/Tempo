@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
+use tempo_timeline::{AudioTrackType, ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
 
 use crate::actions;
 use crate::keybinds;
@@ -107,7 +107,8 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
     color.set_selected(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0) as u32);
 
     let fps = state.fps();
-    let time = gtk::Entry::builder().text(timecode(marker.position_us, fps)).activates_default(true).build();
+    let time = gtk::Entry::builder().text(state.position_tc(marker.position_us)).activates_default(true).build();
+    let keyword = gtk::Entry::builder().text(&marker.keyword).activates_default(true).build();
     let frame_us = state.frame_us();
     let duration = gtk::SpinButton::with_range(0.0, 1_000_000.0, 1.0);
     duration.set_value((marker.duration_us / frame_us) as f64);
@@ -121,9 +122,10 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
     form_row(&grid, 2, "Name", &name);
     form_row(&grid, 3, "Colour", &color);
     form_row(&grid, 4, "Note", &note);
+    form_row(&grid, 5, "Keyword", &keyword);
     let hint = label("Named markers become chapters when you export.", &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
-    grid.attach(&hint, 1, 5, 1, 1);
+    grid.attach(&hint, 1, 6, 1, 1);
 
     let dialog = adw::AlertDialog::builder().heading("Marker").extra_child(&grid).build();
     dialog.add_responses(&[("remove", "Remove Marker"), ("cancel", "Cancel"), ("done", "Done")]);
@@ -137,9 +139,10 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
             let mut edited = marker.clone();
             edited.name = name.text().trim().to_string();
             edited.note = note.text().trim().to_string();
+            edited.keyword = keyword.text().trim().to_string();
             edited.color = MARKER_COLORS[color.selected() as usize].1;
             // A time that does not parse leaves the marker where it was.
-            if let Some(us) = parse_timecode(&time.text(), fps) {
+            if let Some(us) = typed_position_us(&time.text(), fps, state.start_tc_us()) {
                 edited.position_us = state.frame_floor(us);
             }
             edited.duration_us = duration.value_as_int().max(0) as i64 * frame_us;
@@ -176,6 +179,23 @@ fn parse_timecode(text: &str, fps: f64) -> Option<i64> {
     Some(((secs * fps_i + frames) as f64 * 1_000_000.0 / fps) as i64)
 }
 
+/// A typed timecode (which includes the Start Timecode) as a timeline position.
+/// None when it is malformed or lies before the timeline starts.
+fn typed_position_us(text: &str, fps: f64, start_tc_us: i64) -> Option<i64> {
+    parse_timecode(text, fps).map(|us| us - start_tc_us).filter(|us| *us >= 0)
+}
+
+/// What the Create New Timeline dialog asks for, as a timeline.
+fn timeline_from_form(name: String, video: u32, audio: u32, audio_type: AudioTrackType, start_tc_us: i64, resolution: Option<(u32, u32)>) -> Timeline {
+    let mut timeline = Timeline::with_tracks(name, video, audio);
+    timeline.start_tc_us = start_tc_us;
+    timeline.resolution = resolution;
+    for track in timeline.tracks.iter_mut().filter(|t| t.kind == tempo_timeline::TrackKind::Audio) {
+        track.audio_type = audio_type;
+    }
+    timeline
+}
+
 /// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
 /// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
 pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
@@ -188,14 +208,38 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     };
     let video = tracks("No. of Video Tracks");
     let audio = tracks("No. of Audio Tracks");
-    let grid = form_grid();
-    form_row(&grid, 0, "Timeline Name", &name);
-    form_row(&grid, 1, "No. of Video Tracks", &video);
-    form_row(&grid, 2, "No. of Audio Tracks", &audio);
+    let fps = state.fps();
+    let start = gtk::Entry::builder().text(timecode(tempo_timeline::RESOLVE_START_TC_US, fps)).activates_default(true).build();
+    let audio_type = gtk::DropDown::from_strings(&["Mono", "Stereo"]);
+    audio_type.set_selected(1);
+    let switch = || gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
     // On: an empty timeline. Off: it starts with the clip picked in the Media Pool.
-    let empty = gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
+    let empty = switch();
     empty.set_tooltip_text(Some("Turn off to start the timeline with the clip selected in the Media Pool"));
-    form_row(&grid, 3, "Empty Timeline", &empty);
+    let use_project = switch();
+    let (project_w, project_h, project_fps) = state.with_project(|p| (p.width, p.height, p.fps.to_f64())).unwrap_or((1920, 1080, fps));
+    let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    width.set_value(project_w as f64);
+    let height = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    height.set_value(project_h as f64);
+    let size = form_grid();
+    form_row(&size, 0, "Width", &width);
+    form_row(&size, 1, "Height", &height);
+    let rate = label(&format!("Frame rate: {} (the project's)", format!("{project_fps:.3}").trim_end_matches('0').trim_end_matches('.')), &["tempo-dim", "tempo-small"]);
+    rate.set_xalign(0.0);
+    size.attach(&rate, 1, 2, 1, 1);
+    let reveal = gtk::Revealer::builder().child(&size).build();
+    use_project.bind_property("active", &reveal, "reveal-child").transform_to(|_, on: bool| Some(!on)).sync_create().build();
+
+    let grid = form_grid();
+    form_row(&grid, 0, "Start Timecode", &start);
+    form_row(&grid, 1, "Timeline Name", &name);
+    form_row(&grid, 2, "No. of Video Tracks", &video);
+    form_row(&grid, 3, "No. of Audio Tracks", &audio);
+    form_row(&grid, 4, "Audio Track Type", &audio_type);
+    form_row(&grid, 5, "Empty Timeline", &empty);
+    form_row(&grid, 6, "Use Project Settings", &use_project);
+    grid.attach(&reveal, 0, 7, 2, 1);
 
     let dialog = adw::AlertDialog::builder().heading("Create New Timeline").extra_child(&grid).build();
     dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
@@ -205,19 +249,29 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let taken = state.with_project(|p| p.timeline_list()).unwrap_or_default();
     // Weak: the dialog owns the entry, so a strong ref here would keep both alive forever.
     let d = dialog.downgrade();
-    name.connect_changed(move |e| {
-        let typed = e.text().trim().to_lowercase();
-        let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
-        if let Some(d) = d.upgrade() {
-            d.set_response_enabled("create", free);
+    let check = {
+        let (name, start) = (name.clone(), start.clone());
+        move || {
+            let typed = name.text().trim().to_lowercase();
+            let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
+            let valid_start = parse_timecode(&start.text(), fps).is_some();
+            if let Some(d) = d.upgrade() {
+                d.set_response_enabled("create", free && valid_start);
+            }
         }
-    });
+    };
+    let on_name = check.clone();
+    name.connect_changed(move |_| on_name());
+    start.connect_changed(move |_| check());
     let state = state.clone();
     let field = name.clone();
     dialog.connect_response(Some("create"), move |_, _| {
         let typed = field.text().trim().to_string();
         let title = if typed.is_empty() { default.clone() } else { typed };
-        state.add_timeline(Timeline::with_tracks(title, video.value_as_int() as u32, audio.value_as_int() as u32));
+        let start_tc_us = parse_timecode(&start.text(), fps).unwrap_or(tempo_timeline::RESOLVE_START_TC_US);
+        let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
+        let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
+        state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution));
         if !empty.is_active() {
             match state.media_selection.get() {
                 Some(source) => actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None),
@@ -740,7 +794,24 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
 
 #[cfg(test)]
 mod marker_time_tests {
-    use super::parse_timecode;
+    use super::{parse_timecode, timeline_from_form, typed_position_us};
+    use tempo_timeline::{AudioTrackType, TrackKind};
+
+    #[test]
+    fn typed_position_subtracts_start_timecode() {
+        let start = 3_600_000_000;
+        assert_eq!(typed_position_us("01:00:01:00", 24.0, start), Some(1_000_000));
+        assert_eq!(typed_position_us("01:00:00:00", 24.0, start), Some(0));
+        assert_eq!(typed_position_us("00:59:59:00", 24.0, start), None);
+    }
+
+    #[test]
+    fn form_values_reach_the_timeline() {
+        let t = timeline_from_form("T".into(), 1, 2, AudioTrackType::Mono, 5, Some((1080, 1920)));
+        assert_eq!((t.start_tc_us, t.resolution), (5, Some((1080, 1920))));
+        assert!(t.tracks.iter().filter(|x| x.kind == TrackKind::Audio).all(|x| x.audio_type == AudioTrackType::Mono));
+        assert_eq!(timeline_from_form("T".into(), 1, 1, AudioTrackType::Stereo, 0, None).resolution, None);
+    }
 
     #[test]
     fn timecode_text_reads_back() {

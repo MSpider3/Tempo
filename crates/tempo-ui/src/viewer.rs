@@ -9,7 +9,7 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib};
 
 use crate::player::{Player, Snapshot};
-use crate::state::{timecode, AppState, Change};
+use crate::state::{AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
 
@@ -231,7 +231,7 @@ impl Viewer {
             }
             let pos = player.position_us();
             if pos != last_pos.replace(pos) {
-                tc.set_text(&timecode(pos, v.state.fps()));
+                tc.set_text(&v.state.position_tc(pos));
                 v.update_marker_box();
                 v.scrub.set_value(pos as f64);
                 for l in v.position_listeners.borrow().iter() {
@@ -285,7 +285,7 @@ impl Viewer {
         };
         self.marker_box.add_css_class(marker_class(m.color));
         let [time, name, note] = &self.marker_lines;
-        time.set_text(&format!("Time {}", timecode(m.position_us, self.state.fps())));
+        time.set_text(&format!("Time {}", self.state.position_tc(m.position_us)));
         name.set_text(&format!("Name {}", m.name));
         note.set_text(&format!("Note {}", m.note));
         note.set_visible(!m.note.is_empty());
@@ -416,7 +416,7 @@ impl Viewer {
                     None if self.source_only => "Source".to_string(),
                     None => p.timeline.name.clone(),
                 };
-                (p.width, p.height, title)
+                (p.output_size().0, p.output_size().1, title)
             })
             .unwrap_or((1920, 1080, String::new()));
         self.surface.set_frame_size(w, h);
