@@ -155,7 +155,7 @@ impl EditPage {
     /// For a project taller than it is wide, give the viewer a full-height column
     /// at the right, as DaVinci Resolve does. Otherwise it sits above the timeline.
     fn layout_viewer(&self) {
-        let vertical = self.state.with_project(|p| p.height > p.width).unwrap_or(false);
+        let vertical = self.state.with_project(|p| p.output_size().1 > p.output_size().0).unwrap_or(false);
         if vertical == self.vertical.replace(vertical) {
             return;
         }
