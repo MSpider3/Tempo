@@ -8,7 +8,21 @@ through screenshots and the app's own state.
 scripts/e2e.sh                      # build, make media + fixture, run every scenario
 scripts/e2e.sh transitions markers  # only these (file names or parts of them)
 E2E_NO_BUILD=1 scripts/e2e.sh smoke # reuse the last build
+scripts/e2e.sh /any/path/my_check.py # a scenario file anywhere (by path)
 ```
+
+Without the script, from any directory (after one `scripts/e2e.sh` run built the binary
+and the fixture):
+
+```bash
+python3 tests/e2e/tempo_e2e.py run --report /tmp/out /any/path/my_check.py 02_transitions
+```
+
+`TEMPO_E2E_APP` picks the Tempo binary and `TEMPO_E2E_PROJECT` the project every scenario
+opens (`--app`/`--project` win). Both default to what `scripts/e2e.sh` left in this
+checkout's `$CARGO_TARGET_DIR/e2e-bin/<hash of the checkout path>/` (`tempo`,
+`fixture.tempo`); `TEMPO_E2E_TMP` where session dirs go (default `/tmp`; Wayland socket paths must
+stay under 108 bytes).
 
 Exit status 0 means every scenario passed. The last lines print `n/m scenarios passed.
 Report: <dir>`; the report holds everything to look at (see [Results](#results)).
@@ -25,18 +39,26 @@ Report: <dir>`; the report holds everything to look at (see [Results](#results))
   is started on demand), its own PipeWire with WirePlumber's `policy` profile
   (no sound cards, cameras or Bluetooth), and `GSETTINGS_BACKEND=memory`. Child processes
   get a fresh environment, never the caller's. `~/.config/tempo` is never read or written.
+  The harness process itself also points its `DBUS_SESSION_BUS_ADDRESS`, `XDG_*`, `HOME`
+  at the session while it runs and drops `WAYLAND_DISPLAY`/`DISPLAY`, so libraries it
+  loads (libpipewire asks the Realtime portal over D-Bus) only reach the private bus.
 * **Input is not global.** Pointer and keys go through mutter's
   `org.gnome.Mutter.RemoteDesktop` on the private bus: virtual devices inside that
   headless mutter only. Nothing uses uinput, ydotool, xdotool or the real seat.
 * **Screenshots are what the compositor shows**, from `org.gnome.Mutter.ScreenCast` on the
   private PipeWire (connected by file descriptor, never through the environment). Menus,
   popovers and drag icons are in them; the pointer is not drawn.
-* **No sound.** `TEMPO_NO_AUDIO=1` makes the player skip its audio output.
-* **Nothing is left running.** Every child gets SIGKILL if the harness dies
-  (`PR_SET_PDEATHSIG`); a session stops them in order when it ends, even after a failure.
+* **No sound, no background transcodes.** `TEMPO_NO_AUDIO=1` makes the player skip its
+  audio output (only the value `1` counts); `TEMPO_NO_PROXY=1` stops proxy generation.
+* **Nothing is left running.** A session stops its children in order when it ends, even
+  after a failure, then kills their whole process group. SIGTERM and Ctrl+C stop a run
+  the same way. If the harness is killed outright (SIGKILL), every child gets SIGKILL
+  (`PR_SET_PDEATHSIG`; `dbus-daemon` clears that, so a watchdog shell stops it when its
+  pipe from the harness closes), and the next session removes the dead session's dir
+  (only dirs holding the harness's `tempo-e2e-owner` file whose process is gone).
 * Scenario `09_isolation` checks all of this on every run: the environment of each
-  process, and that the app's and mutter's Unix sockets lead only into the session's
-  temp dir (or to the read-only system bus).
+  process and of the harness itself, and that the Unix sockets of the app, mutter and
+  the harness lead only into the session's temp dir (or to the read-only system bus).
 
 ## Needs
 
@@ -49,10 +71,12 @@ anything missing. No root, no X server, no other compositor.
 
 1. `cargo build --bin tempo` and the fixture writer
    (`crates/tempo-app/examples/e2e_fixture.rs`), then copies the binary to
-   `$CARGO_TARGET_DIR/e2e-bin/tempo` (a shared target dir may be rebuilt by others) and
-   checks it has the test channel.
+   `$CARGO_TARGET_DIR/e2e-bin/<hash of the checkout path>/` (a shared target dir is rebuilt
+   by other checkouts, which run this script too). The binary must contain this
+   checkout's `crates/tempo-ui` path (the test channel's `ping` reply); if another
+   checkout's build was copied, the copy is redone.
 2. Makes three 6 s solid-colour clips with a tone in `target/e2e-media/` (`red-6s.mp4`,
-   `lime-6s.mp4`, `blue-6s.mp4`) and the fixture `target/e2e-media/fixture.tempo`:
+   `lime-6s.mp4`, `blue-6s.mp4`) and the fixture `fixture.tempo` next to the copied binary:
    one 30 fps 1920x1080 timeline, tracks V1 and A1 only, the three clips back to back at
    0-4, 4-8, 8-12 s, each using the middle 4 s of its file (1 s handles, so centred
    transitions fit), picture and sound linked, no markers.
@@ -69,17 +93,18 @@ anything missing. No root, no X server, no other compositor.
 | `03_inspector` | select a transition, type End Ratio 80, pick Ease In from the dropdown, type 20 frames, Set as Default Duration, Ctrl+T on the other cut is 20 frames |
 | `04_markers` | click the ruler, Ctrl+M, type a name, type a Keyword, Enter: marker with both at the playhead; Ctrl+S writes both into the project file |
 | `05_new_timeline` | Ctrl+N, Start Timecode 01:00:00:00, name, Audio Track Type Mono, Create: start timecode, mono tracks, a label reads 01:00:00:00 |
-| `06_ghost_tracks` | drag a Media Pool clip into the band above V1: V2 + A2 with the clip (screenshot mid-drag shows the ghost lanes); one Ctrl+Z removes both |
+| `06_ghost_tracks` | drag a Media Pool clip into the band above V1: mid-drag the geometry has ghost lanes V2 + A2 and the band is drawn differently; the drop makes V2 + A2 with the clip; one Ctrl+Z removes both |
 | `07_trim` | nothing selected: Shift+[ trims the clip under the playhead's head, Shift+] another's tail, gaps left, Ctrl+Z twice restores |
 | `08_ease_pixels` | Dip To Color dissolve from red: the viewer at 25 % reads about (126,0,0) linear and (221,0,0) with Ease In |
 | `09_isolation` | the guarantees above |
 | `10_transition_switch` | Inspector Video switch off: transition `enabled` false, the viewer at the cut shows a hard cut (pure red), Ctrl+Z restores |
 | `11_curve_graph` | Inspector curve graph: double-click adds a key, dragging it up raises its value, right-click removes it |
-| `12_marker_colours` | marker popup: 16 colour dots in Resolve order, a point marker's Duration reads 00:00:00:01, click Cocoa: marker colour Cocoa |
+| `12_marker_colours` | marker popup: 16 colour dots in Resolve's order on screen, a point marker's Duration reads 00:00:00:01, click Cocoa: marker colour Cocoa |
 | `13_timeline_portrait` | Ctrl+N with Use Project Settings off, 1080 x 1920, 25 fps: timeline fps 25/1 and that resolution, the viewer picture is portrait |
-| `14_edge_tooltip` | dragging a transition edge shows the "+ss:ff / ss:ff" tooltip at the pointer (mid-drag screenshot) and lengthens it |
+| `14_edge_tooltip` | dragging a transition edge out: the tooltip text is "+ss:ff" over "ss:ff" (from `geometry()`), a black box shows by the pointer (screenshot), it is gone after, and the transition is longer |
 | `15_landing_box` | dragging a Media Pool clip over V1 draws the landing box in the video clip colour (not green) on V1, green on A1 |
 | `16_drop_across_audio` | a Cross Dissolve dragged across the A1 cut and onto the V1 cut is accepted and centred |
+| `17_curve_delete_key` | click a curve key, Delete removes the key and not the transition; BackSpace too |
 
 ## Results
 
@@ -136,14 +161,18 @@ Rules that keep scenarios honest and stable:
   `add_transition_at_cut`, `seek_by_ruler`, `viewer_colour`); files starting with `_`
   are not scenarios.
 * Times in the state are microseconds; the fixture is 30 fps (a frame is 33 334 µs).
-* A different project: set `PROJECT = "/path/to.tempo"` in the scenario module.
+* A different project: set `PROJECT = "/path/to.tempo"` in the scenario module; extra
+  variables for the app: `ENV = {"GDK_DEBUG": "dnd"}`.
+* `geometry()` widgets carry `visible` (false when scrolled out of their scrolled area)
+  and `visible_rect`. `widget()`/`widgets()` skip invisible ones unless `hidden=True`;
+  pass `hidden=True` in the finder you give `scroll_into_view`.
 
 Ad hoc, without the runner (useful to explore, or to reproduce one bug):
 
 ```bash
 cd tests/e2e && python3 - <<'EOF'
 import tempo_e2e as t
-with t.Session(project="../../target/e2e-media/fixture.tempo", report_dir="/tmp/look") as s:
+with t.Session(project=t.DEFAULT_PROJECT, report_dir="/tmp/look") as s:
     s.key("ctrl+t"); s.screenshot("after")
     print(s.state()["project"]["timeline"]["tracks"][0]["transitions"])
 EOF
@@ -175,7 +204,7 @@ Looking:
 | Call | Returns |
 |------|---------|
 | `state()` | `project` (the whole project as saved: `timeline` with `tracks` → `clips`, `transitions` with every field, `markers` with `name`/`keyword`/`color`, `start_tc_us`, `fps`; `timelines`; `sources`), `selection`, `edit_selection` (`{"kind": "edit"/"transition", ...}`), `selected_transition`, `transition_clipboard`, `playhead_us`, `playhead_tc`, `start_tc_us`, `fps`, `settings` (incl. `transition_us`), `tool`, `dirty`, `playing`, `title`, `fullscreen`, `focus` |
-| `geometry()` | `window`, `fullscreen`, `widgets` (every mapped widget: `id`, `parent`, `type`, `name`, `css`, `text`, `tooltip`, `active`, `value`, `sensitive`, `focus`, `rect` [x, y, w, h]; popovers included at their screen place), `timeline` (`canvas`, `ruler`, `ghost_band`, `pps`, `playhead_x`, `tracks` [name, id, rect], `clips` [id, name, track, in_us, out_us, rect, edit_y], `transitions` [id, clip_id, kind, track, start_us, end_us, rect], `markers` [id, position_us, x]) |
+| `geometry()` | `window`, `fullscreen`, `widgets` (every mapped widget: `id`, `parent`, `type`, `name`, `css`, `text`, `tooltip`, `active`, `value`, `sensitive`, `focus`, `rect` [x, y, w, h], `visible`, `visible_rect`; popovers included at their screen place), `timeline` (`canvas`, `ruler`, `ghost_band`, `pps`, `playhead_x`, `tracks` [name, id, ghost, rect] (ghost lanes V2/A2… while a clip is dragged over them), `clips` [id, name, track, in_us, out_us, rect, edit_y], `transitions` [id, clip_id, kind, track, start_us, end_us, rect], `markers` [id, position_us, x], `tip` (the tooltip drawn on the canvas while dragging: `text`, `pointer` [x, y]; null otherwise)) |
 | `screenshot(name=None)` | `Image` after the screen is still; `.pixel(x, y)`, `.mean(rect)`, `.brightness(rect=None)`, `.save(path)` |
 | `widgets(text=, type=, tooltip=, css=, contains=)` / `widget(...)` | all matches / the first, waiting for it |
 | `row_widget(label, type, index=0)` / `row_widgets(label, type)` | the field on a label's row (Inspector, dialogs), scrolled into view |
@@ -221,4 +250,5 @@ All in `crates/tempo-ui/src/app.rs`, active only when the variable is set:
 * No `xdg-desktop-portal`: file choosers and similar portal dialogs cannot be tested.
 * No sound is played or checked; audio code runs only as far as the timeline model.
 * Pixel checks assume Tempo's fixed dark theme and the solid-colour fixture.
-* Each scenario starts its own compositor and app (about 3 s); keep scenarios focused.
+* Each scenario starts its own compositor and app; a scenario takes 4–40 s (start-up is
+  about 3 s of that, more on a busy machine). Keep scenarios focused.

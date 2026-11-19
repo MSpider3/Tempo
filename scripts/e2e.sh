@@ -6,9 +6,14 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-repo=$PWD
+repo=$(pwd -P)
 target=${CARGO_TARGET_DIR:-$repo/target}
 media=$target/e2e-media
+# The target dir may be shared with other checkouts, which rebuild target/debug/tempo and
+# run this script too: this checkout's binary and fixture live in a dir of its own
+# (the same name tests/e2e/tempo_e2e.py computes).
+bin=$target/e2e-bin/$(printf %s "$repo" | sha1sum | cut -c1-8)
+app=$bin/tempo
 report=${E2E_REPORT:-$target/e2e-report/$(date +%Y%m%d-%H%M%S)}
 
 for tool in mutter dbus-daemon pipewire wireplumber gst-launch-1.0 ffmpeg python3; do
@@ -18,16 +23,21 @@ gst-inspect-1.0 pipewiresrc >/dev/null 2>&1 || { echo "e2e: missing the GStreame
 python3 -c 'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst, Gio' 2>/dev/null ||
     { echo "e2e: python3 needs PyGObject with Gst 1.0" >&2; exit 2; }
 
-# The target dir may be shared with other checkouts, so the tested binary is copied
-# aside right after the build and checked for the test channel.
-app=$target/e2e-bin/tempo
+# The binary names the crate dir it was built from (the test channel's `ping` reply), so
+# a copy of another checkout's build is caught and the (no-op) build and copy repeated.
+mine() { grep -aqF "$repo/crates/tempo-ui" "$app" 2>/dev/null; }
 if [ -z "${E2E_NO_BUILD:-}" ]; then
-    cargo build --bin tempo
-    cargo build -p tempo-app --example e2e_fixture
-    mkdir -p "$target/e2e-bin"
-    cp "$target/debug/tempo" "$app"
+    mkdir -p "$bin"
+    for _ in 1 2 3 4 5; do
+        cargo build --bin tempo
+        cargo build -p tempo-app --example e2e_fixture
+        cp "$target/debug/tempo" "$app"
+        cp "$target/debug/examples/e2e_fixture" "$bin/e2e_fixture"
+        mine && break
+        echo "e2e: another checkout replaced target/debug/tempo; copying again" >&2
+    done
 fi
-grep -aq TEMPO_TEST_CONTROL "$app" 2>/dev/null || { echo "e2e: $app has no test control channel; build again" >&2; exit 2; }
+mine || { echo "e2e: $app is not this checkout's build (or has no test channel); build again" >&2; exit 2; }
 
 # Plain colour clips with a tone, so pixel checks are exact: 6 s at 30 fps, of which the
 # fixture uses the middle 4 s (the rest are handles for transitions).
@@ -39,9 +49,9 @@ for colour in red lime blue; do
         -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=6" \
         -pix_fmt yuv420p -g 30 -c:v "$h264" -c:a aac -shortest "$media/$colour-6s.mp4"
 done
-project=$media/fixture.tempo
+project=$bin/fixture.tempo
 rm -f "$project"
-"$target/debug/examples/e2e_fixture" "$project" "$media/red-6s.mp4" "$media/lime-6s.mp4" "$media/blue-6s.mp4"
+"$bin/e2e_fixture" "$project" "$media/red-6s.mp4" "$media/lime-6s.mp4" "$media/blue-6s.mp4"
 
 mkdir -p "$report"
 python3 tests/e2e/tempo_e2e.py run --project "$project" --report "$report" --app "$app" "$@"

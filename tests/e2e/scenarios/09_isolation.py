@@ -1,4 +1,4 @@
-"""Isolation: the app and compositor talk only to the session's private Wayland, D-Bus and PipeWire sockets, and use a private HOME."""
+"""Isolation: the harness, the app and the compositor talk only to the session's private Wayland, D-Bus and PipeWire sockets, and use a private HOME."""
 
 import os
 import re
@@ -51,5 +51,15 @@ def run(s):
         s.note(f"{name}_unix_peers", peers)
         outside = [p for p in peers if not p.startswith(private) and not p.startswith(allowed)]
         expect(not outside, f"{name} talks only to private sockets, not {outside}")
+    # The harness process itself: its session variables point at the private session
+    # while it runs, and it is connected to private sockets only.
+    for var in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "HOME"):
+        expect(os.environ.get(var, "").replace("unix:path=", "").startswith(private), f"the harness's {var} is private: {os.environ.get(var)}")
+    expect("WAYLAND_DISPLAY" not in os.environ and "DISPLAY" not in os.environ, "the harness has no desktop display variables")
+    peers = unix_peers(os.getpid())
+    s.note("harness_unix_peers", peers)
+    outside = [p for p in peers if not p.startswith(private) and not p.startswith(allowed)]
+    expect(not outside, f"the harness talks only to private sockets, not {outside}")
+    expect(f"{s.run_dir}/pipewire-0" in peers, f"the harness captures the screen from the private PipeWire: {peers}")
     app_peers = unix_peers(s.pid("app"))
     expect(f"{s.run_dir}/{s.display}" in app_peers, f"the app is connected to the private compositor: {app_peers}")

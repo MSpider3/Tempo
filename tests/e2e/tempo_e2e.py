@@ -14,7 +14,8 @@ Every Session starts its own D-Bus session bus, PipeWire + WirePlumber (no hardw
 `mutter --headless --wayland --no-x11` and Tempo, all inside a fresh temp directory
 with its own HOME and XDG dirs. Input goes through mutter's RemoteDesktop API on that
 private bus; screenshots come from mutter's ScreenCast stream on that private PipeWire.
-Nothing talks to the user's desktop, sound server or session bus.
+Nothing talks to the user's desktop, sound server or session bus, the harness process
+included: while a Session runs, its own D-Bus/XDG/HOME variables point at the private ones.
 
 Command line:  python3 tests/e2e/tempo_e2e.py run --project P --report DIR [scenario ...]
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import importlib.util
 import json
 import os
@@ -48,7 +50,11 @@ from e2e_find import E2EError, FindMixin, center  # noqa: E402  (re-exported for
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-DEFAULT_APP = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "e2e-bin" / "tempo"  # copied there by scripts/e2e.sh
+# This checkout's binary and fixture, put there by scripts/e2e.sh (a dir per checkout, as
+# the target dir may be shared).
+CHECKOUT_BIN = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "e2e-bin" / hashlib.sha1(str(REPO).encode()).hexdigest()[:8]
+DEFAULT_APP = CHECKOUT_BIN / "tempo"
+DEFAULT_PROJECT = CHECKOUT_BIN / "fixture.tempo"
 
 BTN = {"left": 272, "right": 273, "middle": 274}  # linux/input-event-codes.h
 MODIFIERS = {"ctrl": 0xFFE3, "control": 0xFFE3, "shift": 0xFFE1, "alt": 0xFFE9, "super": 0xFFEB, "meta": 0xFFEB}
@@ -90,6 +96,40 @@ def _die_with_parent():
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
     except OSError:
         pass
+
+
+# Variables of the harness process itself that point at a desktop session. While a Session
+# runs they point at its private one, so libraries loaded into the harness (libpipewire
+# in the screen capture asks the Realtime portal over D-Bus) never reach the user's.
+SESSION_VARS = ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "HOME", "WAYLAND_DISPLAY", "DISPLAY", "PIPEWIRE_REMOTE", "PULSE_SERVER")
+OWNER_FILE = "tempo-e2e-owner"  # in each session dir: the harness's pid and start time
+
+
+def _process_start(pid):
+    """Start time of `pid` in clock ticks (with the pid it names one process), or None."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def sweep_stale_sessions():
+    """Remove session dirs whose harness is gone (killed with SIGKILL, say). Only dirs
+    the harness made (they hold OWNER_FILE) and that belong to this user are touched."""
+    for d in Path(short_tmp()).glob("te2e-*"):
+        try:
+            if d.is_symlink() or d.stat().st_uid != os.getuid():
+                continue
+            pid, started = (int(v) for v in (d / OWNER_FILE).read_text().split())
+        except (OSError, ValueError):
+            continue
+        if _process_start(pid) != started:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _interrupt(signum, frame):
+    # SIGTERM ends a run like Ctrl+C: the `with Session` blocks close and clean up.
+    raise KeyboardInterrupt(f"signal {signum}")
 
 
 class Image:
@@ -201,6 +241,9 @@ class Session(FindMixin):
     # -- lifecycle
 
     def __enter__(self):
+        self._old_term = None
+        if threading.current_thread() is threading.main_thread() and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL:
+            self._old_term = signal.signal(signal.SIGTERM, _interrupt)
         try:
             self.start()
         except BaseException:
@@ -210,11 +253,15 @@ class Session(FindMixin):
 
     def __exit__(self, *exc):
         self.close()
+        if self._old_term is not None:
+            signal.signal(signal.SIGTERM, self._old_term)
         return False
 
     def start(self):
+        sweep_stale_sessions()
         self.tmp = Path(tempfile.mkdtemp(prefix="te2e-", dir=short_tmp()))
         os.chmod(self.tmp, 0o700)
+        (self.tmp / OWNER_FILE).write_text(f"{os.getpid()} {_process_start(os.getpid())}\n")
         self.run_dir = self.tmp / "run"
         for d in ["run", "home", "config", "data", "cache", "state", "logs"]:
             (self.tmp / d).mkdir(mode=0o700)
@@ -234,6 +281,12 @@ class Session(FindMixin):
             "GTK_A11Y": "none",
         }
         self._start_bus()
+        # GStreamer's plugin registry stays where it was (a cache file, not a session service).
+        os.environ.setdefault("GST_REGISTRY", str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "gstreamer-1.0" / f"registry.{os.uname().machine}.bin"))
+        self._saved_env = {k: os.environ.get(k) for k in SESSION_VARS}
+        for k in SESSION_VARS:
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in self.env.items() if k in SESSION_VARS})
         self._spawn("pipewire", ["pipewire"])
         self._wait_path(self.run_dir / "pipewire-0", "PipeWire socket")
         # The "policy" profile links streams but opens no sound cards, cameras or Bluetooth.
@@ -257,17 +310,24 @@ class Session(FindMixin):
             "<policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/>"
             "<allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>\n"
         )
-        self._spawn("dbus", ["dbus-daemon", f"--config-file={config}", "--nofork", "--nopidfile"])
+        # dbus-daemon clears PR_SET_PDEATHSIG, so a shell holds it: when the harness goes
+        # (even by SIGKILL) the pipe on the shell's stdin closes and the shell stops the bus.
+        read_end, self._bus_pipe = os.pipe()
+        watchdog = 'dbus-daemon "$@" & read -r _; kill $!; wait'
+        self._spawn("dbus", ["sh", "-c", watchdog, "sh", f"--config-file={config}", "--nofork", "--nopidfile"], stdin=read_end, pdeathsig=False)
+        os.close(read_end)
         self._wait_path(self.run_dir / "bus", "D-Bus socket")
         self.env["DBUS_SESSION_BUS_ADDRESS"] = address
         flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
         self.bus = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
 
-    def _spawn(self, name, argv, env=None):
+    def _spawn(self, name, argv, env=None, stdin=subprocess.DEVNULL, pdeathsig=True):
         log = self.tmp / "logs" / f"{name}.log"
         self.logs[name] = log
         out = open(log, "wb")
-        proc = subprocess.Popen(argv, env=env or self.env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=self.tmp, preexec_fn=_die_with_parent)
+        # All children share one process group (the first one's), killed as a whole in close().
+        group = self.procs[0][1].pid if self.procs else 0
+        proc = subprocess.Popen(argv, env=env or self.env, stdout=out, stderr=subprocess.STDOUT, stdin=stdin, cwd=self.tmp, preexec_fn=_die_with_parent if pdeathsig else None, process_group=group)
         out.close()
         self.procs.append((name, proc))
         return proc
@@ -328,6 +388,13 @@ class Session(FindMixin):
         # App first, bus last; each gets SIGTERM, then SIGKILL after 5 s.
         order = ["app", "mutter", "wireplumber", "pipewire", "dbus"]
         for name, proc in sorted(self.procs, key=lambda p: order.index(p[0]) if p[0] in order else -1):
+            if name == "dbus" and getattr(self, "_bus_pipe", None) is not None:
+                os.close(self._bus_pipe)  # the watchdog shell stops dbus-daemon and exits
+                self._bus_pipe = None
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    pass
             if proc.poll() is None:
                 proc.terminate()
                 try:
@@ -335,6 +402,11 @@ class Session(FindMixin):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(5)
+        if self.procs:
+            try:
+                os.killpg(self.procs[0][1].pid, signal.SIGKILL)  # anything they started (ffmpeg, ...)
+            except (ProcessLookupError, PermissionError):
+                pass
         self.procs = []
         if self.bus:
             try:
@@ -349,6 +421,13 @@ class Session(FindMixin):
                         shutil.copy(log, self.report_dir / f"{name}.log")
             shutil.rmtree(self.tmp, ignore_errors=True)
             self.tmp = None
+        if getattr(self, "_saved_env", None) is not None:
+            for k, v in self._saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            self._saved_env = None
 
     # -- waiting
 
@@ -515,6 +594,9 @@ class Session(FindMixin):
                 self.move(ax + (bx - ax) * t, ay + (by - ay) * t)
                 time.sleep(max(duration / steps - STEP_DELAY, 0))
         time.sleep(hold)
+        # Release only once the app has handled the motion (a drop target that has not
+        # seen the pointer arrive refuses the drop; seen under load).
+        self._after_input()
         if before_release:
             before_release()
         self.move(x2, y2)
@@ -639,7 +721,7 @@ def run_scenarios(specs, project, report, app=None):
         result = {"scenario": name, "description": (module.__doc__ or "").strip().splitlines()[0] if module.__doc__ else "", "passed": False}
         print(f"[ RUN  ] {name}", flush=True)
         try:
-            with Session(project=getattr(module, "PROJECT", project), report_dir=out, app=app) as session:
+            with Session(project=getattr(module, "PROJECT", project), report_dir=out, app=app, extra_env=getattr(module, "ENV", None)) as session:
                 try:
                     module.run(session)
                 except BaseException:
@@ -675,9 +757,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="run scenarios (all by default)")
     run.add_argument("scenarios", nargs="*", help="scenario files or name fragments (e.g. transitions)")
-    run.add_argument("--project", default=os.environ.get("TEMPO_E2E_PROJECT"), help="the fixture .tempo to open")
+    run.add_argument("--project", default=os.environ.get("TEMPO_E2E_PROJECT") or (str(DEFAULT_PROJECT) if DEFAULT_PROJECT.exists() else None), help="the .tempo to open (default: the fixture scripts/e2e.sh wrote)")
     run.add_argument("--report", default=str(REPO / "target" / "e2e-report"), help="where results and screenshots go")
-    run.add_argument("--app", default=None, help="the tempo binary (default target/e2e-bin/tempo)")
+    run.add_argument("--app", default=None, help="the tempo binary (default: the one scripts/e2e.sh copied, or $TEMPO_E2E_APP)")
     sub.add_parser("list", help="list scenarios")
     args = parser.parse_args()
     if args.command == "list":

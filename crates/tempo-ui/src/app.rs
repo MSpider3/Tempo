@@ -138,9 +138,18 @@ fn dev_hooks(app: &adw::Application, win: &std::rc::Rc<MainWindow>) {
 /// unless the variable is set; everything runs on the main loop without blocking it.
 fn test_control(app: &adw::Application, win: &Rc<MainWindow>) {
     let Some(path) = std::env::var_os("TEMPO_TEST_CONTROL") else { return };
+    let path = std::path::PathBuf::from(path);
+    if let Err(e) = private_socket_path(&path) {
+        tracing::error!("test control socket {}: {e}", path.display());
+        return;
+    }
     let service = gio::SocketService::new();
-    let address = gio::UnixSocketAddress::new(std::path::Path::new(&path));
+    let address = gio::UnixSocketAddress::new(&path);
     if let Err(e) = service.add_address(&address, gio::SocketType::Stream, gio::SocketProtocol::Default, None::<&glib::Object>) {
+        tracing::error!("test control socket: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
         tracing::error!("test control socket: {e}");
         return;
     }
@@ -155,16 +164,52 @@ fn test_control(app: &adw::Application, win: &Rc<MainWindow>) {
     tracing::info!("test control listening");
 }
 
+/// The control socket may only live in a directory that this user owns and nobody else
+/// can enter; a stale socket file left there is removed.
+fn private_socket_path(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).ok_or("needs an absolute path in a private directory")?;
+    let me = std::fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.uid() != me || meta.mode() & 0o077 != 0 {
+        return Err(format!("{} must be a directory owned by this user with mode 0700", dir.display()));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path).map_err(|e| e.to_string()),
+        Ok(_) => Err("exists and is not a socket".into()),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Longest command line accepted; commands are a word and a short argument.
+const MAX_TEST_LINE: usize = 4096;
+
 async fn serve_test_client(app: adw::Application, win: Rc<MainWindow>, connection: gio::SocketConnection) {
-    let input = gio::DataInputStream::new(&connection.input_stream());
+    let input = connection.input_stream();
     let output = connection.output_stream();
-    while let Ok(Some(line)) = input.read_line_utf8_future(glib::Priority::DEFAULT).await {
-        let reply = match test_command(&app, &win, line.trim()).await {
-            Ok(result) => serde_json::json!({ "ok": true, "result": result }),
-            Err(error) => serde_json::json!({ "ok": false, "error": error }),
-        };
-        if output.write_all_future(format!("{reply}\n").into_bytes(), glib::Priority::DEFAULT).await.is_err() {
-            break;
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            let reply = match std::str::from_utf8(&line) {
+                Ok(text) => match test_command(&app, &win, text.trim()).await {
+                    Ok(result) => serde_json::json!({ "ok": true, "result": result }),
+                    Err(error) => serde_json::json!({ "ok": false, "error": error }),
+                },
+                Err(_) => serde_json::json!({ "ok": false, "error": "not UTF-8" }),
+            };
+            if output.write_all_future(format!("{reply}\n").into_bytes(), glib::Priority::DEFAULT).await.is_err() {
+                return;
+            }
+        }
+        if pending.len() > MAX_TEST_LINE {
+            let reply = serde_json::json!({ "ok": false, "error": format!("line longer than {MAX_TEST_LINE} bytes") });
+            let _ = output.write_all_future(format!("{reply}\n").into_bytes(), glib::Priority::DEFAULT).await;
+            return;
+        }
+        match input.read_bytes_future(MAX_TEST_LINE, glib::Priority::DEFAULT).await {
+            Ok(bytes) if !bytes.is_empty() => pending.extend_from_slice(&bytes),
+            _ => return,
         }
     }
 }
@@ -172,7 +217,8 @@ async fn serve_test_client(app: adw::Application, win: Rc<MainWindow>, connectio
 async fn test_command(app: &adw::Application, win: &Rc<MainWindow>, line: &str) -> Result<Value, String> {
     let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
     match command {
-        "ping" => Ok(json!("pong")),
+        // The crate dir names the checkout this binary was built from (scripts/e2e.sh).
+        "ping" => Ok(json!({ "pong": true, "source": env!("CARGO_MANIFEST_DIR") })),
         "state" => Ok(test_state(win)),
         "geometry" => Ok(test_geometry(win)),
         // Setup only: a GAction name or a `run_script_step` step.
@@ -233,7 +279,7 @@ fn test_geometry(win: &MainWindow) -> Value {
     let window: &gtk::Widget = win.window.upcast_ref();
     let (ox, oy) = win.window.surface_transform();
     let mut widgets = Vec::new();
-    collect_widgets(window, window, (ox, oy), None, &mut widgets);
+    collect_widgets(window, window, (ox, oy), None, None, &mut widgets);
     json!({
         "window": [0.0, 0.0, win.window.width(), win.window.height()],
         "fullscreen": win.window.is_fullscreen(),
@@ -242,12 +288,18 @@ fn test_geometry(win: &MainWindow) -> Value {
     })
 }
 
-fn rect_json(r: &gtk::graphene::Rect, (ox, oy): (f64, f64)) -> Value {
-    json!([r.x() as f64 + ox, r.y() as f64 + oy, r.width(), r.height()])
+/// A screen rectangle: x, y, width, height.
+type Area = (f64, f64, f64, f64);
+
+fn intersect(a: Area, b: Area) -> Area {
+    let (x0, y0) = (a.0.max(b.0), a.1.max(b.1));
+    let (x1, y1) = ((a.0 + a.2).min(b.0 + b.2), (a.1 + a.3).min(b.1 + b.3));
+    (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
-/// Depth first; `native` is the widget whose surface `origin` is the screen offset of.
-fn collect_widgets(widget: &gtk::Widget, native: &gtk::Widget, origin: (f64, f64), parent: Option<usize>, out: &mut Vec<Value>) {
+/// Depth first; `native` is the widget whose surface `origin` is the screen offset of;
+/// `clip` is the part of the screen the enclosing scrolled areas show.
+fn collect_widgets(widget: &gtk::Widget, native: &gtk::Widget, origin: (f64, f64), clip: Option<Area>, parent: Option<usize>, out: &mut Vec<Value>) {
     let mut child = widget.first_child();
     while let Some(c) = child {
         child = c.next_sibling();
@@ -255,19 +307,25 @@ fn collect_widgets(widget: &gtk::Widget, native: &gtk::Widget, origin: (f64, f64
             continue;
         }
         // A popover is a surface of its own, placed relative to its parent's surface.
-        let (native, origin) = match c.downcast_ref::<gtk::Popover>() {
+        let (native, origin, clip) = match c.downcast_ref::<gtk::Popover>() {
             Some(popover) => {
                 let place = popover.surface().and_then(|s| s.downcast::<gtk::gdk::Popup>().ok()).map(|p| (p.position_x() as f64, p.position_y() as f64));
                 let (tx, ty) = popover.surface_transform();
                 let (px, py) = place.unwrap_or_default();
-                (c.clone(), (origin.0 + px + tx, origin.1 + py + ty))
+                (c.clone(), (origin.0 + px + tx, origin.1 + py + ty), None)
             }
-            None => (native.clone(), origin),
+            None => (native.clone(), origin, clip),
         };
         let Some(bounds) = c.compute_bounds(&native) else { continue };
+        let area = (bounds.x() as f64 + origin.0, bounds.y() as f64 + origin.1, bounds.width() as f64, bounds.height() as f64);
+        let shown = clip.map_or(area, |clip| intersect(area, clip));
         let id = out.len();
-        out.push(widget_json(&c, id, parent, rect_json(&bounds, origin)));
-        collect_widgets(&c, &native, origin, Some(id), out);
+        let mut json = widget_json(&c, id, parent, json!([area.0, area.1, area.2, area.3]));
+        json["visible"] = json!(shown.2 > 0.0 && shown.3 > 0.0);
+        json["visible_rect"] = json!([shown.0, shown.1, shown.2, shown.3]);
+        out.push(json);
+        let clip = if c.is::<gtk::ScrolledWindow>() || c.is::<gtk::Viewport>() { Some(shown) } else { clip };
+        collect_widgets(&c, &native, origin, clip, Some(id), out);
     }
 }
 
@@ -333,7 +391,7 @@ fn timeline_geometry(win: &MainWindow, origin: (f64, f64)) -> Value {
             let Some(track) = t.find_track(row.track_id) else { continue };
             let n = name(row);
             let (top, bottom) = (row.y as f64, (row.y + row.h) as f64);
-            tracks.push(json!({ "name": n, "id": track.id, "rect": rect(0.0, top, width, bottom) }));
+            tracks.push(json!({ "name": n, "id": track.id, "ghost": false, "rect": rect(0.0, top, width, bottom) }));
             for c in &track.clips {
                 let (x0, x1) = (x(&n, c.timeline_in), x(&n, c.timeline_out));
                 clips.push(json!({ "id": c.id, "name": c.name, "track": n, "in_us": c.timeline_in, "out_us": c.timeline_out, "rect": rect(x0, top, x1, bottom), "edit_y": at(0.0, bottom - 8.0).1 }));
@@ -343,6 +401,24 @@ fn timeline_geometry(win: &MainWindow, origin: (f64, f64)) -> Value {
                 transitions.push(json!({ "id": tr.id, "clip_id": tr.clip_id, "kind": format!("{:?}", tr.kind), "track": n, "start_us": a, "end_us": b, "rect": rect(x(&n, a), top + 6.0, x(&n, b), bottom - 26.0) }));
             }
         }
+    });
+    // The temporary lanes shown while a clip is dragged above the top video track.
+    let imp = gtk::subclass::prelude::ObjectSubclassIsExt::imp(canvas);
+    if let Some((video, audio)) = imp.ghost.get() {
+        let next = |kind: tempo_timeline::TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
+        if video {
+            tracks.insert(0, json!({ "name": format!("V{}", next(tempo_timeline::TrackKind::Video)), "id": null, "ghost": true, "rect": rect(0.0, ruler_h, width, first_y) }));
+        }
+        if audio {
+            let top = rows.last().map_or(ruler_h, |r| (r.y + r.h) as f64);
+            let h = rows.iter().rev().find(|r| r.kind == tempo_timeline::TrackKind::Audio).map_or(54.0, |r| r.h as f64);
+            tracks.push(json!({ "name": format!("A{}", next(tempo_timeline::TrackKind::Audio)), "id": null, "ghost": true, "rect": rect(0.0, top, width, top + h) }));
+        }
+    }
+    // The small tooltip drawn on the canvas while dragging (edges, markers, trims).
+    let tip = imp.tip.borrow().as_ref().map(|(tx, ty, text)| {
+        let (px, py) = at(*tx, *ty);
+        json!({ "text": text, "pointer": [px, py] })
     });
     let markers = win.state.with_timeline(|t| t.markers.iter().map(|m| json!({ "id": m.id, "position_us": m.position_us, "x": at(x(&first, m.position_us), 0.0).0 })).collect::<Vec<_>>()).unwrap_or_default();
     json!({
@@ -355,6 +431,7 @@ fn timeline_geometry(win: &MainWindow, origin: (f64, f64)) -> Value {
         "clips": clips,
         "transitions": transitions,
         "markers": markers,
+        "tip": tip,
     })
 }
 
@@ -442,5 +519,26 @@ mod tests {
 
             assert!(found, "Icon '{icon}' must be present in bundled GResource");
         }
+    }
+
+    #[test]
+    fn control_socket_only_in_a_private_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // Not TMPDIR: a Unix socket path must stay under 108 bytes.
+        let dir = std::path::Path::new("/tmp").join(format!("tempo-ctl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(super::private_socket_path(&sock).is_ok());
+        // A stale socket is removed; any other file there is refused.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(super::private_socket_path(&sock).is_ok() && !sock.exists());
+        std::fs::write(&sock, b"").unwrap();
+        assert!(super::private_socket_path(&sock).is_err());
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::private_socket_path(&sock).is_err());
+        assert!(super::private_socket_path(std::path::Path::new("control.sock")).is_err());
+        std::fs::remove_dir(&dir).unwrap();
     }
 }
