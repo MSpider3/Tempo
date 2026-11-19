@@ -62,14 +62,27 @@ fn one_frame_us(fps: f64) -> i64 {
     (1_000_000.0 / fps) as i64
 }
 
+/// The frame a time is in, with the same rounding as `AppState::frame_floor`
+/// (a time within a tenth of a frame of the next frame counts as that frame).
+fn frame_count(us: i64, fps: RationalFps) -> i64 {
+    let (num, den) = (fps.num.max(1) as i128, fps.den.max(1) as i128);
+    ((us.max(0) as i128 * num * 10 + den * 1_000_000) / (den * 10_000_000)) as i64
+}
+
+/// The rate a new timeline will have: the project's, or the dropdown's when Use Project Settings is off.
+fn chosen_timeline_fps(use_project: bool, selected: RationalFps, project: RationalFps) -> RationalFps {
+    if use_project { project } else { selected }
+}
+
 /// Resolve shows a point marker's duration as one frame.
 fn shown_marker_duration_us(duration_us: i64, fps: f64) -> i64 {
     duration_us.max(one_frame_us(fps))
 }
 
-/// One frame or less stays a point marker (stored as 0); longer is stored as typed.
-fn stored_marker_duration_us(typed_us: i64, fps: f64) -> i64 {
-    if typed_us <= one_frame_us(fps) { 0 } else { typed_us }
+/// One frame or less (counted in whole frames, as `frame_floor` does) stays a point
+/// marker, stored as 0; longer is stored as `floored_us`.
+fn stored_marker_duration_us(typed_us: i64, floored_us: i64, fps: RationalFps) -> i64 {
+    if frame_count(typed_us, fps) <= 1 { 0 } else { floored_us }
 }
 
 pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject) + 'static) {
@@ -184,7 +197,8 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
             }
             // A duration that does not parse stays as it was.
             if let Some(us) = parse_timecode(&duration.text(), fps) {
-                edited.duration_us = stored_marker_duration_us(state.frame_floor(us), fps);
+                let rate = state.with_project(|p| p.timeline_fps()).unwrap_or(RationalFps::FPS_30);
+                edited.duration_us = stored_marker_duration_us(us, state.frame_floor(us), rate);
             }
             if edited != marker {
                 actions::update_marker(&state, edited);
@@ -257,7 +271,8 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     };
     let video = tracks("No. of Video Tracks");
     let audio = tracks("No. of Audio Tracks");
-    let fps = state.fps();
+    let project_rate = state.with_project(|p| p.fps).unwrap_or(RationalFps::FPS_30);
+    let fps = project_rate.to_f64();
     let start = gtk::Entry::builder().text(timecode(default_start_tc_us(fps), fps)).activates_default(true).build();
     let audio_type = gtk::DropDown::from_strings(&["Mono", "Stereo"]);
     audio_type.set_selected(1);
@@ -296,14 +311,21 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     dialog.set_default_response(Some("create"));
     dialog.set_close_response("cancel");
     let taken = state.with_project(|p| p.timeline_list()).unwrap_or_default();
+    // The rate the new timeline gets decides what the Start Timecode means.
+    let chosen_fps = {
+        let (use_project, rate) = (use_project.clone(), rate.clone());
+        move || chosen_timeline_fps(use_project.is_active(), RATES[rate.selected() as usize].1, project_fps).to_f64()
+    };
+    // The default follows the rate until the user types a different Start Timecode.
+    let default_start = Rc::new(std::cell::RefCell::new(start.text().to_string()));
     // Weak: the dialog owns the entry, so a strong ref here would keep both alive forever.
     let d = dialog.downgrade();
     let check = {
-        let (name, start) = (name.clone(), start.clone());
+        let (name, start, chosen_fps) = (name.clone(), start.clone(), chosen_fps.clone());
         move || {
             let typed = name.text().trim().to_lowercase();
             let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
-            let valid_start = parse_timecode(&start.text(), fps).is_some();
+            let valid_start = parse_timecode(&start.text(), chosen_fps()).is_some();
             if let Some(d) = d.upgrade() {
                 d.set_response_enabled("create", free && valid_start);
             }
@@ -311,13 +333,30 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     };
     let on_name = check.clone();
     name.connect_changed(move |_| on_name());
-    start.connect_changed(move |_| check());
+    let on_start = check.clone();
+    start.connect_changed(move |_| on_start());
+    let follow = {
+        let (start, chosen_fps, default_start) = (start.clone(), chosen_fps.clone(), default_start.clone());
+        move || {
+            let rate = chosen_fps();
+            if start.text() == default_start.borrow().as_str() {
+                let text = timecode(default_start_tc_us(rate), rate);
+                *default_start.borrow_mut() = text.clone();
+                start.set_text(&text);
+            }
+            check();
+        }
+    };
+    let on_switch = follow.clone();
+    use_project.connect_active_notify(move |_| on_switch());
+    rate.connect_selected_notify(move |_| follow());
     let state = state.clone();
     let field = name.clone();
     dialog.connect_response(Some("create"), move |_, _| {
         let typed = field.text().trim().to_string();
         let title = if typed.is_empty() { default.clone() } else { typed };
-        let start_tc_us = parse_timecode(&start.text(), fps).unwrap_or_else(|| default_start_tc_us(fps));
+        let new_fps = chosen_fps();
+        let start_tc_us = parse_timecode(&start.text(), new_fps).unwrap_or_else(|| default_start_tc_us(new_fps));
         let timeline_fps = (!use_project.is_active()).then(|| timeline_fps_choice(RATES[rate.selected() as usize].1, project_fps)).flatten();
         let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
         let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
@@ -844,7 +883,7 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
 
 #[cfg(test)]
 mod marker_time_tests {
-    use super::{default_start_tc_us, one_frame_us, parse_timecode, rate_index, shown_marker_duration_us, stored_marker_duration_us, timeline_fps_choice, timeline_from_form, typed_position_us, RATES};
+    use super::{chosen_timeline_fps, default_start_tc_us, frame_count, one_frame_us, parse_timecode, rate_index, shown_marker_duration_us, stored_marker_duration_us, timeline_fps_choice, timeline_from_form, typed_position_us, RATES};
     use tempo_timeline::{AudioTrackType, RationalFps, TrackKind};
 
     #[test]
@@ -855,18 +894,46 @@ mod marker_time_tests {
         assert_eq!(typed_position_us("00:59:59:00", 24.0, start), None);
     }
 
+    /// Every listed rate, as the dialogs see it.
+    fn all_rates() -> impl Iterator<Item = RationalFps> {
+        RATES.iter().map(|r| r.1)
+    }
+
+    /// `AppState::frame_floor` for a rate: the start of the frame a time is in.
+    fn frame_floor(us: i64, fps: RationalFps) -> i64 {
+        (frame_count(us, fps) as i128 * fps.den as i128 * 1_000_000 + fps.num as i128 / 2).div_euclid(fps.num as i128) as i64
+    }
+
     #[test]
     fn point_marker_shows_one_frame_and_one_frame_stores_as_point() {
-        for fps in [24.0, 29.97, 59.94] {
+        for rate in all_rates() {
+            let fps = rate.to_f64();
             let one = one_frame_us(fps);
             assert_eq!(shown_marker_duration_us(0, fps), one);
             assert_eq!(shown_marker_duration_us(one * 5, fps), one * 5);
-            assert_eq!(crate::state::timecode(shown_marker_duration_us(0, fps), fps), "00:00:00:01");
-            assert_eq!(stored_marker_duration_us(parse_timecode("00:00:00:01", fps).unwrap(), fps), 0);
-            assert_eq!(stored_marker_duration_us(0, fps), 0);
+            assert_eq!(crate::state::timecode(shown_marker_duration_us(0, fps), fps), "00:00:00:01", "{fps}");
+            // Renaming a point marker re-parses its shown duration and must keep it a point.
+            let typed = parse_timecode("00:00:00:01", fps).unwrap();
+            assert_eq!(stored_marker_duration_us(typed, frame_floor(typed, rate), rate), 0, "{fps}");
+            assert_eq!(stored_marker_duration_us(0, 0, rate), 0, "{fps}");
             let two = parse_timecode("00:00:00:02", fps).unwrap();
-            assert_eq!(stored_marker_duration_us(two, fps), two);
+            assert_eq!(stored_marker_duration_us(two, frame_floor(two, rate), rate), frame_floor(two, rate), "{fps}");
         }
+    }
+
+    #[test]
+    fn start_timecode_is_read_at_the_new_timelines_rate() {
+        let (project, selected) = (RationalFps::FPS_30, RationalFps::FPS_25);
+        assert_eq!(chosen_timeline_fps(true, selected, project), project);
+        assert_eq!(chosen_timeline_fps(false, selected, project), selected);
+        for rate in [RationalFps::FPS_29_97, RationalFps::FPS_23_976] {
+            let fps = chosen_timeline_fps(false, rate, project).to_f64();
+            assert_eq!(crate::state::timecode(default_start_tc_us(fps), fps), "01:00:00:00");
+        }
+        let at25 = chosen_timeline_fps(false, selected, project).to_f64();
+        assert_eq!(parse_timecode("01:00:00:27", at25), None);
+        let us = parse_timecode("01:00:00:12", at25).unwrap();
+        assert_eq!(crate::state::timecode(us, at25), "01:00:00:12");
     }
 
     #[test]
