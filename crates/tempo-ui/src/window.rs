@@ -30,7 +30,7 @@ const AUTOSAVE_CHECK_SECONDS: u32 = 30;
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
-    state: Rc<AppState>,
+    pub(crate) state: Rc<AppState>,
     root: gtk::Stack,
     toasts: adw::ToastOverlay,
     project_view: adw::ToolbarView,
@@ -38,7 +38,7 @@ pub struct MainWindow {
     viewer: Rc<Viewer>,
     /// The second viewer of dual-viewer mode, made the first time it is switched on.
     source_viewer: std::cell::RefCell<Option<Rc<Viewer>>>,
-    edit: Rc<EditPage>,
+    pub(crate) edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
     plugins: Rc<Plugins>,
