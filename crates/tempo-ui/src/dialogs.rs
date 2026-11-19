@@ -11,7 +11,7 @@ use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetCli
 
 use crate::actions;
 use crate::keybinds;
-use crate::state::AppState;
+use crate::state::{timecode, AppState};
 use crate::util::label;
 
 fn form_grid() -> gtk::Grid {
@@ -106,13 +106,24 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
     let color = gtk::DropDown::from_strings(&MARKER_COLORS.map(|c| c.0));
     color.set_selected(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0) as u32);
 
+    let fps = state.fps();
+    let time = gtk::Entry::builder().text(timecode(marker.position_us, fps)).activates_default(true).build();
+    let frame_us = state.frame_us();
+    let duration = gtk::SpinButton::with_range(0.0, 1_000_000.0, 1.0);
+    duration.set_value((marker.duration_us / frame_us) as f64);
+    duration.set_activates_default(true);
+    duration.set_tooltip_text(Some("Length in frames; 0 marks a single frame"));
+    duration.update_property(&[gtk::accessible::Property::Label("Duration in frames")]);
+
     let grid = form_grid();
-    form_row(&grid, 0, "Name", &name);
-    form_row(&grid, 1, "Colour", &color);
-    form_row(&grid, 2, "Note", &note);
+    form_row(&grid, 0, "Time", &time);
+    form_row(&grid, 1, "Duration", &duration);
+    form_row(&grid, 2, "Name", &name);
+    form_row(&grid, 3, "Colour", &color);
+    form_row(&grid, 4, "Note", &note);
     let hint = label("Named markers become chapters when you export.", &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
-    grid.attach(&hint, 1, 3, 1, 1);
+    grid.attach(&hint, 1, 5, 1, 1);
 
     let dialog = adw::AlertDialog::builder().heading("Marker").extra_child(&grid).build();
     dialog.add_responses(&[("remove", "Remove Marker"), ("cancel", "Cancel"), ("done", "Done")]);
@@ -127,6 +138,11 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
             edited.name = name.text().trim().to_string();
             edited.note = note.text().trim().to_string();
             edited.color = MARKER_COLORS[color.selected() as usize].1;
+            // A time that does not parse leaves the marker where it was.
+            if let Some(us) = parse_timecode(&time.text(), fps) {
+                edited.position_us = state.frame_floor(us);
+            }
+            edited.duration_us = duration.value_as_int().max(0) as i64 * frame_us;
             if edited != marker {
                 actions::update_marker(&state, edited);
             }
@@ -140,6 +156,24 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
         _ => {}
     });
     dialog.present(Some(parent));
+}
+
+/// `HH:MM:SS:FF` (also `MM:SS:FF` or `SS:FF`, `;` as well as `:`) to microseconds.
+/// None when it is malformed or the frames are past the frame rate.
+fn parse_timecode(text: &str, fps: f64) -> Option<i64> {
+    let fps_i = fps.round().max(1.0) as i64;
+    let mut parts: Vec<i64> = text.trim().split([':', ';']).map(|p| p.trim().parse::<i64>().ok().filter(|n| *n >= 0)).collect::<Option<_>>()?;
+    if parts.len() < 2 || parts.len() > 4 {
+        return None;
+    }
+    // Right to left: frames, seconds, minutes, hours.
+    parts.reverse();
+    let frames = parts[0];
+    if frames >= fps_i || parts.get(1).is_some_and(|s| *s >= 60) || parts.get(2).is_some_and(|m| *m >= 60) {
+        return None;
+    }
+    let secs = parts[1] + parts.get(2).unwrap_or(&0) * 60 + parts.get(3).unwrap_or(&0) * 3600;
+    Some(((secs * fps_i + frames) as f64 * 1_000_000.0 / fps) as i64)
 }
 
 /// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
@@ -702,4 +736,26 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
         });
     });
     dialog.present(Some(parent.as_ref()));
+}
+
+#[cfg(test)]
+mod marker_time_tests {
+    use super::parse_timecode;
+
+    #[test]
+    fn timecode_text_reads_back() {
+        assert_eq!(parse_timecode("00:00:01:00", 24.0), Some(1_000_000));
+        assert_eq!(parse_timecode("01:00:00:00", 25.0), Some(3_600_000_000));
+        assert_eq!(parse_timecode("1:12", 24.0), Some(1_500_000));
+        assert_eq!(parse_timecode("00:00:00;05", 25.0), Some(200_000));
+    }
+
+    #[test]
+    fn bad_timecode_is_refused() {
+        assert_eq!(parse_timecode("abc", 24.0), None);
+        assert_eq!(parse_timecode("00:00:00:24", 24.0), None);
+        assert_eq!(parse_timecode("00:75:00:00", 24.0), None);
+        assert_eq!(parse_timecode("-1:00", 24.0), None);
+        assert_eq!(parse_timecode("5", 24.0), None);
+    }
 }
