@@ -889,7 +889,7 @@ impl Project {
     /// "Timeline N" with the first N no timeline uses yet.
     pub fn next_timeline_name(&self) -> String {
         let names = self.timeline_list();
-        (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n == c)).unwrap_or_default()
+        (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n.eq_ignore_ascii_case(c))).unwrap_or_default()
     }
 
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: RationalFps) -> Self {
@@ -1504,6 +1504,13 @@ mod tests {
         let mut p = project();
         assert_eq!(p.next_timeline_name(), "Timeline 2");
         p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 3");
+    }
+
+    #[test]
+    fn next_timeline_name_ignores_case() {
+        let mut p = project();
+        p.add_timeline(Timeline::with_tracks("timeline 2", 1, 1));
         assert_eq!(p.next_timeline_name(), "Timeline 3");
     }
 
