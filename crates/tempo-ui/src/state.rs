@@ -18,6 +18,8 @@ pub enum Change {
     Timeline,
     /// The Media Pool changed.
     Media,
+    /// Timelines were renamed, duplicated or removed (Media Pool, viewer menu).
+    Timelines,
     /// A different clip (or nothing) is selected.
     Selection,
     /// Tool, snapping, destination tracks, In/Out marks.
@@ -277,6 +279,37 @@ impl AppState {
         }
         self.switched_timeline(from);
         self.set_dirty(true);
+    }
+
+    /// Renames timeline `id`; false when the name is blank or taken.
+    pub fn rename_timeline(&self, id: Uuid, name: &str) -> bool {
+        let done = self.project.borrow_mut().as_mut().is_some_and(|p| p.rename_timeline(id, name));
+        if done {
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        done
+    }
+
+    /// Copies timeline `id` as "<name> Copy" without opening it.
+    pub fn duplicate_timeline(&self, id: Uuid) -> Option<Uuid> {
+        let copy = self.project.borrow_mut().as_mut().and_then(|p| p.duplicate_timeline(id));
+        if copy.is_some() {
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        copy
+    }
+
+    /// Deletes timeline `id` (never the open one) and its parked undo history.
+    pub fn remove_timeline(&self, id: Uuid) -> bool {
+        let done = self.project.borrow_mut().as_mut().is_some_and(|p| p.remove_timeline(id));
+        if done {
+            self.parked_logs.borrow_mut().remove(&id);
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        done
     }
 
     /// After another timeline was opened: swap undo histories and start it from the top.

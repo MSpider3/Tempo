@@ -260,3 +260,5 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .tempo scrollbar { background: none; }
 .tempo scrollbar slider { background-color: @tempo_line_button; min-width: 6px; min-height: 6px; }
 .empty-hint { color: @tempo_text_dim; }
+
+.tempo .media-thumb.pool-open-timeline { border: 2px solid @tempo_accent; }

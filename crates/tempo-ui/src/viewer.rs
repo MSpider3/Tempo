@@ -261,6 +261,9 @@ impl Viewer {
                     v.refresh();
                 }
             }
+            if matches!(change, Change::Timelines) {
+                v.refresh();
+            }
             if matches!(change, Change::Project | Change::Timeline | Change::Media) {
                 v.update_marker_box();
                 v.refresh();
