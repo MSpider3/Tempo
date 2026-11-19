@@ -55,6 +55,8 @@ enum Status {
 
 struct Job {
     name: String,
+    /// "<project> | <timeline>", as Resolve's Deliver queue shows it.
+    label: String,
     format: String,
     settings: TimelineExport,
     project: Arc<Project>,
@@ -266,7 +268,7 @@ impl ExportPage {
     }
 
     fn load_defaults(self: &Rc<Self>) {
-        let name = self.state.with_project(|p| p.name.clone()).unwrap_or_default();
+        let name = self.state.with_project(default_file_name).unwrap_or_default();
         self.file_name.set_text(&name);
         if self.location.text().is_empty() {
             let dir = glib::user_special_dir(glib::UserDirectory::Videos).unwrap_or_else(glib::home_dir);
@@ -353,7 +355,7 @@ impl ExportPage {
         };
         let (r0, r1) = range.unwrap_or((0, timeline_end));
         let name = self.file_name.text().trim().to_string();
-        let name = if name.is_empty() { project.name.clone() } else { name };
+        let name = if name.is_empty() { default_file_name(&project) } else { name };
         let f = &FORMATS[self.format_index.get()];
         let (_, crf, mut audio_kbps) = QUALITIES[self.quality.selected() as usize];
         let (mut width, mut height, mut max_video_kbps) = (f.width, f.height, None);
@@ -395,6 +397,7 @@ impl ExportPage {
             max_video_kbps,
         };
         self.jobs.borrow_mut().push(Job {
+            label: job_label(&project),
             name,
             format: format!("{} · {} × {}", f.ratio, width, height),
             settings,
@@ -514,7 +517,7 @@ impl ExportPage {
             .borrow()
             .iter()
             .find(|j| j.status == Status::Rendering)
-            .map(|j| format!("Rendering {} — {}%", j.name, j.progress.load(Ordering::Relaxed) / 10));
+            .map(|j| format!("Rendering {} — {}%", j.label, j.progress.load(Ordering::Relaxed) / 10));
         if let Some(f) = self.activity.borrow().as_ref() {
             f(text);
         }
@@ -579,7 +582,7 @@ impl ExportPage {
         card.append(&header);
 
         let body = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).margin_top(8).margin_bottom(8).margin_start(10).margin_end(10).build();
-        let name = label(&job.name, &["tempo-heading", "tempo-bright"]);
+        let name = label(&job.label, &["tempo-heading", "tempo-bright"]);
         name.set_xalign(0.0);
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         body.append(&name);
@@ -762,6 +765,15 @@ fn find_descendant<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
         child = c.next_sibling();
     }
     None
+}
+
+fn job_label(p: &Project) -> String {
+    format!("{} | {}", p.name, p.timeline.name)
+}
+
+/// With several timelines the timeline name is added so two jobs do not default to one file.
+fn default_file_name(p: &Project) -> String {
+    if p.timelines.is_empty() { p.name.clone() } else { format!("{} {}", p.name, p.timeline.name) }
 }
 
 fn find_named_label(root: &gtk::Widget, name: &str) -> Option<gtk::Label> {
