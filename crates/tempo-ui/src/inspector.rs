@@ -712,10 +712,36 @@ fn graph_value(x: f64, y: f64, w: f64, h: f64) -> (f32, f32) {
     (u.clamp(0.0, 1.0) as f32, v.clamp(0.0, 1.0) as f32)
 }
 
+/// Where a key value lands on the graph: the mix runs from Start Ratio to End Ratio.
+fn to_level(v: f32, (start, end): (f32, f32)) -> f32 {
+    start + (end - start) * v
+}
+
+/// The key value that sits at graph `level`; `fallback` when the ratios are equal (the
+/// level then says nothing about the value).
+fn from_level(level: f32, (start, end): (f32, f32), fallback: f32) -> f32 {
+    if (end - start).abs() < 1e-4 { fallback } else { ((level - start) / (end - start)).clamp(0.0, 1.0) }
+}
+
+/// The curve as drawn: `steps + 1` (place, level) samples of what playback mixes.
+fn sample_drawn_curve(t: &Transition, steps: usize) -> Vec<(f32, f32)> {
+    (0..=steps).map(|i| i as f32 / steps as f32).map(|u| (u, t.progress_at(u))).collect()
+}
+
+thread_local! {
+    /// The selected curve key per transition, kept across the panel rebuild an edit causes.
+    static KEPT_KEY: Cell<Option<(TransitionRef, usize)>> = const { Cell::new(None) };
+}
+
+/// The kept key for `sel` if it still exists among `len` keys.
+fn kept_selection<R: PartialEq>(kept: Option<(R, usize)>, sel: &R, len: usize) -> Option<usize> {
+    kept.filter(|(r, i)| r == sel && *i < len).map(|(_, i)| i)
+}
+
 /// The key nearest to the pixel, if within reach.
-fn hit_key(keys: &[[f32; 2]], x: f64, y: f64, w: f64, h: f64) -> Option<usize> {
+fn hit_key(keys: &[[f32; 2]], levels: (f32, f32), x: f64, y: f64, w: f64, h: f64) -> Option<usize> {
     let dist = |k: &[f32; 2]| {
-        let (kx, ky) = graph_point(k[0], k[1], w, h);
+        let (kx, ky) = graph_point(k[0], to_level(k[1], levels), w, h);
         (kx - x).hypot(ky - y)
     };
     keys.iter().enumerate().map(|(i, k)| (i, dist(k))).filter(|(_, d)| *d <= KEY_HIT_PX).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
@@ -765,7 +791,15 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
     area.set_tooltip_text(Some("Drag a key to move it. Double-click to add one. Right-click or Delete removes the selected key."));
     area.update_property(&[gtk::accessible::Property::Label("Transition curve graph")]);
     let shape = Rc::new(RefCell::new(t.clone()));
-    let selected: Rc<Cell<Option<usize>>> = Rc::default();
+    let selected: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(kept_selection(KEPT_KEY.get(), &sel, t.curve.len())));
+    let levels = (t.start_ratio, t.end_ratio);
+    let select = {
+        let selected = selected.clone();
+        move |i: Option<usize>| {
+            selected.set(i);
+            KEPT_KEY.set(i.map(|i| (sel, i)));
+        }
+    };
     let size = |a: &gtk::DrawingArea| (f64::from(a.width()), f64::from(a.height()));
 
     let (sh, selected_draw, s) = (shape.clone(), selected.clone(), state.clone());
@@ -785,6 +819,15 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
         cr.rectangle(x0, y0, x1 - x0, y1 - y0);
         let _ = cr.stroke();
         let shape = sh.borrow();
+        // Faint guides at Start and End Ratio.
+        cr.set_dash(&[3.0, 3.0], 0.0);
+        for ratio in [shape.start_ratio, shape.end_ratio] {
+            let (_, y) = graph_point(0.0, ratio, w, h);
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            let _ = cr.stroke();
+        }
+        cr.set_dash(&[], 0.0);
         if let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) {
             paint("tempo_accent");
             let (px, _) = graph_point(u, 0.0, w, h);
@@ -794,14 +837,13 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
         }
         paint("tempo_text");
         cr.set_line_width(2.0);
-        for i in 0..=64 {
-            let u = i as f32 / 64.0;
-            let (x, y) = graph_point(u, shape.curve_at(u), w, h);
+        for (i, (u, level)) in sample_drawn_curve(&shape, 64).into_iter().enumerate() {
+            let (x, y) = graph_point(u, level, w, h);
             if i == 0 { cr.move_to(x, y) } else { cr.line_to(x, y) }
         }
         let _ = cr.stroke();
         for (i, k) in shape.curve.iter().enumerate() {
-            let (x, y) = graph_point(k[0], k[1], w, h);
+            let (x, y) = graph_point(k[0], to_level(k[1], (shape.start_ratio, shape.end_ratio)), w, h);
             paint(if selected_draw.get() == Some(i) { "tempo_accent" } else { "tempo_text_bright" });
             cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
@@ -828,12 +870,12 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
     // Drag a key; commit on release.
     let drag = gtk::GestureDrag::builder().button(1).build();
     let moving: Rc<Cell<Option<(usize, f64, f64)>>> = Rc::default();
-    let (sh, mv, selected_c, a) = (shape.clone(), moving.clone(), selected.clone(), area.clone());
+    let (sh, mv, select_c, a) = (shape.clone(), moving.clone(), select.clone(), area.clone());
     drag.connect_drag_begin(move |_, x, y| {
         let (w, h) = size(&a);
-        let hit = hit_key(&sh.borrow().curve, x, y, w, h);
+        let hit = hit_key(&sh.borrow().curve, levels, x, y, w, h);
         mv.set(hit.map(|i| (i, x, y)));
-        selected_c.set(hit);
+        select_c(hit);
         a.grab_focus();
         a.queue_draw();
     });
@@ -841,8 +883,9 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
     drag.connect_drag_update(move |_, dx, dy| {
         let Some((i, x, y)) = mv.get() else { return };
         let (w, h) = size(&a);
-        let (u, v) = graph_value(x + dx, y + dy, w, h);
-        let moved = move_key(&sh.borrow().curve, i, u, v);
+        let (u, level) = graph_value(x + dx, y + dy, w, h);
+        let old = sh.borrow().curve.get(i).map_or(0.0, |k| k[1]);
+        let moved = move_key(&sh.borrow().curve, i, u, from_level(level, levels, old));
         sh.borrow_mut().curve = moved;
         a.queue_draw();
     });
@@ -858,16 +901,17 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
 
     // Double-click on empty space adds a key on the curve there.
     let click = gtk::GestureClick::builder().button(1).build();
-    let (sh, a, commit_add) = (shape.clone(), area.clone(), commit.clone());
+    let (sh, a, commit_add, select_a) = (shape.clone(), area.clone(), commit.clone(), select.clone());
     click.connect_pressed(move |_, presses, x, y| {
         let (w, h) = size(&a);
         let shape = sh.borrow();
-        if presses != 2 || hit_key(&shape.curve, x, y, w, h).is_some() {
+        if presses != 2 || hit_key(&shape.curve, levels, x, y, w, h).is_some() {
             return;
         }
         let (u, _) = graph_value(x, y, w, h);
         if let Some(keys) = add_key(&shape.curve, u, shape.curve_at(u)) {
             drop(shape);
+            select_a(None);
             commit_add(keys);
         }
     });
@@ -875,11 +919,12 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
 
     // Right-click on a key removes it.
     let right = gtk::GestureClick::builder().button(3).build();
-    let (sh, a, commit_remove) = (shape.clone(), area.clone(), commit.clone());
+    let (sh, a, commit_remove, select_r) = (shape.clone(), area.clone(), commit.clone(), select.clone());
     right.connect_pressed(move |_, _, x, y| {
         let (w, h) = size(&a);
-        let hit = hit_key(&sh.borrow().curve, x, y, w, h);
+        let hit = hit_key(&sh.borrow().curve, levels, x, y, w, h);
         if let Some(i) = hit {
+            select_r(None);
             let mut keys = sh.borrow().curve.clone();
             keys.remove(i);
             commit_remove(keys);
@@ -896,7 +941,7 @@ fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk:
         let mut keys = sh.borrow().curve.clone();
         if i < keys.len() {
             keys.remove(i);
-            selected.set(None);
+            select(None);
             commit(keys);
         }
         glib::Propagation::Stop
@@ -962,12 +1007,52 @@ mod tests {
     }
 
     #[test]
+    fn drawn_curve_runs_from_start_ratio_to_end_ratio() {
+        let t = Transition { start_ratio: 0.2, end_ratio: 0.6, ..Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::CrossDissolve, 1, TransitionAlignment::Centered) };
+        let drawn = sample_drawn_curve(&t, 4);
+        assert_eq!(drawn.len(), 5);
+        assert!((drawn[0].1 - 0.2).abs() < 1e-6 && (drawn[2].1 - 0.4).abs() < 1e-6 && (drawn[4].1 - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn key_levels_round_trip_through_the_ratios_and_flat_ratios_keep_the_value() {
+        assert!((to_level(0.5, (0.2, 0.6)) - 0.4).abs() < 1e-6);
+        assert!((from_level(0.4, (0.2, 0.6), 0.9) - 0.5).abs() < 1e-6);
+        assert_eq!(from_level(0.4, (0.3, 0.3), 0.9), 0.9);
+        assert_eq!(from_level(0.0, (0.2, 0.6), 0.9), 0.0);
+    }
+
+    #[test]
+    fn hit_key_finds_a_key_drawn_at_its_ratio_level() {
+        let keys = [[0.5, 0.8]];
+        let (x, y) = graph_point(0.5, 0.4, 220.0, 110.0);
+        assert_eq!(hit_key(&keys, (0.0, 0.5), x, y, 220.0, 110.0), Some(0));
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x, y, 220.0, 110.0), None);
+    }
+
+    #[test]
+    fn selection_is_kept_for_the_same_transition_only_and_while_the_key_exists() {
+        assert_eq!(kept_selection(Some((1, 2)), &1, 3), Some(2));
+        assert_eq!(kept_selection(Some((1, 2)), &9, 3), None);
+        assert_eq!(kept_selection(Some((1, 2)), &1, 2), None);
+        assert_eq!(kept_selection::<i32>(None, &1, 3), None);
+    }
+
+    #[test]
+    fn a_moved_key_keeps_its_index_so_the_kept_selection_still_points_at_it() {
+        let keys = [[0.2, 0.3], [0.8, 0.7]];
+        let moved = move_key(&keys, 0, 0.5, 0.9);
+        assert_eq!(kept_selection(Some((7, 0)), &7, moved.len()), Some(0));
+        assert_eq!(moved[0], [0.5, 0.9]);
+    }
+
+    #[test]
     fn hit_key_picks_the_nearest_key_within_reach() {
         let keys = [[0.25, 0.5], [0.75, 0.5]];
         let (x, y) = graph_point(0.75, 0.5, 220.0, 110.0);
-        assert_eq!(hit_key(&keys, x + 3.0, y - 2.0, 220.0, 110.0), Some(1));
-        assert_eq!(hit_key(&keys, x + 30.0, y, 220.0, 110.0), None);
-        assert_eq!(hit_key(&[], x, y, 220.0, 110.0), None);
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x + 3.0, y - 2.0, 220.0, 110.0), Some(1));
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x + 30.0, y, 220.0, 110.0), None);
+        assert_eq!(hit_key(&[], (0.0, 1.0), x, y, 220.0, 110.0), None);
     }
 
     #[test]
