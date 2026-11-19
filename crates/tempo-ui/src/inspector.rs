@@ -390,7 +390,7 @@ impl Inspector {
         if video {
             Self::ratio_row(&grid, 5, "Start Ratio", t.start_ratio, sel, state, |t, r| t.start_ratio = r);
             Self::ratio_row(&grid, 6, "End Ratio", t.end_ratio, sel, state, |t, r| t.end_ratio = r);
-            Self::ease_row(&grid, 7, t.ease, sel, state);
+            Self::ease_row(&grid, 7, t, sel, state);
             Self::curve_row(&grid, 8, t, sel, state);
         }
         if video && t.kind == TransitionKind::DipToColor {
@@ -420,11 +420,16 @@ impl Inspector {
         grid.attach(&spin, 1, row, 1, 1);
     }
 
-    fn ease_row(grid: &gtk::Grid, row: i32, ease: TransitionEase, sel: TransitionRef, state: &Rc<AppState>) {
+    fn ease_row(grid: &gtk::Grid, row: i32, t: &Transition, sel: TransitionRef, state: &Rc<AppState>) {
         const EASES: [TransitionEase; 4] = [TransitionEase::None, TransitionEase::In, TransitionEase::Out, TransitionEase::InOut];
         Self::row_label(grid, row, "Ease");
         let drop = gtk::DropDown::from_strings(&["None", "In", "Out", "In & Out"]);
-        drop.set_selected(EASES.iter().position(|e| *e == ease).unwrap_or(0) as u32);
+        drop.set_selected(EASES.iter().position(|e| *e == t.ease).unwrap_or(0) as u32);
+        // Curve keys set the shape; the panel is rebuilt after Reset Curve, which re-enables this.
+        if !t.curve.is_empty() {
+            drop.set_sensitive(false);
+            drop.set_tooltip_text(Some("The curve keys set the shape. Reset the curve to use Ease."));
+        }
         let s = state.clone();
         drop.connect_selected_notify(move |d| {
             let ease = EASES.get(d.selected() as usize).copied().unwrap_or_default();
