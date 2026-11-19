@@ -262,7 +262,7 @@ impl AppState {
     fn switched_timeline(&self, from: Option<Uuid>) {
         self.player.pause();
         let to = self.with_timeline(|t| t.id);
-        let log = to.and_then(|id| self.parked_logs.borrow_mut().remove(&id)).unwrap_or_else(CommandLog::new);
+        let log = to.and_then(|id| self.parked_logs.borrow_mut().remove(&id)).unwrap_or_default();
         let old = self.log.replace(log);
         if let Some(from) = from {
             self.parked_logs.borrow_mut().insert(from, old);
