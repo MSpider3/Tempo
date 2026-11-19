@@ -13,6 +13,20 @@ use crate::state::{timecode, AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
 
+const MARKER_CLASSES: [&str; 6] = ["marker-blue", "marker-green", "marker-yellow", "marker-red", "marker-orange", "marker-purple"];
+
+fn marker_class(color: tempo_timeline::MarkerColor) -> &'static str {
+    use tempo_timeline::MarkerColor as C;
+    match color {
+        C::Blue => MARKER_CLASSES[0],
+        C::Green => MARKER_CLASSES[1],
+        C::Yellow => MARKER_CLASSES[2],
+        C::Red => MARKER_CLASSES[3],
+        C::Orange => MARKER_CLASSES[4],
+        C::Purple => MARKER_CLASSES[5],
+    }
+}
+
 pub struct Viewer {
     pub root: gtk::Box,
     pub surface: VideoSurface,
@@ -28,6 +42,9 @@ pub struct Viewer {
     /// The name above the picture: in timeline mode, a menu of the project's timelines.
     switcher: gtk::MenuButton,
     proxy_badge: gtk::Label,
+    /// Resolve's box over the picture while the playhead is parked on a marker.
+    marker_box: gtk::Box,
+    marker_lines: [gtk::Label; 3],
     /// Shown while a Media Pool clip is in the viewer: the way back.
     back: gtk::Button,
     scrub: gtk::Scale,
@@ -103,6 +120,14 @@ impl Viewer {
         proxy_badge.set_visible(false);
         let overlay = gtk::Overlay::builder().child(&surface).css_classes(["viewer-surround"]).build();
         overlay.add_overlay(&proxy_badge);
+        let marker_lines = [label("", &[]), label("", &[]), label("", &[])];
+        let marker_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).halign(gtk::Align::Start).valign(gtk::Align::Start).can_target(false).visible(false).build();
+        marker_box.add_css_class("marker-overlay");
+        for l in &marker_lines {
+            l.set_xalign(0.0);
+            marker_box.append(l);
+        }
+        overlay.add_overlay(&marker_box);
         root.append(&overlay);
 
         // Scrub bar.
@@ -146,6 +171,8 @@ impl Viewer {
             name,
             switcher,
             proxy_badge,
+            marker_box,
+            marker_lines,
             back,
             scrub,
             play,
@@ -205,6 +232,7 @@ impl Viewer {
             let pos = player.position_us();
             if pos != last_pos.replace(pos) {
                 tc.set_text(&timecode(pos, v.state.fps()));
+                v.update_marker_box();
                 v.scrub.set_value(pos as f64);
                 for l in v.position_listeners.borrow().iter() {
                     l(pos);
@@ -212,6 +240,7 @@ impl Viewer {
             }
             let playing = player.is_playing();
             if playing != last_playing.replace(playing) {
+                v.update_marker_box();
                 v.play.set_icon_name(if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" });
             }
             glib::ControlFlow::Continue
@@ -233,11 +262,31 @@ impl Viewer {
                 }
             }
             if matches!(change, Change::Project | Change::Timeline | Change::Media) {
+                v.update_marker_box();
                 v.refresh();
             }
         });
         viewer.refresh();
         viewer
+    }
+
+    /// Show "Time" and "Name" over the picture while the playhead rests on a marker.
+    fn update_marker_box(&self) {
+        let marker = (!self.source_only && !self.player.is_playing() && !self.state.source_mode()).then(|| crate::actions::marker_at_playhead(&self.state)).flatten();
+        for class in MARKER_CLASSES {
+            self.marker_box.remove_css_class(class);
+        }
+        let Some(m) = marker else {
+            self.marker_box.set_visible(false);
+            return;
+        };
+        self.marker_box.add_css_class(marker_class(m.color));
+        let [time, name, note] = &self.marker_lines;
+        time.set_text(&format!("Time {}", timecode(m.position_us, self.state.fps())));
+        name.set_text(&format!("Name {}", m.name));
+        note.set_text(&format!("Note {}", m.note));
+        note.set_visible(!m.note.is_empty());
+        self.marker_box.set_visible(true);
     }
 
     /// Called with the playhead position whenever it moves.

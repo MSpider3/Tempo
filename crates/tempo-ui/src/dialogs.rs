@@ -98,7 +98,10 @@ const MARKER_COLORS: [(&str, MarkerColor); 6] = [
 
 /// Edit a marker's name, colour and note.
 pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker: Marker) {
-    let name = gtk::Entry::builder().text(&marker.name).activates_default(true).build();
+    // An unnamed marker gets "Marker N" as in Resolve, and keeps it when the dialog is closed with Esc.
+    let others = state.with_timeline(|t| t.markers.iter().filter(|m| m.id != marker.id).cloned().collect::<Vec<_>>()).unwrap_or_default();
+    let default_name = if marker.name.is_empty() { actions::default_marker_name(&others) } else { marker.name.clone() };
+    let name = gtk::Entry::builder().text(&default_name).activates_default(true).build();
     let note = gtk::Entry::builder().text(&marker.note).activates_default(true).build();
     let color = gtk::DropDown::from_strings(&MARKER_COLORS.map(|c| c.0));
     color.set_selected(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0) as u32);
@@ -128,6 +131,12 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
                 actions::update_marker(&state, edited);
             }
         }
+        // Esc or Cancel: the marker stays, with its default name if it had none.
+        _ if marker.name.is_empty() => {
+            let mut named = marker.clone();
+            named.name = default_name.clone();
+            actions::update_marker(&state, named);
+        }
         _ => {}
     });
     dialog.present(Some(parent));
@@ -149,6 +158,10 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     form_row(&grid, 0, "Timeline Name", &name);
     form_row(&grid, 1, "No. of Video Tracks", &video);
     form_row(&grid, 2, "No. of Audio Tracks", &audio);
+    // On: an empty timeline. Off: it starts with the clip picked in the Media Pool.
+    let empty = gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
+    empty.set_tooltip_text(Some("Turn off to start the timeline with the clip selected in the Media Pool"));
+    form_row(&grid, 3, "Empty Timeline", &empty);
 
     let dialog = adw::AlertDialog::builder().heading("Create New Timeline").extra_child(&grid).build();
     dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
@@ -171,6 +184,12 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         let typed = field.text().trim().to_string();
         let title = if typed.is_empty() { default.clone() } else { typed };
         state.add_timeline(Timeline::with_tracks(title, video.value_as_int() as u32, audio.value_as_int() as u32));
+        if !empty.is_active() {
+            match state.media_selection.get() {
+                Some(source) => actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None),
+                None => state.message("No clip is selected in the Media Pool, so the timeline is empty."),
+            }
+        }
     });
     dialog.present(Some(parent));
     name.grab_focus();
