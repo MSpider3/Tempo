@@ -455,19 +455,60 @@ pub fn selected_transition(state: &AppState) -> Option<(Uuid, Transition)> {
 /// `template` fitted to the edit at `position_us` on a track (see `fit_transition`), or
 /// why it cannot go there.
 fn placed_transition(state: &AppState, track_id: Uuid, position_us: i64, template: &Transition) -> Result<Transition, &'static str> {
-    state
-        .with_project(|p| {
-            let track = p.timeline.find_track(track_id).ok_or("That track is no longer there.")?;
-            if track.locked {
-                return Err("That track is locked. Click its lock in the track header to edit it.");
+    state.with_project(|p| place_on(&p.timeline, &p.sources, p.fps, track_id, position_us, template)).unwrap_or(Err("Open a project first."))
+}
+
+fn place_on(
+    timeline: &Timeline,
+    sources: &HashMap<Uuid, MediaSource>,
+    fps: RationalFps,
+    track_id: Uuid,
+    position_us: i64,
+    template: &Transition,
+) -> Result<Transition, &'static str> {
+    let track = timeline.find_track(track_id).ok_or("That track is no longer there.")?;
+    if track.locked {
+        return Err("That track is locked. Click its lock in the track header to edit it.");
+    }
+    if is_audio_kind(&template.kind) != (track.kind == TrackKind::Audio) {
+        return Err(if track.kind == TrackKind::Audio { "Video transitions go on video tracks." } else { "Audio transitions go on audio tracks." });
+    }
+    let edit = track.edit_at(position_us).ok_or("There is no edit point there.")?;
+    fit_transition(track, &edit, template, sources, fps)
+}
+
+/// The standard transitions for Add Transition, one per free edit, each fitted with the
+/// ones before it already in place, so a short clip's two transitions share its length.
+/// Returns them with the reason the last refused edit gave, if any.
+fn fill_edits(
+    timeline: &Timeline,
+    sources: &HashMap<Uuid, MediaSource>,
+    fps: RationalFps,
+    edits: &[(Uuid, i64, TransitionKind)],
+) -> (Vec<(Uuid, Transition)>, Option<&'static str>) {
+    let mut scratch = timeline.clone();
+    let (mut placed, mut why) = (Vec::new(), None);
+    for (track_id, position, kind) in edits {
+        // No second transition on an edit that has one.
+        let taken = scratch.find_track(*track_id).and_then(|track| {
+            let edit = track.edit_at(*position)?;
+            Some(track.transition_at_edit(edit.clip_id, edit.edge).is_some())
+        });
+        if taken != Some(false) {
+            why = Some("There is already a transition there.");
+            continue;
+        }
+        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind.clone(), STANDARD_TRANSITION_US, TransitionAlignment::Centered);
+        match place_on(&scratch, sources, fps, *track_id, *position, &template) {
+            Ok(t) => {
+                if SetTransitionCommand::set(*track_id, t.clone()).execute(&mut scratch).is_ok() {
+                    placed.push((*track_id, t));
+                }
             }
-            if is_audio_kind(&template.kind) != (track.kind == TrackKind::Audio) {
-                return Err(if track.kind == TrackKind::Audio { "Video transitions go on video tracks." } else { "Audio transitions go on audio tracks." });
-            }
-            let edit = track.edit_at(position_us).ok_or("There is no edit point there.")?;
-            fit_transition(track, &edit, template, &p.sources, p.fps)
-        })
-        .unwrap_or(Err("Open a project first."))
+            Err(e) => why = Some(e),
+        }
+    }
+    (placed, why)
 }
 
 /// Ctrl+C with a transition selected: copy the transition alone, as Resolve does.
@@ -560,33 +601,22 @@ fn add_transitions(state: &Rc<AppState>, video: Option<TransitionKind>, audio: b
         state.message("Select an edit point or a clip on the timeline first.");
         return;
     }
-    let mut commands: Vec<Box<dyn Command>> = Vec::new();
-    let mut why = "There is already a transition there.";
-    for (track_id, track_kind, position) in edits {
-        let kind = match track_kind {
-            TrackKind::Video => video.clone(),
-            TrackKind::Audio => audio.then_some(TransitionKind::Crossfade),
-        };
-        let Some(kind) = kind else { continue };
-        // No second transition on an edit that has one.
-        let taken = state.with_timeline(|t| {
-            let track = t.find_track(track_id)?;
-            let edit = track.edit_at(position)?;
-            Some(track.transition_at_edit(edit.clip_id, edit.edge).is_some())
-        });
-        if taken.flatten() != Some(false) {
-            continue;
-        }
-        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind, STANDARD_TRANSITION_US, TransitionAlignment::Centered);
-        match placed_transition(state, track_id, position, &template) {
-            Ok(t) => commands.push(Box::new(SetTransitionCommand::set(track_id, t))),
-            Err(e) => why = e,
-        }
-    }
-    if commands.is_empty() {
-        state.message(why);
+    let wanted: Vec<(Uuid, i64, TransitionKind)> = edits
+        .into_iter()
+        .filter_map(|(track_id, track_kind, position)| {
+            let kind = match track_kind {
+                TrackKind::Video => video.clone(),
+                TrackKind::Audio => audio.then_some(TransitionKind::Crossfade),
+            };
+            kind.map(|k| (track_id, position, k))
+        })
+        .collect();
+    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.fps, &wanted)) else { return };
+    if placed.is_empty() {
+        state.message(why.unwrap_or("There is already a transition there."));
         return;
     }
+    let commands: Vec<Box<dyn Command>> = placed.into_iter().map(|(track_id, t)| Box::new(SetTransitionCommand::set(track_id, t)) as Box<dyn Command>).collect();
     state.execute(Box::new(CompositeCommand::new("Add Transition", commands)));
 }
 
@@ -1294,6 +1324,30 @@ mod tests {
         // The kind, colour and ease come from the template; the clip edge from the edit.
         let t = fit_transition(&track, &track.edit_at(4 * S).unwrap(), &standard(S), &sources, FPS).unwrap();
         assert_eq!((t.kind, t.clip_id), (TransitionKind::DipToColor, track.clips[1].id));
+    }
+
+    #[test]
+    fn add_transition_on_a_short_clip_fits_its_two_transitions_together() {
+        // A [0, 4 s], a 0.6 s B, C after it: Ctrl+T on B puts a transition on both its cuts.
+        let (mut track, mut sources) = cut(2 * S);
+        track.clips[1].timeline_out = 4_600_000;
+        track.clips[1].source_out = 2_600_000;
+        let src = MediaSource::new(std::path::PathBuf::from("c"), MediaType::Video, 10 * S);
+        track.clips.push(Clip::new(track.id, src.id, ClipType::Video, "c", 4_600_000, 8 * S, 2 * S, 5_400_000));
+        sources.insert(src.id, src);
+        let id = track.id;
+        let mut timeline = Timeline::new();
+        timeline.tracks = vec![track];
+        let wanted = [(id, 4 * S, TransitionKind::CrossDissolve), (id, 4_600_000, TransitionKind::CrossDissolve)];
+        let (placed, _) = fill_edits(&timeline, &sources, FPS, &wanted);
+        assert_eq!(placed.len(), 2);
+        // What is stored is what is drawn: put both on, and each span is as long as its duration.
+        let track = &mut timeline.tracks[0];
+        track.transitions = placed.iter().map(|(_, t)| t.clone()).collect();
+        for t in &track.transitions {
+            let (start, end) = track.transition_span(t).expect("a span");
+            assert_eq!(end - start, t.duration_us, "{t:?}");
+        }
     }
 
     #[test]

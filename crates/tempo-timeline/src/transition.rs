@@ -338,6 +338,8 @@ impl Track {
     /// A transition longer than the footage there is shrinks to fit.
     pub fn transition_layers(&self, sources: &HashMap<Uuid, MediaSource>) -> TransitionLayers {
         let mut layers = TransitionLayers { clips: self.clips.clone(), ..TransitionLayers::default() };
+        // Head and tail transition lengths per clip, folded into its fades below.
+        let (mut heads, mut tails) = (HashMap::new(), HashMap::new());
         for t in self.transitions.iter().filter(|t| t.kind != TransitionKind::Cut) {
             let dip = t.dip_color();
             match self.shape(t) {
@@ -349,27 +351,27 @@ impl Track {
                 Some(Shape::Head(clip, len)) if len > 0 => match dip {
                     Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_in, end_us: clip.timeline_in + len, color, fade_in_us: 0, fade_out_us: len }),
                     None => {
-                        if let Some(c) = layers.clips.iter_mut().find(|c| c.id == clip.id) {
-                            c.properties.fade_in_us = c.properties.fade_in_us.max(len);
-                        }
+                        heads.insert(clip.id, len);
                     }
                 },
                 Some(Shape::Tail(clip, len)) if len > 0 => match dip {
                     Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_out - len, end_us: clip.timeline_out, color, fade_in_us: len, fade_out_us: 0 }),
                     None => {
-                        if let Some(c) = layers.clips.iter_mut().find(|c| c.id == clip.id) {
-                            c.properties.fade_out_us = c.properties.fade_out_us.max(len);
-                        }
+                        tails.insert(clip.id, len);
                     }
                 },
                 _ => {}
             }
         }
         // As `Clip::with_fade`: the fades of a clip never overlap, so every renderer agrees.
+        // Transitions keep the length they are drawn with (spans already fit the clip); the
+        // clip's own fades give way to them.
         for c in &mut layers.clips {
-            let (dur, p) = (c.duration_us(), &mut c.properties);
-            p.fade_in_us = p.fade_in_us.clamp(0, dur);
-            p.fade_out_us = p.fade_out_us.clamp(0, dur - p.fade_in_us);
+            let dur = c.duration_us();
+            let (t_in, t_out) = (heads.get(&c.id).copied().unwrap_or(0), tails.get(&c.id).copied().unwrap_or(0));
+            let p = &mut c.properties;
+            p.fade_in_us = p.fade_in_us.max(t_in).clamp(0, (dur - t_out).max(0));
+            p.fade_out_us = p.fade_out_us.max(t_out).clamp(0, (dur - p.fade_in_us).max(0));
         }
         layers
     }
@@ -639,6 +641,19 @@ mod tests {
         assert!(close(picture(&layers, 500_000), 5.0));
         assert_eq!(layers.color, vec![ColorLayer { start_us: 7 * S, end_us: 8 * S, color: [1.0, 0.0, 0.0], fade_in_us: S, fade_out_us: 0 }]);
         assert!(close(picture(&layers, 7_500_000), 60.0));
+    }
+
+    #[test]
+    fn a_transition_keeps_its_length_over_the_clips_own_fade() {
+        let (mut tl, sources, _, b) = setup();
+        // B is 4 s long with its own 3.5 s fade-in; a 1 s tail transition still gets 1 s.
+        tl.tracks[0].clips[1].properties.fade_in_us = 3_500_000;
+        tl.tracks[0].transitions.push(dissolve(b, TransitionEdge::Out, S, TransitionAlignment::EndAtCut));
+        let span = tl.tracks[0].transition_span(&tl.tracks[0].transitions[0]);
+        let layers = tl.tracks[0].transition_layers(&sources);
+        let clip = &layers.clips[1].properties;
+        assert_eq!(span, Some((7 * S, 8 * S)));
+        assert_eq!((clip.fade_in_us, clip.fade_out_us), (3 * S, S));
     }
 
     #[test]
