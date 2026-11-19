@@ -25,6 +25,9 @@ pub struct Inspector {
     title: gtk::Label,
     body: gtk::Box,
     scroller: gtk::ScrolledWindow,
+    /// What the panel shows (a transition, or the selected clips): its scroll position
+    /// is kept while this stays the same.
+    shown: Cell<Option<(Option<EditSelection>, Option<Uuid>)>>,
     /// Set while an edit from the Inspector itself is applied, so the fields are
     /// not rebuilt under the user's hands.
     busy: Rc<Cell<bool>>,
@@ -60,17 +63,16 @@ impl Inspector {
         let scroller = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
         root.append(&scroller);
 
-        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, busy: Rc::new(Cell::new(false)) });
+        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, shown: Cell::new(None), busy: Rc::new(Cell::new(false)) });
         let i = inspector.clone();
         state.connect(move |change| {
             if matches!(change, Change::Selection | Change::Timeline | Change::Project) {
-                let at = i.scroller.vadjustment().value();
+                // Editing keeps the panel where the user is; something else selected starts at the top.
+                let now = Some((i.state.edit_selection.get(), i.state.selected_ids().first().copied()));
+                let at = if i.shown.replace(now) == now { i.scroller.vadjustment().value() } else { 0.0 };
                 i.rebuild();
-                // An edit keeps the panel where the user is; a new selection starts at the top.
-                if matches!(change, Change::Timeline) {
-                    let adjustment = i.scroller.vadjustment();
-                    glib::idle_add_local_once(move || adjustment.set_value(at));
-                }
+                let adjustment = i.scroller.vadjustment();
+                glib::idle_add_local_once(move || adjustment.set_value(at));
             }
         });
         inspector.rebuild();
