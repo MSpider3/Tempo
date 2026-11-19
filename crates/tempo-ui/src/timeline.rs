@@ -148,6 +148,13 @@ fn length_tip(from: i64, to: i64, left_edge: bool, both_free: bool, fps: f64) ->
     format!("{}{}\n{}", if moved >= 0 { "+" } else { "" }, offset_label(moved, fps), offset_label(to, fps))
 }
 
+/// A centred transition moves both edges, so its length changes in whole 2-frame steps
+/// (each edge on a frame line); an odd step falls back one frame toward `from`.
+fn even_steps(from: i64, to: i64, both_free: bool, frame_us: i64) -> i64 {
+    let frames = ((to - from) as f64 / frame_us.max(1) as f64).round() as i64;
+    if both_free && frames % 2 != 0 { to - frames.signum() * frame_us } else { to }
+}
+
 /// Size of a probe thumbnail (raw RGBA) from its byte count.
 fn thumbnail_size(len: usize) -> Option<(usize, usize)> {
     [(160, 90), (320, 180), (96, 54)].into_iter().find(|(w, h)| w * h * 4 == len)
@@ -1081,9 +1088,11 @@ impl TimelineCanvas {
             s.append_color(&gdk::RGBA::new(bar.red(), bar.green(), bar.blue(), 0.9), &graphene::Rect::new(area.x(), bar_y, area.width(), NAME_BAR_H));
             if let Some((texture, name)) = self.drop_source_look() {
                 let side = bar_y - area.y();
-                s.push_clip(&graphene::Rect::new(area.x(), area.y(), area.width(), side));
-                s.append_texture(&texture, &graphene::Rect::new(area.x(), area.y(), side * 16.0 / 9.0, side));
-                s.pop();
+                if let Some(texture) = texture {
+                    s.push_clip(&graphene::Rect::new(area.x(), area.y(), area.width(), side));
+                    s.append_texture(&texture, &graphene::Rect::new(area.x(), area.y(), side * 16.0 / 9.0, side));
+                    s.pop();
+                }
                 self.text(s, &name, area.x() + 6.0, bar_y + 3.0, &gdk::RGBA::WHITE, true, area.width() - 10.0);
             }
             s.pop();
@@ -1091,21 +1100,25 @@ impl TimelineCanvas {
         }
     }
 
-    /// The dragged Media Pool source's thumbnail (made once) and file name.
-    fn drop_source_look(&self) -> Option<(gdk::Texture, String)> {
+    /// The dragged Media Pool source's file name and, when it has one, its thumbnail (made once).
+    fn drop_source_look(&self) -> Option<(Option<gdk::Texture>, String)> {
         let id = self.imp().drop_source.get()?;
         let state = self.state();
-        let name = state.with_project(|p| p.sources.get(&id).and_then(|src| src.path.file_name().map(|n| n.to_string_lossy().into_owned()))).flatten()?;
+        let (name, data) = state.with_project(|p| p.sources.get(&id).map(|src| (src.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), src.thumbnail_data.is_some()))).flatten()?;
         let mut cache = self.imp().thumbs.borrow_mut();
-        let texture = cache
-            .entry(id)
-            .or_insert_with(|| {
-                let data = state.with_project(|p| p.sources.get(&id).and_then(|src| src.thumbnail_data.clone())).flatten()?;
-                let (w, h) = thumbnail_size(data.len())?;
-                Some(gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(data), w * 4).upcast::<gdk::Texture>())
-            })
-            .clone()?;
-        Some((texture, name))
+        if !cache.contains_key(&id) && data {
+            let texture = state
+                .with_project(|p| p.sources.get(&id).and_then(|src| src.thumbnail_data.clone()))
+                .flatten()
+                .and_then(|data| {
+                    let (w, h) = thumbnail_size(data.len())?;
+                    Some(gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(data), w * 4).upcast::<gdk::Texture>())
+                });
+            if let Some(t) = texture {
+                cache.insert(id, Some(t));
+            }
+        }
+        Some((cache.get(&id).cloned().flatten(), name))
     }
 
     /// The new tracks a source dropped at `y` would get, if any.
@@ -1404,7 +1417,7 @@ impl TimelineCanvas {
             }
             Some(Drag::Transition { left, both, from, to, max, .. }) => {
                 let fps = state.with_project(|p| p.timeline_fps()).unwrap_or_default();
-                *to = actions::dragged_length(*from, delta_us, *left, *both, *max, fps);
+                *to = even_steps(*from, actions::dragged_length(*from, delta_us, *left, *both, *max, fps), *both, state.frame_us());
                 *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, *left, *both, state.fps())));
             }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
@@ -2287,6 +2300,10 @@ mod tests {
         assert_eq!(length_tip(10 * 41_667, 15 * 41_667, true, false, 24.0), "-00:05\n00:15");
         // Centred on a cut both edges move, so each moves half the length change.
         assert_eq!(length_tip(10 * 41_667, 14 * 41_667, false, true, 24.0), "+00:02\n00:14");
+        // An odd change steps back to a whole-frame edge movement: 10 -> 15 becomes 10 -> 14.
+        assert_eq!(even_steps(10 * 41_667, 15 * 41_667, true, 41_667), 14 * 41_667);
+        assert_eq!(even_steps(10 * 41_667, 7 * 41_667, true, 41_667), 8 * 41_667);
+        assert_eq!(even_steps(10 * 41_667, 15 * 41_667, false, 41_667), 15 * 41_667);
     }
 
     #[test]
