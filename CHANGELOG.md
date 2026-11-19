@@ -8,14 +8,28 @@ All notable changes to Tempo are recorded here. The format follows
 
 ### Added
 
-- **Drag transitions from the Effects panel onto the timeline**, as in DaVinci Resolve.
-  - A Cross Dissolve dropped on a cut joins the two clips.
-  - Dropped on the start or end of a clip with nothing next to it, it fades from or to black.
-  - Fade In, Fade Out and Fade In and Out go on the clip they are dropped on.
-  - While you drag, the edit point it will go on is marked.
-  - Clicking an item still applies it to the selected clip.
-- **Drag the start of a cross dissolve** to make it longer or shorter, in whole frames. Its
-  end stays on the cut (Resolve's "End on Edit").
+- **Transitions work as in DaVinci Resolve.** A transition is its own object on the timeline.
+  - The Effects panel lists Video Transitions › Dissolve: **Cross Dissolve** and **Dip To
+    Color Dissolve**. Drag one onto a cut, or onto the start or end of a clip. A box shows
+    where it will land. Audio tracks refuse video transitions.
+  - On a cut it is centred when both clips have footage to spare; otherwise it starts or
+    ends on the cut. On the first clip's start it fades from black, and on the last clip's
+    end it fades to black.
+  - Click a transition to select it (red outline). Drag its free edge to change its length
+    in whole frames; a centred one changes on both sides. A tooltip shows the change and the
+    new length. Lengths never go past the footage the clips have.
+  - The Inspector shows Type, Duration in seconds and frames, Alignment (Start, Center, End
+    on Edit) and, for Dip To Color, the colour.
+  - Click a clip edge to select the edit point (green bracket). `Up` and `Down` move the
+    selected edit point with the playhead.
+  - `Ctrl+C` on a selected transition copies just the transition, and `Ctrl+V` puts it on the
+    selected edit point. So `Up`, `Ctrl+V`, `Up`, `Ctrl+V`… gives every cut the same transition.
+  - `Backspace` or `Delete` on a selected transition removes only the transition.
+  - `Ctrl+T` adds the standard transition (1 s) on the selected edit, picture and sound;
+    `Alt+T` adds it to the picture only and `Shift+T` to the sound only (a Cross Fade).
+  - Right-click a transition for Copy, Delete and Change Transition Duration….
+  - Sound cross fades are equal power. Video transitions leave the sound alone.
+  - Project files now use schema 4. Older dissolves open as transitions.
 - **Several timelines per project.**
   - `Ctrl+N` opens Create New Timeline, with a name and the number of video and audio tracks.
   - The Media Pool right-click menu has Create New Timeline too.
@@ -24,7 +38,23 @@ All notable changes to Tempo are recorded here. The format follows
   - Each timeline keeps its own clips, markers and undo history.
   - Project files now use schema 3. Older files open as one timeline named "Timeline 1".
 - **Edit a marker** by double-clicking it in the timeline ruler. The Marker dialog sets its
-  name, colour and note, and removes it, as in Resolve.
+  time, duration, name, colour and note, and removes it, as in Resolve. New markers are named
+  "Marker N", and `Esc` keeps the marker.
+- **Markers on the ruler**: hover one to see its time and name; drag it to move it (it snaps
+  to cuts and the playhead). A marker with a duration shows as a bar.
+- **Marker overlay on the viewer**: with the playhead on a marker, the viewer shows its time
+  and name, as in Resolve.
+- **Zoom presets** above the timeline: Full Extent, Detail (around the playhead) and Custom
+  (the zoom you last set by hand).
+- Dragging a clip shows how far it moved, and trimming shows how much, as `ss:ff`.
+- **Timelines in the Media Pool.** Double-click to open; right-click to rename, duplicate or
+  delete one.
+- Create New Timeline has **Empty Timeline**. Turn it off to start the timeline with the clip
+  selected in the Media Pool.
+- **Upload from the Export page**, as Resolve's "Upload directly to YouTube": when an uploader
+  plugin is on, Render Settings has Title, Description, Upload Thumbnail, Privacy and Category.
+  They are kept per job, and the job uploads once it has rendered. Plugins receive the
+  privacy, category and thumbnail.
 - Export render-queue jobs are named "<project> | <timeline>". Each job renders the timeline
   that was open when it was queued.
 
@@ -32,14 +62,11 @@ All notable changes to Tempo are recorded here. The format follows
 
 - New transitions are one second long, Resolve's standard transition duration. This was half
   a second.
-- A cross dissolve into a clip that has no footage before its start no longer refuses. The
-  clip's start is trimmed to make room, and later clips and its linked sound move with it.
-  This is the "trim clips" choice Resolve offers for insufficient handles. `Ctrl+Z` undoes it.
+- Right-click Fade In and Fade Out are one second long, like the Effects panel.
 
 ### Fixed
 
-- The cross dissolve box on the timeline reached past the cut into the next clip. It now
-  covers only the part before the cut, where the dissolve plays.
+- A dissolve no longer stops working when the clip before it moves.
 - The icon column of the Effects panel items stretched across half the row.
 - Fedora 45 (FFmpeg 9):
   - Export failed for titles containing `%`.
