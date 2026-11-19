@@ -237,6 +237,7 @@ If the panel is closed, the key opens it first and then focuses it.
 
 | Key | Action | Tempo action | Resolve command |
 |---|---|---|---|
+| `Ctrl+N` | New timeline | `win.new-timeline` | `fileNewTimeline` |
 | `Ctrl+S` | Save project | `app.save` | `fileSaveProject` |
 | `Ctrl+Shift+S` | Save project as | `app.save-as` | `fileSaveProjectAs` |
 | `Ctrl+I` | Import media | `win.import-media` | `fileImportMedia` |
@@ -283,7 +284,6 @@ so that the key is available, with the right meaning, when the feature arrives.
 | `G` | Add flag | Not planned |
 | `Shift+C`, `Ctrl+Shift+C` | Curve editor, keyframe editor | With the keyframes plugin point |
 | `[`, `]` | Previous / next keyframe | With the keyframes plugin point |
-| `Ctrl+N` | New timeline | Tempo has one timeline per project |
 | `Ctrl+E`, `Ctrl+Shift+O`, `Ctrl+Shift+I` | Export project, export / import XML | With the interchange plugin |
 | `Shift+2`, `3`, `5`, `6`, `7` | Media, Cut, Fusion, Color, Fairlight pages | Never |
 | `Alt+1`…`9`, `Ctrl+Alt+1`…`9` | Track destination | Not planned |
