@@ -155,6 +155,13 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("create"));
     dialog.set_close_response("cancel");
+    let taken = state.with_project(|p| p.timeline_list()).unwrap_or_default();
+    let d = dialog.clone();
+    name.connect_changed(move |e| {
+        let typed = e.text().trim().to_lowercase();
+        let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
+        d.set_response_enabled("create", free);
+    });
     let state = state.clone();
     let field = name.clone();
     dialog.connect_response(Some("create"), move |_, _| {

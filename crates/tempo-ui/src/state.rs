@@ -245,6 +245,8 @@ impl AppState {
         let from = self.with_timeline(|t| t.id);
         if from != Some(id) && self.project.borrow_mut().as_mut().is_some_and(|p| p.open_timeline(id)) {
             self.switched_timeline(from);
+            // The file records which timeline is open, as Resolve reopens the last one.
+            self.set_dirty(true);
         }
     }
 

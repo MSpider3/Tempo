@@ -89,7 +89,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **2**
+Current schema version: **3**
 
 ---
 
@@ -202,6 +202,20 @@ VALUES ('00000000-0000-0000-0000-000000000000', 'Master', NULL, 0);
 ---
 
 ## 7. Tracks
+
+A project holds one or more timelines (schema 3). Tracks and markers name their timeline;
+clips follow their track and transitions follow their clip. A file from before schema 3 has
+no `timelines` rows and NULL `timeline_id`s, and loads as one timeline named "Timeline 1".
+
+```sql
+CREATE TABLE timelines (
+    id      TEXT PRIMARY KEY,           -- UUID
+    name    TEXT NOT NULL,
+    is_open INTEGER NOT NULL DEFAULT 0  -- 1 for the timeline open when saved
+);
+ALTER TABLE tracks  ADD COLUMN timeline_id TEXT;   -- migration 3
+ALTER TABLE markers ADD COLUMN timeline_id TEXT;   -- migration 3
+```
 
 ```sql
 CREATE TABLE tracks (
@@ -510,6 +524,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "Clip speed: source and timeline lengths may differ",
         sql: include_str!("migrations/002_clip_speed.sql"),
+    },
+    Migration {
+        version: 3,
+        description: "Several timelines per project",
+        sql: include_str!("migrations/003_timelines.sql"),
     },
 ];
 ```

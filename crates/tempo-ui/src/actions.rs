@@ -789,11 +789,18 @@ pub fn close_gap(state: &Rc<AppState>, gap: Gap) {
     }
 }
 
-/// Take a file out of the Media Pool. Files still used on the timeline stay.
+/// Take a file out of the Media Pool. Files still used on any timeline stay.
 pub fn remove_source(state: &Rc<AppState>, source: Uuid) {
-    let used = state.with_timeline(|t| t.tracks.iter().flat_map(|tr| tr.clips.iter()).any(|c| c.source_id == source)).unwrap_or(false);
-    if used {
-        state.message("This clip is used on the timeline. Delete it from the timeline first.");
+    let used_on = state
+        .with_project(|p| {
+            std::iter::once(&p.timeline)
+                .chain(&p.timelines)
+                .find(|t| t.tracks.iter().flat_map(|tr| tr.clips.iter()).any(|c| c.source_id == source))
+                .map(|t| t.name.clone())
+        })
+        .flatten();
+    if let Some(timeline) = used_on {
+        state.message(format!("This clip is used on {timeline}. Delete it from that timeline first."));
         return;
     }
     let removed = state.project.borrow_mut().as_mut().is_some_and(|p| p.sources.remove(&source).is_some());

@@ -782,7 +782,8 @@ fn job_label(p: &Project) -> String {
 
 /// With several timelines the timeline name is added so two jobs do not default to one file.
 fn default_file_name(p: &Project) -> String {
-    if p.timelines.is_empty() { p.name.clone() } else { format!("{} {}", p.name, p.timeline.name) }
+    let name = if p.timelines.is_empty() { p.name.clone() } else { format!("{} {}", p.name, p.timeline.name) };
+    name.replace(['/', '\\'], "-")
 }
 
 fn find_named_label(root: &gtk::Widget, name: &str) -> Option<gtk::Label> {

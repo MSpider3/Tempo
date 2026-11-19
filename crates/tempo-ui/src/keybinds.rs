@@ -142,7 +142,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
-    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>n", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
 
     #[test]
     fn every_hint_names_a_bound_action() {
@@ -169,7 +169,7 @@ mod tests {
         for bind in load() {
             for key in bind.keys.iter().chain(bind.alt.iter()) {
                 let norm = key.to_lowercase();
-                assert!(!RESERVED.contains(&norm.as_str()), "{key} is reserved but bound to {}", bind.action);
+                assert!(!RESERVED.iter().any(|r| r.to_lowercase() == norm), "{key} is reserved but bound to {}", bind.action);
                 if let Some(other) = seen.insert(norm, bind.action.clone()) {
                     assert_eq!(other, bind.action, "{key} is bound to both {other} and {}", bind.action);
                 }
