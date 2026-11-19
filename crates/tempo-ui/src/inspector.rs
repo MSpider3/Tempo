@@ -8,7 +8,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use tempo_timeline::{
     frame_to_us, us_to_frame, Clip, ClipType, Command, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand, SetTransitionCommand,
-    TitleType, Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind,
+    TitleType, Transition, TransitionAlignment, TransitionEdge, TransitionKind,
 };
 use uuid::Uuid;
 
@@ -368,20 +368,10 @@ impl Inspector {
         }
         grid.attach(&aligns, 1, 3, 1, 1);
 
-        Self::row_label(&grid, 4, "Ease");
-        let eases = [TransitionEase::None, TransitionEase::In, TransitionEase::Out, TransitionEase::InOut];
-        let ease = gtk::DropDown::from_strings(&["None", "Ease In", "Ease Out", "Ease In & Out"]);
-        ease.set_selected(eases.iter().position(|e| *e == t.ease).unwrap_or(0) as u32);
-        let s = state.clone();
-        ease.connect_selected_notify(move |d| {
-            if let Some(&e) = eases.get(d.selected() as usize) {
-                edit_transition(&s, sel, |t| t.ease = e);
-            }
-        });
-        grid.attach(&ease, 1, 4, 1, 1);
+        // shortcut: Ease is saved in the file but not rendered yet (ramps are linear), so it has no control here; add the row back when the renderers apply it.
 
         if t.kind == TransitionKind::DipToColor {
-            Self::row_label(&grid, 5, "Color");
+            Self::row_label(&grid, 4, "Color");
             let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
             button.set_rgba(&gtk::gdk::RGBA::new(t.color[0], t.color[1], t.color[2], 1.0));
             let s = state.clone();
@@ -389,7 +379,7 @@ impl Inspector {
                 let c = b.rgba();
                 edit_transition(&s, sel, |t| t.color = [c.red(), c.green(), c.blue()]);
             });
-            grid.attach(&button, 1, 5, 1, 1);
+            grid.attach(&button, 1, 4, 1, 1);
         }
         true
     }
