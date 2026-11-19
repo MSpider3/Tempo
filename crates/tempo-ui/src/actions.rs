@@ -27,13 +27,12 @@ pub enum Place {
 }
 
 /// Build the clip(s) a source produces: picture on a video track, sound on an audio track.
-pub(crate) fn clips_for_source(
-    state: &AppState,
-    source_id: Uuid,
-    at_us: i64,
-    video_track: Option<Uuid>,
-    audio_track: Option<Uuid>,
-) -> Vec<Clip> {
+pub(crate) fn clips_for_source(state: &AppState, source_id: Uuid, at_us: i64, video_track: Option<Uuid>, audio_track: Option<Uuid>) -> Vec<Clip> {
+    clips_for_source_marked(state, source_id, at_us, video_track, audio_track, true)
+}
+
+/// `use_marks` off places the whole source whatever the viewer's marks say.
+fn clips_for_source_marked(state: &AppState, source_id: Uuid, at_us: i64, video_track: Option<Uuid>, audio_track: Option<Uuid>, use_marks: bool) -> Vec<Clip> {
     let Some((media_type, duration, has_audio, name)) = state
         .with_project(|p| {
             p.sources.get(&source_id).map(|s| {
@@ -47,7 +46,7 @@ pub(crate) fn clips_for_source(
     };
 
     // Honour In/Out marks set on this clip in the viewer's source mode.
-    let marked = state.source_clip.get() == Some(source_id);
+    let marked = use_marks && state.source_clip.get() == Some(source_id);
     let full = if media_type == MediaType::Image { STILL_DURATION_US } else { duration.max(1) };
     let src_in = if marked { state.src_in.get().unwrap_or(0).clamp(0, full - 1) } else { 0 };
     let src_out = if marked { state.src_out.get().unwrap_or(full).clamp(src_in + 1, full) } else { full };
@@ -81,8 +80,9 @@ pub(crate) fn clips_for_source(
 
 /// Place a Media Pool source on the timeline. `track` overrides the destination
 /// track of its kind (used when a clip is dropped on a particular row), and
-/// `at_us` the place (a drop); without it the clip goes to the playhead.
-pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Option<i64>, track: Option<Uuid>) {
+/// `at_us` the place (a drop); without it the clip goes to the playhead. `use_marks`
+/// off ignores the viewer's In/Out marks and places the whole clip.
+pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Option<i64>, track: Option<Uuid>, use_marks: bool) {
     let dropped = at_us.is_some();
     let mut video = state.dest_track(TrackKind::Video);
     let mut audio = state.dest_track(TrackKind::Audio);
@@ -103,7 +103,7 @@ pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Op
             .unwrap_or(0);
     }
 
-    let mut clips = clips_for_source(state, source_id, at, video, audio);
+    let mut clips = clips_for_source_marked(state, source_id, at, video, audio, use_marks);
     if clips.is_empty() {
         state.message("Nothing to place: pick a clip in the Media Pool first.");
         return;
@@ -219,7 +219,7 @@ pub fn current_source(state: &AppState) -> Option<Uuid> {
 
 pub fn place_current(state: &Rc<AppState>, how: Place) {
     match current_source(state) {
-        Some(id) => place_source(state, id, how, None, None),
+        Some(id) => place_source(state, id, how, None, None, true),
         None => state.message("Pick a clip in the Media Pool first."),
     }
 }
@@ -1226,41 +1226,29 @@ pub fn goto_marker(state: &Rc<AppState>, forward: bool) {
 /// becomes the selection, so Up, Ctrl+V, Up, Ctrl+V… pastes on every cut. Otherwise
 /// the playhead goes to the next or previous cut on any track.
 pub fn goto_edit(state: &Rc<AppState>, forward: bool) {
-    // The selected edit or transition only says which track to follow; the step is from the playhead.
-    let from = match state.edit_selection.get() {
+    // Previous / Next Edit are timeline commands: they count from the timeline playhead and
+    // move it, whatever the viewer shows. A selected edit or transition only says which
+    // track to follow; without one every track counts.
+    let at = state.playhead_us();
+    let track = match state.edit_selection.get() {
         Some(EditSelection::Edit { track_id, .. } | EditSelection::Transition { track_id, .. }) => Some(track_id),
         None => None,
     };
-    if let Some(track_id) = from {
-        let at = state.player.position_us();
-        let next = state
-            .with_timeline(|t| {
-                let points = t.find_track(track_id)?.edit_points().into_iter().map(|e| e.position_us);
-                neighbour_edit(points, at, t.duration_us(), forward)
-            })
-            .flatten();
-        if let Some(pos) = next {
-            state.select_edit(Some(EditSelection::Edit { track_id, position_us: pos }));
-            state.player.pause();
-            state.player.seek(pos, true);
-        }
-        return;
-    }
-    let pos = state.player.position_us();
-    let target = state
+    let next = state
         .with_timeline(|t| {
-            let points = t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]);
-            if forward {
-                points.filter(|p| *p > pos).min()
-            } else {
-                points.filter(|p| *p < pos).max()
-            }
+            let points: Vec<i64> = match track {
+                Some(id) => t.find_track(id)?.edit_points().into_iter().map(|e| e.position_us).collect(),
+                None => t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]).collect(),
+            };
+            neighbour_edit(points, at, t.duration_us(), forward)
         })
         .flatten();
-    if let Some(t) = target {
-        state.player.pause();
-        state.player.seek(t, true);
+    let Some(pos) = next else { return };
+    if let Some(track_id) = track {
+        state.select_edit(Some(EditSelection::Edit { track_id, position_us: pos }));
     }
+    state.player.pause();
+    state.player.seek_timeline(pos);
 }
 
 pub fn step_frames(state: &Rc<AppState>, frames: i64) {
@@ -1433,6 +1421,22 @@ mod tests {
     }
 
     #[test]
+    fn a_copied_transition_is_placed_by_the_edit_it_lands_on_not_the_timeline_it_came_from() {
+        let (track, sources) = cut(2 * S);
+        let mut timeline = Timeline::new();
+        let track_id = track.id;
+        let b_id = track.clips[1].id;
+        timeline.tracks.push(track);
+        // Copied on another timeline: its clip id means nothing here.
+        let copied = Transition::new(Uuid::new_v4(), TransitionEdge::Out, TransitionKind::DipToColor, S, TransitionAlignment::EndAtCut);
+        let t = place_on(&timeline, &sources, FPS, track_id, 4 * S, &copied).expect("fits");
+        assert_eq!((t.clip_id, t.kind.clone(), t.duration_us), (b_id, TransitionKind::DipToColor, S));
+        // An audio transition does not go on a video track.
+        let fade = Transition::new(Uuid::new_v4(), TransitionEdge::In, TransitionKind::Crossfade, S, TransitionAlignment::Centered);
+        assert_eq!(place_on(&timeline, &sources, FPS, track_id, 4 * S, &fade), Err("Audio transitions go on audio tracks."));
+    }
+
+    #[test]
     fn up_and_down_step_through_edits_and_the_timeline_ends() {
         let points = [0, 4 * S, 8 * S];
         assert_eq!(neighbour_edit(points, 4 * S, 10 * S, false), Some(0));
@@ -1490,5 +1494,27 @@ mod tests {
         // Assert
         assert_eq!(note.as_deref(), Some(""));
         assert_eq!(popup.as_deref(), Some("Marker 2"));
+    }
+
+    #[test]
+    fn a_source_is_placed_whole_when_the_marks_are_not_to_be_used() {
+        // Arrange: a 10 s source with In/Out marks on it in the viewer.
+        let state = AppState::new();
+        let mut project = tempo_timeline::Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30);
+        let src = MediaSource::new(std::path::PathBuf::from("a"), MediaType::Video, 10 * S);
+        let (id, track) = (src.id, project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id));
+        project.sources.insert(id, src);
+        *state.project.borrow_mut() = Some(project);
+        state.source_clip.set(Some(id));
+        state.src_in.set(Some(2 * S));
+        state.src_out.set(Some(5 * S));
+
+        // Act
+        let marked = clips_for_source_marked(&state, id, 0, track, None, true);
+        let whole = clips_for_source_marked(&state, id, 0, track, None, false);
+
+        // Assert
+        assert_eq!((marked[0].source_in, marked[0].source_out), (2 * S, 5 * S));
+        assert_eq!((whole[0].source_in, whole[0].source_out), (0, 10 * S));
     }
 }

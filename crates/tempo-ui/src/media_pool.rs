@@ -182,9 +182,9 @@ impl MediaPool {
             });
             group.add_action(&action);
         };
-        add("insert", Box::new(|p, id| actions::place_source(&p.state, id, Place::Insert, None, None)));
-        add("overwrite", Box::new(|p, id| actions::place_source(&p.state, id, Place::Overwrite, None, None)));
-        add("append", Box::new(|p, id| actions::place_source(&p.state, id, Place::Append, None, None)));
+        add("insert", Box::new(|p, id| actions::place_source(&p.state, id, Place::Insert, None, None, true)));
+        add("overwrite", Box::new(|p, id| actions::place_source(&p.state, id, Place::Overwrite, None, None, true)));
+        add("append", Box::new(|p, id| actions::place_source(&p.state, id, Place::Append, None, None, true)));
         add("open", Box::new(|p, id| p.state.show_source(Some(id))));
         add("remove", Box::new(|p, id| actions::remove_source(&p.state, id)));
         add("open-timeline", Box::new(|p, id| p.state.open_timeline(id)));
