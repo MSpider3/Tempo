@@ -870,7 +870,7 @@ impl Project {
     /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.
     pub fn timeline_list(&self) -> Vec<(Uuid, String)> {
         let mut list: Vec<_> = std::iter::once(&self.timeline).chain(&self.timelines).map(|t| (t.id, t.name.clone())).collect();
-        list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        list.sort_by_key(|a| a.1.to_lowercase());
         list
     }
 
@@ -1417,5 +1417,114 @@ mod tests {
         // A dissolve cannot use footage that does not exist before the In point.
         b.source_in = 200_000;
         assert_eq!(b.dissolve_lead().unwrap().duration_us(), 200_000);
+    }
+
+    fn project() -> Project {
+        Project::new("p", 1920, 1080, RationalFps::FPS_30)
+    }
+
+    #[test]
+    fn with_tracks_makes_video_then_audio_in_order() {
+        let t = Timeline::with_tracks("Cut", 3, 2);
+        let got: Vec<_> = t.tracks.iter().map(|tr| (tr.kind, tr.kind_index, tr.name.as_str(), tr.sort_order)).collect();
+        assert_eq!(t.name, "Cut");
+        assert_eq!(
+            got,
+            vec![
+                (TrackKind::Video, 1, "Video 1", 0),
+                (TrackKind::Video, 2, "Video 2", 1),
+                (TrackKind::Video, 3, "Video 3", 2),
+                (TrackKind::Audio, 1, "Audio 1", 3),
+                (TrackKind::Audio, 2, "Audio 2", 4),
+            ]
+        );
+        assert!(t.markers.is_empty());
+    }
+
+    #[test]
+    fn with_tracks_allows_zero_tracks_and_gives_each_timeline_its_own_id() {
+        let (a, b) = (Timeline::with_tracks("a", 0, 0), Timeline::with_tracks("b", 0, 0));
+        assert!(a.tracks.is_empty());
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn add_timeline_opens_the_new_one_and_keeps_the_old_intact() {
+        let mut p = project();
+        let old_id = p.timeline.id;
+        p.timeline.markers.push(Marker::new(5, "m", MarkerColor::Blue));
+        let new = Timeline::with_tracks("Timeline 2", 1, 1);
+        let new_id = new.id;
+        p.add_timeline(new);
+        assert_eq!(p.timeline.id, new_id);
+        assert_eq!(p.timelines.len(), 1);
+        assert_eq!(p.timelines[0].id, old_id);
+        assert_eq!(p.timelines[0].tracks.len(), 4);
+        assert_eq!(p.timelines[0].markers.len(), 1);
+    }
+
+    #[test]
+    fn open_timeline_swaps_back_and_keeps_markers() {
+        let mut p = project();
+        let first = p.timeline.id;
+        p.timeline.markers.push(Marker::new(5, "m", MarkerColor::Blue));
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let opened = p.open_timeline(first);
+        assert!(opened);
+        assert_eq!(p.timeline.id, first);
+        assert_eq!(p.timeline.markers.len(), 1);
+        assert_eq!(p.timelines.len(), 1);
+        assert_eq!(p.timelines[0].name, "Timeline 2");
+    }
+
+    #[test]
+    fn open_timeline_returns_false_for_unknown_and_already_open_ids() {
+        let mut p = project();
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let open = p.timeline.id;
+        assert!(!p.open_timeline(Uuid::new_v4()));
+        assert!(!p.open_timeline(open));
+        assert_eq!(p.timeline.id, open);
+        assert_eq!(p.timelines.len(), 1);
+    }
+
+    #[test]
+    fn timeline_list_includes_the_open_timeline_sorted_ignoring_case() {
+        let mut p = project();
+        p.timeline.name = "charlie".into();
+        p.add_timeline(Timeline::with_tracks("Alpha", 1, 1));
+        p.add_timeline(Timeline::with_tracks("bravo", 1, 1));
+        let names: Vec<_> = p.timeline_list().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["Alpha", "bravo", "charlie"]);
+        assert!(p.timeline_list().iter().any(|(id, _)| *id == p.timeline.id));
+    }
+
+    #[test]
+    fn next_timeline_name_skips_names_in_use() {
+        let mut p = project();
+        assert_eq!(p.next_timeline_name(), "Timeline 2");
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 3");
+    }
+
+    #[test]
+    fn next_timeline_name_fills_a_gap() {
+        let mut p = project();
+        p.timeline.name = "Timeline 2".into();
+        p.add_timeline(Timeline::with_tracks("Timeline 3", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 1");
+    }
+
+    #[test]
+    fn old_project_json_without_timeline_fields_still_loads() {
+        let p = project();
+        let mut v = serde_json::to_value(&p).unwrap();
+        v.as_object_mut().unwrap().remove("timelines");
+        let t = v["timeline"].as_object_mut().unwrap();
+        t.remove("id");
+        t.remove("name");
+        let back: Project = serde_json::from_value(v).unwrap();
+        assert!(back.timelines.is_empty());
+        assert_eq!(back.timeline.name, "Timeline 1");
     }
 }
