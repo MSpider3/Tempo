@@ -165,6 +165,25 @@ mod tests {
         assert!((power(3_999_999) - power(4_000_000)).abs() < 0.05, "{} vs {}", power(3_999_999), power(4_000_000));
     }
 
+    #[test]
+    fn a_switched_off_audio_transition_leaves_a_plain_cut() {
+        use tempo_timeline::{MediaType, Project, RationalFps, Transition, TransitionAlignment, TrackKind};
+        let mut project = Project::new("t", 320, 180, RationalFps::FPS_30);
+        let source = MediaSource::new(std::env::temp_dir().join("x.wav"), MediaType::Audio, 8_000_000);
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        let track = project.timeline.find_track_mut(a).unwrap();
+        track.clips.push(Clip::new(a, source.id, ClipType::Audio, "a", 0, 4_000_000, 1_000_000, 5_000_000));
+        track.clips.push(Clip::new(a, source.id, ClipType::Audio, "b", 4_000_000, 8_000_000, 2_000_000, 6_000_000));
+        let b = track.clips[1].id;
+        let mut t = Transition::new(b, TransitionEdge::In, TransitionKind::Crossfade, 1_000_000, TransitionAlignment::Centered);
+        t.enabled = false;
+        track.transitions.push(t);
+        let sources = HashMap::from([(source.id, source)]);
+        let strips = audio_strips(project.timeline.find_track_mut(a).unwrap(), &sources);
+        assert!(strips.ramps.is_empty());
+        assert!(strips.strips.iter().skip(1).all(|s| s.is_empty()));
+    }
+
     /// A short clip B between A and C with a cross fade on both cuts: each side gets its own
     /// handle piece, pieces in a strip are in order and never overlap, and power stays level.
     #[test]

@@ -627,7 +627,19 @@ pub fn timecode(us: i64, fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::timecode;
+    use super::*;
+
+    #[test]
+    fn frame_helpers_follow_the_timelines_own_rate() {
+        let state = AppState::new();
+        let mut project = Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30);
+        project.timeline.fps = Some(tempo_timeline::RationalFps::FPS_25);
+        *state.project.borrow_mut() = Some(project);
+        assert_eq!(state.frame_us(), 40_000);
+        assert_eq!(state.fps(), 25.0);
+        assert_eq!(state.frame_step(0, 25), 1_000_000);
+        assert_eq!(state.frame_floor(1_030_000), 1_000_000);
+    }
 
     #[test]
     fn timecode_uses_project_rate() {

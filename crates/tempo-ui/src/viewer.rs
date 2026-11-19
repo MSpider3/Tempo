@@ -496,3 +496,22 @@ fn viewer_menu() -> (gtk::Popover, gtk::CheckButton) {
     list.append(&check);
     (gtk::Popover::builder().child(&list).build(), check)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_colours_in_the_stylesheet_match_the_model() {
+        let css = include_str!("../../../assets/style/tempo.css");
+        let all: Vec<_> = tempo_timeline::MarkerColor::RESOLVE.into_iter().chain([tempo_timeline::MarkerColor::Orange]).collect();
+        for color in all.iter().copied() {
+            let name = color.name().to_lowercase();
+            let prefix = format!("@define-color tempo_marker_{name} ");
+            let line = css.lines().find(|l| l.starts_with(&prefix)).unwrap_or_else(|| panic!("no tempo_marker_{name} in tempo.css"));
+            assert_eq!(line[prefix.len()..].trim().trim_end_matches(';'), color.hex(), "{name}");
+            assert_eq!(marker_class(color), format!("marker-{name}"));
+        }
+        assert_eq!(css.matches("@define-color tempo_marker_").count(), all.len());
+    }
+}
