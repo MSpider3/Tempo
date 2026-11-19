@@ -1184,7 +1184,7 @@ pub fn add_marker(state: &Rc<AppState>) -> Option<Marker> {
     }
     // Named "Marker N" from the start, so the overlay, ruler and popup agree.
     let others = state.with_timeline(|t| t.markers.clone()).unwrap_or_default();
-    let marker = Marker::new(state.frame_floor(state.playhead_us()), &default_marker_name(&others), MarkerColor::Blue);
+    let marker = Marker::new(state.frame_floor(state.playhead_us()), default_marker_name(&others), MarkerColor::Blue);
     state.execute(Box::new(AddMarkerCommand::new(marker.clone()))).then_some(marker)
 }
 
