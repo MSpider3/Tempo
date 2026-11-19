@@ -259,6 +259,12 @@ fn timeline_from_form(name: String, video: u32, audio: u32, audio_type: AudioTra
     timeline
 }
 
+/// Mark In/Out can seed the new timeline only when the Media Pool pick is the clip open in
+/// the viewer's source mode and has an In or an Out.
+fn marks_available(selected: Option<uuid::Uuid>, source: Option<uuid::Uuid>, src_in: Option<i64>, src_out: Option<i64>) -> bool {
+    selected.is_some() && selected == source && (src_in.is_some() || src_out.is_some())
+}
+
 /// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
 /// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
 pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
@@ -282,6 +288,15 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let empty = check_button("Empty Timeline");
     empty.set_tooltip_text(Some("Turn off to start the timeline with the clip selected in the Media Pool"));
     let use_project = check_button("Use Project Settings");
+    // Resolve's option is off until asked for, and greyed out unless the picked clip has marks.
+    let use_marks = check_button("Use Selected Mark In/Out");
+    use_marks.set_active(false);
+    let marks = marks_available(state.media_selection.get(), state.source_clip.get(), state.src_in.get(), state.src_out.get());
+    use_marks.set_sensitive(marks);
+    if !marks {
+        use_marks.set_tooltip_text(Some("Set In/Out on the clip in the viewer's source mode and select it in the Media Pool"));
+    }
+    empty.bind_property("active", &use_marks, "sensitive").transform_to(move |_, empty: bool| Some(marks && !empty)).sync_create().build();
     let (project_w, project_h, project_fps) = state.with_project(|p| (p.width, p.height, p.fps)).unwrap_or((1920, 1080, RationalFps::FPS_30));
     let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
     width.set_value(project_w as f64);
@@ -303,15 +318,35 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     form_row(&grid, 3, "No. of Audio Tracks", &audio);
     form_row(&grid, 4, "Audio Track Type", &audio_type);
     grid.attach(&empty, 1, 5, 1, 1);
-    grid.attach(&reveal, 0, 6, 2, 1);
-    // Bottom left, just above the buttons, as in Resolve.
-    grid.attach(&use_project, 0, 7, 2, 1);
+    grid.attach(&use_marks, 1, 6, 1, 1);
+    grid.attach(&reveal, 0, 7, 2, 1);
+    grid.set_margin_start(24);
+    grid.set_margin_end(24);
+    grid.set_margin_top(12);
+    grid.set_margin_bottom(12);
 
-    let dialog = adw::AlertDialog::builder().heading("Create New Timeline").extra_child(&grid).build();
-    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("create"));
-    dialog.set_close_response("cancel");
+    // Resolve's button row: Use Project Settings bottom left, Cancel and Create right.
+    let cancel = gtk::Button::with_label("Cancel");
+    let create = gtk::Button::with_label("Create");
+    create.add_css_class("suggested-action");
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    let bar = gtk::Box::builder().spacing(8).margin_start(24).margin_end(24).margin_top(8).margin_bottom(12).build();
+    bar.append(&use_project);
+    bar.append(&spacer);
+    bar.append(&cancel);
+    bar.append(&create);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&grid));
+    view.add_bottom_bar(&bar);
+    let dialog = adw::Dialog::builder().title("Create New Timeline").child(&view).build();
+    dialog.set_default_widget(Some(&create));
+    let closer = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(d) = closer.upgrade() {
+            d.close();
+        }
+    });
     let taken = state.with_project(|p| p.timeline_list()).unwrap_or_default();
     // The rate the new timeline gets decides what the Start Timecode means.
     let chosen_fps = {
@@ -321,16 +356,13 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     // The default follows the rate until the user types a different Start Timecode.
     let default_start = Rc::new(std::cell::RefCell::new(start.text().to_string()));
     // Weak: the dialog owns the entry, so a strong ref here would keep both alive forever.
-    let d = dialog.downgrade();
     let check = {
-        let (name, start, chosen_fps) = (name.clone(), start.clone(), chosen_fps.clone());
+        let (name, start, chosen_fps, create) = (name.clone(), start.clone(), chosen_fps.clone(), create.clone());
         move || {
             let typed = name.text().trim().to_lowercase();
             let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
             let valid_start = parse_timecode(&start.text(), chosen_fps()).is_some();
-            if let Some(d) = d.upgrade() {
-                d.set_response_enabled("create", free && valid_start);
-            }
+            create.set_sensitive(free && valid_start);
         }
     };
     let on_name = check.clone();
@@ -354,7 +386,8 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     rate.connect_selected_notify(move |_| follow());
     let state = state.clone();
     let field = name.clone();
-    dialog.connect_response(Some("create"), move |_, _| {
+    let closer = dialog.downgrade();
+    create.connect_clicked(move |_| {
         let typed = field.text().trim().to_string();
         let title = if typed.is_empty() { default.clone() } else { typed };
         let new_fps = chosen_fps();
@@ -365,9 +398,22 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps));
         if !empty.is_active() {
             match state.media_selection.get() {
-                Some(source) => actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None),
+                Some(source) => {
+                    // place_source honours the viewer's marks on this clip; off means the whole clip.
+                    let (src_in, src_out) = (state.src_in.get(), state.src_out.get());
+                    if !use_marks.is_active() {
+                        state.src_in.set(None);
+                        state.src_out.set(None);
+                    }
+                    actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None);
+                    state.src_in.set(src_in);
+                    state.src_out.set(src_out);
+                }
                 None => state.message("No clip is selected in the Media Pool, so the timeline is empty."),
             }
+        }
+        if let Some(d) = closer.upgrade() {
+            d.close();
         }
     });
     dialog.present(Some(parent));
@@ -885,8 +931,18 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
 
 #[cfg(test)]
 mod marker_time_tests {
-    use super::{chosen_timeline_fps, default_start_tc_us, frame_count, one_frame_us, parse_timecode, rate_index, shown_marker_duration_us, stored_marker_duration_us, timeline_fps_choice, timeline_from_form, typed_position_us, RATES};
+    use super::{marks_available, chosen_timeline_fps, default_start_tc_us, frame_count, one_frame_us, parse_timecode, rate_index, shown_marker_duration_us, stored_marker_duration_us, timeline_fps_choice, timeline_from_form, typed_position_us, RATES};
     use tempo_timeline::{AudioTrackType, RationalFps, TrackKind};
+
+    #[test]
+    fn marks_apply_only_to_the_selected_clip_with_a_mark() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(marks_available(Some(a), Some(a), Some(5), None));
+        assert!(marks_available(Some(a), Some(a), None, Some(9)));
+        assert!(!marks_available(Some(a), Some(a), None, None));
+        assert!(!marks_available(Some(a), Some(b), Some(5), Some(9)));
+        assert!(!marks_available(None, None, Some(5), Some(9)));
+    }
 
     #[test]
     fn typed_position_subtracts_start_timecode() {
