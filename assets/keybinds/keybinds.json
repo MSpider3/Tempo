@@ -570,8 +570,28 @@
     "<Primary>t"
    ],
    "alt": [],
-   "label": "Cross Dissolve into the Selected Clip",
+   "label": "Add Transition (picture and sound)",
    "resolve": "editAddTransition"
+  },
+  {
+   "group": "Editing",
+   "action": "win.transition-add-video",
+   "keys": [
+    "<Alt>t"
+   ],
+   "alt": [],
+   "label": "Add Video Transition",
+   "resolve": "editAddVideoTransition"
+  },
+  {
+   "group": "Editing",
+   "action": "win.transition-add-audio",
+   "keys": [
+    "<Shift>t"
+   ],
+   "alt": [],
+   "label": "Add Audio Transition",
+   "resolve": "editAddAudioTransition"
   },
   {
    "group": "Trimming",
