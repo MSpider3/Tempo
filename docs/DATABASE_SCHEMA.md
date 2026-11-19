@@ -20,7 +20,12 @@
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
 >
-> **Updated 2026-11-19.** The schema is now **version 5**. Migration 5 adds `start_tc_us`,
+> **Updated 2026-11-19.** The schema is now **version 6**. Migration 6 adds `fps_num` and
+> `fps_den` to `timelines` (own frame rate when "Use Project Settings" was off, NULL = the
+> project's) and `enabled` to `transitions` (the Inspector's Video/Audio switch; 0 plays as
+> a cut). Marker colours 6-16 are Resolve's other colours (the column was already an integer).
+>
+> **Earlier on 2026-11-19.** The schema became **version 5**. Migration 5 adds `start_tc_us`,
 > `width` and `height` to `timelines` (Start Timecode; own size when "Use Project Settings"
 > was off, NULL = the project's), `audio_type` to `tracks` (0 mono, 1 stereo), `keyword` to
 > `markers`, and `start_ratio`, `end_ratio` and `curve` (JSON `[[place, value], ...]`) to
@@ -99,7 +104,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **5**
+Current schema version: **6**
 
 ---
 
@@ -413,6 +418,8 @@ CREATE TABLE markers (
     position_us INTEGER NOT NULL,
     name        TEXT NOT NULL DEFAULT '',
     color       INTEGER NOT NULL DEFAULT 0,   -- 0=red 1=green 2=blue 3=yellow 4=orange 5=purple
+                                              -- 6=cyan 7=pink 8=fuchsia 9=rose 10=lavender 11=sky
+                                              -- 12=mint 13=lemon 14=sand 15=cocoa 16=cream
     duration_us INTEGER NOT NULL DEFAULT 0,   -- 0=point marker
     note        TEXT NOT NULL DEFAULT ''
 );

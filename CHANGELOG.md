@@ -62,7 +62,8 @@ All notable changes to Tempo are recorded here. The format follows
   selected in the Media Pool.
 - Create New Timeline has **Start Timecode** (01:00:00:00 by default), **Audio Track Type**
   (Mono or Stereo) and **Use Project Settings**. Turn that off to give the timeline its own
-  width and height; the frame rate stays the project's. The ruler, viewer, timecode label,
+  width, height and frame rate. Timecode, frame steps, snapping, transition limits,
+  playback and export of that timeline use its own rate. The ruler, viewer, timecode label,
   marker times and EDL export count from the Start Timecode.
 - Audio track headers show "2.0" (stereo) or "1.0" (mono). A mono track plays down the
   middle, in playback and export.
@@ -71,6 +72,20 @@ All notable changes to Tempo are recorded here. The format follows
   tracks and place the clip in one undo step. An audio-only clip dragged below the last
   audio track makes a new audio track. A box shows where the clip will land, the drag shows
   the clip's thumbnail, and the first drop on an empty timeline zooms to fit.
+- **Resolve's 16 marker colours** in the Markers dialog (Blue, Cyan, Green, Yellow, Red,
+  Pink, Purple, Fuchsia, Rose, Lavender, Sky, Mint, Lemon, Sand, Cocoa, Cream), on the ruler
+  and on the viewer. A point marker's Duration reads 00:00:00:01, as in Resolve.
+- The Inspector's transition page has a **Video** (or **Audio**) header with an on/off
+  switch. Off, the transition stays on the timeline (dimmed) but plays and exports as a cut.
+- **Transition Curve graph** in the Inspector: click to add a key, drag a key to move it,
+  each drag is one undo step.
+- The transition edge tooltip shows how far the dragged edge moved (`+` is right) and then
+  the new length, as in Resolve.
+- The drop box is blue with the clip's thumbnail for video and green for audio.
+- **End-to-end tests on Wayland.** `scripts/e2e.sh` runs the real app on a private headless
+  mutter with real mouse and keyboard input and screenshots, and never touches your own
+  desktop. Any person or AI can add a scenario; see `docs/TESTING_E2E.md`.
+- Project files now use schema 6.
 - **Edit animations**: trims, deletes and ripples slide clips, transitions, the playhead and
   the view into place over about 120 ms instead of jumping.
 - **Upload from the Export page**, as Resolve's "Upload directly to YouTube": when an uploader
