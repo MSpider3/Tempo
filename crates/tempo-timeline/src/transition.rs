@@ -24,8 +24,12 @@
 //! [`STANDARD_TRANSITION_US`] (1 s). The part of a cut transition before the cut shows
 //! B's footage from before its In point (head handle); the part after it shows A's
 //! footage after its Out point (tail handle). Each part also fits inside the clip it
-//! covers. Head and tail transitions fit inside their clip. [`Track::max_transition_us`]
-//! gives the longest allowed; nothing here trims clips to make room.
+//! covers. Head and tail transitions fit inside their clip. A clip's two ends share it:
+//! what its In transition covers plus what lies at its end (its Out transition, or the
+//! part of the next cut's transition before that cut) is at most its length.
+//! [`Track::max_transition_us`] gives the longest allowed; nothing here trims clips to
+//! make room. Saved data that breaks this is shrunk when drawn and in
+//! [`Track::transition_span`]: the In edge keeps its length, the end gets what is left.
 //!
 //! # Rendering
 //! [`Track::transition_layers`] turns a track's transitions into things the renderers
@@ -248,30 +252,48 @@ impl Track {
         at.into_iter().filter_map(|p| self.edit_at(p)).collect()
     }
 
+    /// How much of `clip`, from its start, its In transition covers (head fade or the
+    /// part of a cut transition after the cut). This edge has first claim on the clip.
+    fn in_use(&self, clip: &Clip) -> i64 {
+        let Some(t) = self.transition_at_edit(clip.id, TransitionEdge::In) else { return 0 };
+        let d = t.duration_us.max(0);
+        let inside = if self.clip_ending_at(clip.timeline_in).is_some() { d - before_cut(t) } else { d };
+        inside.clamp(0, clip.duration_us())
+    }
+
+    /// How much of `clip`, up to its end, its Out transition or the part of the next
+    /// cut's transition before that cut asks for, whichever is longer.
+    fn out_use(&self, clip: &Clip) -> i64 {
+        let tail = self.transition_at_edit(clip.id, TransitionEdge::Out).map_or(0, |t| t.duration_us);
+        let next = self
+            .clip_starting_at(clip.timeline_out)
+            .and_then(|n| self.transition_at_edit(n.id, TransitionEdge::In))
+            .map_or(0, before_cut);
+        tail.max(next).clamp(0, clip.duration_us())
+    }
+
     fn shape(&self, t: &Transition) -> Option<Shape<'_>> {
         let clip = self.find_clip(t.clip_id)?;
         let d = t.duration_us.max(0);
+        // A clip's In edge keeps its length; what lies at its end gets what is left.
         if t.edge == TransitionEdge::Out {
-            return Some(Shape::Tail(clip, d.min(clip.duration_us())));
+            return Some(Shape::Tail(clip, d.min(clip.duration_us() - self.in_use(clip))));
         }
         let Some(outgoing) = self.clip_ending_at(clip.timeline_in) else {
             return Some(Shape::Head(clip, d.min(clip.duration_us())));
         };
-        let before = match t.alignment {
-            TransitionAlignment::Centered => d / 2,
-            TransitionAlignment::EndAtCut => d,
-            TransitionAlignment::StartAtCut => 0,
-        };
+        let before = before_cut(t);
         Some(Shape::Cut {
             outgoing,
             incoming: clip,
-            before: before.min(outgoing.duration_us()),
+            before: before.min(outgoing.duration_us() - self.in_use(outgoing)).max(0),
             after: (d - before).min(clip.duration_us()),
         })
     }
 
     /// Timeline start and end of a transition on this track, `None` if its clip is not
-    /// here. Limited to the clips it covers, not to the footage there is.
+    /// here. Limited to the clips it covers (sharing a clip with the transition at its
+    /// other end, see `max_transition_us`), not to the footage there is.
     pub fn transition_span(&self, t: &Transition) -> Option<(i64, i64)> {
         Some(match self.shape(t)? {
             Shape::Cut { incoming, before, after, .. } => (incoming.timeline_in - before, incoming.timeline_in + after),
@@ -282,8 +304,10 @@ impl Track {
 
     /// The longest transition, in whole frames, that fits on a clip edge with this
     /// alignment where the clips are now: limited by the handles (`sources` gives each
-    /// source's length; a source not in it is not limited) and the clips' lengths.
-    /// 0 when the clip is not on this track or nothing fits.
+    /// source's length; a source not in it is not limited) and the clips' lengths, less
+    /// what the transition at each clip's other end already covers: a clip's two
+    /// transitions together never cover more than the clip. 0 when the clip is not on
+    /// this track or nothing fits.
     pub fn max_transition_us(
         &self,
         clip_id: Uuid,
@@ -294,10 +318,11 @@ impl Track {
     ) -> i64 {
         let Some(clip) = self.find_clip(clip_id) else { return 0 };
         let longest = match (edge, self.clip_ending_at(clip.timeline_in)) {
-            (TransitionEdge::Out, _) | (TransitionEdge::In, None) => clip.duration_us(),
+            (TransitionEdge::Out, _) => clip.duration_us() - self.in_use(clip),
+            (TransitionEdge::In, None) => clip.duration_us() - self.out_use(clip),
             (TransitionEdge::In, Some(outgoing)) => {
-                let before = head_room(clip).min(outgoing.duration_us());
-                let after = tail_room(outgoing, sources).min(clip.duration_us());
+                let before = head_room(clip).min(outgoing.duration_us() - self.in_use(outgoing)).max(0);
+                let after = tail_room(outgoing, sources).min(clip.duration_us() - self.out_use(clip)).max(0);
                 match alignment {
                     TransitionAlignment::EndAtCut => before,
                     TransitionAlignment::StartAtCut => after,
@@ -340,6 +365,12 @@ impl Track {
                 _ => {}
             }
         }
+        // As `Clip::with_fade`: the fades of a clip never overlap, so every renderer agrees.
+        for c in &mut layers.clips {
+            let (dur, p) = (c.duration_us(), &mut c.properties);
+            p.fade_in_us = p.fade_in_us.clamp(0, dur);
+            p.fade_out_us = p.fade_out_us.clamp(0, dur - p.fade_in_us);
+        }
         layers
     }
 
@@ -347,6 +378,8 @@ impl Track {
     /// before them into cross dissolves ending on the cut, as they were drawn, and clears
     /// the field. Run on load.
     pub fn convert_legacy_dissolves(&mut self) {
+        // Sound gets Resolve's audio Cross Fade, so it stays a sound transition.
+        let kind = if self.kind == crate::types::TrackKind::Audio { TransitionKind::Crossfade } else { TransitionKind::CrossDissolve };
         let found: Vec<(Uuid, i64)> = self
             .clips
             .iter()
@@ -358,7 +391,7 @@ impl Track {
                 clip.properties.dissolve_in_us = 0;
             }
             if d > 0 && self.transition_at_edit(clip_id, TransitionEdge::In).is_none() {
-                self.transitions.push(Transition::new(clip_id, TransitionEdge::In, TransitionKind::CrossDissolve, d, TransitionAlignment::EndAtCut));
+                self.transitions.push(Transition::new(clip_id, TransitionEdge::In, kind.clone(), d, TransitionAlignment::EndAtCut));
             }
         }
     }
@@ -374,6 +407,16 @@ impl Track {
         for t in self.transitions.iter_mut().filter(|t| t.clip_id == from && t.edge == edge) {
             t.clip_id = to;
         }
+    }
+}
+
+/// How much of a cut transition lies before the cut, by its alignment.
+fn before_cut(t: &Transition) -> i64 {
+    let d = t.duration_us.max(0);
+    match t.alignment {
+        TransitionAlignment::Centered => d / 2,
+        TransitionAlignment::EndAtCut => d,
+        TransitionAlignment::StartAtCut => 0,
     }
 }
 
@@ -781,5 +824,83 @@ mod tests {
         assert_eq!(frame_floor_us(1_040_000, FPS), 1_040_000);
         assert!(frame_floor_us(1_000_000, RationalFps::FPS_23_976) <= 1_000_000);
         assert_eq!(frame_floor_us(-5, FPS), 0);
+    }
+
+    /// V1 with A [0, 4 s], B [4, 4.6 s], C [4.6, 8 s], each with 2 s of handle on both sides.
+    fn short_middle_clip() -> (Timeline, HashMap<Uuid, MediaSource>, [Uuid; 3]) {
+        let mut tl = Timeline::new_default();
+        let track = tl.tracks[0].id;
+        let mut sources = HashMap::new();
+        let mut ids = [Uuid::nil(); 3];
+        for (i, (tin, tout)) in [(0, 4 * S), (4 * S, 4_600_000), (4_600_000, 8 * S)].into_iter().enumerate() {
+            let src = MediaSource::new(PathBuf::from("m"), MediaType::Video, 20 * S);
+            let c = Clip::new(track, src.id, ClipType::Video, "m", tin, tout, 2 * S, 2 * S + tout - tin);
+            sources.insert(src.id, src);
+            ids[i] = c.id;
+            tl.tracks[0].clips.push(c);
+        }
+        (tl, sources, ids)
+    }
+
+    fn assert_no_overlap(clips: &[Clip]) {
+        for (i, x) in clips.iter().enumerate() {
+            for y in &clips[i + 1..] {
+                assert!(x.timeline_out <= y.timeline_in || y.timeline_out <= x.timeline_in, "{:?} overlaps {:?}", (x.timeline_in, x.timeline_out), (y.timeline_in, y.timeline_out));
+            }
+        }
+    }
+
+    #[test]
+    fn both_cuts_of_a_short_clip_share_its_length() {
+        let (mut tl, sources, [_, b, c]) = short_middle_clip();
+        tl.tracks[0].transitions.push(dissolve(b, TransitionEdge::In, S, TransitionAlignment::Centered));
+        // 0.5 s of B is used by its first cut, so the second can only put 0.1 s into B.
+        assert_eq!(tl.tracks[0].max_transition_us(c, TransitionEdge::In, TransitionAlignment::Centered, &sources, FPS), 200_000);
+        assert_eq!(tl.tracks[0].max_transition_us(c, TransitionEdge::In, TransitionAlignment::EndAtCut, &sources, FPS), 80_000);
+        // And the first cut can only put 0.6 s - what the second uses into B.
+        tl.tracks[0].transitions.push(dissolve(c, TransitionEdge::In, 200_000, TransitionAlignment::Centered));
+        assert_eq!(tl.tracks[0].max_transition_us(b, TransitionEdge::In, TransitionAlignment::StartAtCut, &sources, FPS), 480_000);
+        assert_eq!(tl.tracks[0].max_transition_us(b, TransitionEdge::Out, TransitionAlignment::EndAtCut, &sources, FPS), 80_000);
+    }
+
+    #[test]
+    fn saved_cuts_that_overlap_in_a_short_clip_are_shrunk() {
+        let (mut tl, sources, [_, b, c]) = short_middle_clip();
+        tl.tracks[0].transitions.push(dissolve(b, TransitionEdge::In, S, TransitionAlignment::Centered));
+        tl.tracks[0].transitions.push(dissolve(c, TransitionEdge::In, S, TransitionAlignment::Centered));
+        let layers = tl.tracks[0].transition_layers(&sources);
+        assert_no_overlap(&layers.mix);
+        // The earlier cut keeps its length; the later one gets what is left of B.
+        let track = &tl.tracks[0];
+        assert_eq!(track.transition_span(&track.transitions[0]), Some((3_500_000, 4_500_000)));
+        assert_eq!(track.transition_span(&track.transitions[1]), Some((4_500_000, 5_100_000)));
+    }
+
+    #[test]
+    fn head_and_tail_of_a_lone_clip_never_overlap() {
+        let (mut tl, sources, a, b) = setup();
+        tl.tracks[0].clips.retain(|c| c.id != b);
+        tl.tracks[0].clips[0].timeline_out = 1_500_000;
+        tl.tracks[0].transitions.push(dissolve(a, TransitionEdge::In, S, TransitionAlignment::StartAtCut));
+        // 0.5 s left is 12.5 frames: 12 whole ones.
+        assert_eq!(tl.tracks[0].max_transition_us(a, TransitionEdge::Out, TransitionAlignment::EndAtCut, &sources, FPS), 480_000);
+        tl.tracks[0].transitions.push(dissolve(a, TransitionEdge::Out, S, TransitionAlignment::EndAtCut));
+        let layers = tl.tracks[0].transition_layers(&sources);
+        let p = &layers.clips[0].properties;
+        assert_eq!((p.fade_in_us, p.fade_out_us), (S, 500_000));
+        // The clip's own fade is kept within what the transition leaves too.
+        tl.tracks[0].transitions.pop();
+        tl.tracks[0].clips[0].properties.fade_out_us = 1_200_000;
+        let p = &tl.tracks[0].transition_layers(&sources).clips[0].properties;
+        assert_eq!((p.fade_in_us, p.fade_out_us), (S, 500_000));
+    }
+
+    #[test]
+    fn old_dissolves_on_sound_become_cross_fades() {
+        let (mut tl, _, _, b) = setup();
+        tl.tracks[0].kind = crate::types::TrackKind::Audio;
+        tl.tracks[0].clips[1].properties.dissolve_in_us = 500_000;
+        tl.tracks[0].convert_legacy_dissolves();
+        assert_eq!(tl.tracks[0].transition_at_edit(b, TransitionEdge::In).map(|t| t.kind.clone()), Some(TransitionKind::Crossfade));
     }
 }
