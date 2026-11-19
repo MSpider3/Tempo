@@ -111,6 +111,12 @@ pub struct ClipProperties {
     pub fade_in_us: i64,
     #[serde(default)]
     pub fade_out_us: i64,
+    /// Set by `Track::transition_layers` on a video transition's fade: the transition's
+    /// Ease, ratios and curve shape that fade's ramp. Never saved; own fades stay linear.
+    #[serde(skip)]
+    pub fade_in_shape: Option<Box<Transition>>,
+    #[serde(skip)]
+    pub fade_out_shape: Option<Box<Transition>>,
     /// Cross dissolve: this clip starts appearing this long *before* its start,
     /// over the end of the clip it touches, using footage from before its In point.
     /// Deprecated: kept so old files still read; loading turns it into a `Transition`
@@ -152,6 +158,8 @@ impl Default for ClipProperties {
             enabled: true,
             fade_in_us: 0,
             fade_out_us: 0,
+            fade_in_shape: None,
+            fade_out_shape: None,
             dissolve_in_us: 0,
             link: None,
             effects: Vec::new(),
@@ -424,10 +432,12 @@ impl Clip {
         let to_end = self.timeline_out - timeline_time_us;
         let mut factor = 1.0f32;
         if p.fade_in_us > 0 && from_start < p.fade_in_us {
-            factor = factor.min(from_start.max(0) as f32 / p.fade_in_us as f32);
+            let ramp = from_start.max(0) as f32 / p.fade_in_us as f32;
+            factor = factor.min(p.fade_in_shape.as_ref().map_or(ramp, |t| t.progress_at(ramp)));
         }
         if p.fade_out_us > 0 && to_end < p.fade_out_us {
-            factor = factor.min(to_end.max(0) as f32 / p.fade_out_us as f32);
+            let ramp = to_end.max(0) as f32 / p.fade_out_us as f32;
+            factor = factor.min(p.fade_out_shape.as_ref().map_or(ramp, |t| 1.0 - t.progress_at(1.0 - ramp)));
         }
         factor
     }
