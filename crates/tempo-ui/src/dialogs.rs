@@ -185,6 +185,11 @@ fn typed_position_us(text: &str, fps: f64, start_tc_us: i64) -> Option<i64> {
     parse_timecode(text, fps).map(|us| us - start_tc_us).filter(|us| *us >= 0)
 }
 
+/// Resolve's 01:00:00:00 counted in frames, so it reads that at 23.976/29.97/59.94 too.
+fn default_start_tc_us(fps: f64) -> i64 {
+    parse_timecode("01:00:00:00", fps).unwrap_or(tempo_timeline::RESOLVE_START_TC_US)
+}
+
 /// What the Create New Timeline dialog asks for, as a timeline.
 fn timeline_from_form(name: String, video: u32, audio: u32, audio_type: AudioTrackType, start_tc_us: i64, resolution: Option<(u32, u32)>) -> Timeline {
     let mut timeline = Timeline::with_tracks(name, video, audio);
@@ -209,7 +214,7 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let video = tracks("No. of Video Tracks");
     let audio = tracks("No. of Audio Tracks");
     let fps = state.fps();
-    let start = gtk::Entry::builder().text(timecode(tempo_timeline::RESOLVE_START_TC_US, fps)).activates_default(true).build();
+    let start = gtk::Entry::builder().text(timecode(default_start_tc_us(fps), fps)).activates_default(true).build();
     let audio_type = gtk::DropDown::from_strings(&["Mono", "Stereo"]);
     audio_type.set_selected(1);
     let switch = || gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
@@ -268,7 +273,7 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     dialog.connect_response(Some("create"), move |_, _| {
         let typed = field.text().trim().to_string();
         let title = if typed.is_empty() { default.clone() } else { typed };
-        let start_tc_us = parse_timecode(&start.text(), fps).unwrap_or(tempo_timeline::RESOLVE_START_TC_US);
+        let start_tc_us = parse_timecode(&start.text(), fps).unwrap_or_else(|| default_start_tc_us(fps));
         let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
         let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
         state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution));
@@ -794,7 +799,7 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
 
 #[cfg(test)]
 mod marker_time_tests {
-    use super::{parse_timecode, timeline_from_form, typed_position_us};
+    use super::{default_start_tc_us, parse_timecode, timeline_from_form, typed_position_us};
     use tempo_timeline::{AudioTrackType, TrackKind};
 
     #[test]
@@ -803,6 +808,13 @@ mod marker_time_tests {
         assert_eq!(typed_position_us("01:00:01:00", 24.0, start), Some(1_000_000));
         assert_eq!(typed_position_us("01:00:00:00", 24.0, start), Some(0));
         assert_eq!(typed_position_us("00:59:59:00", 24.0, start), None);
+    }
+
+    #[test]
+    fn default_start_reads_one_hour_at_ntsc_rates() {
+        for fps in [23.976, 29.97, 59.94, 24.0, 25.0] {
+            assert_eq!(crate::state::timecode(default_start_tc_us(fps), fps), "01:00:00:00", "{fps}");
+        }
     }
 
     #[test]

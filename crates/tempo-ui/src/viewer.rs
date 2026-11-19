@@ -9,7 +9,7 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib};
 
 use crate::player::{Player, Snapshot};
-use crate::state::{AppState, Change};
+use crate::state::{timecode, AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
 
@@ -231,7 +231,9 @@ impl Viewer {
             }
             let pos = player.position_us();
             if pos != last_pos.replace(pos) {
-                tc.set_text(&v.state.position_tc(pos));
+                // Only timeline positions carry the Start Timecode; a source's own time does not.
+                let on_timeline = !v.source_only && !v.state.source_mode();
+                tc.set_text(&if on_timeline { v.state.position_tc(pos) } else { timecode(pos, v.state.fps()) });
                 v.update_marker_box();
                 v.scrub.set_value(pos as f64);
                 for l in v.position_listeners.borrow().iter() {
