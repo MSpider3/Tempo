@@ -243,20 +243,52 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
 }
 
 /// Ask for the details of an upload, then run the plugin's uploader on a worker.
-pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: crate::plugins::Uploader, file: std::path::PathBuf, title: &str, description: &str) {
-    let title_entry = gtk::Entry::builder().text(title).build();
+/// `draft` holds the starting values; its token is ignored.
+pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: crate::plugins::Uploader, draft: tempo_plugin::UploadInput) {
+    let title_entry = gtk::Entry::builder().text(draft.title.as_str()).build();
     let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
-    text.buffer().set_text(description);
+    text.buffer().set_text(&draft.description);
     let description_box = gtk::ScrolledWindow::builder().child(&text).min_content_height(110).min_content_width(320).css_classes(["card"]).build();
+    let privacy = gtk::DropDown::from_strings(&["Private", "Unlisted", "Public"]);
+    privacy.set_selected(tempo_plugin::PRIVACY.iter().position(|p| *p == draft.privacy).unwrap_or(0) as u32);
+    let category = gtk::DropDown::from_strings(&tempo_plugin::CATEGORIES);
+    category.set_selected(tempo_plugin::CATEGORIES.iter().position(|c| *c == draft.category).unwrap_or(0) as u32);
+    let thumb_entry = gtk::Entry::builder().hexpand(true).placeholder_text("No thumbnail").build();
+    if let Some(t) = &draft.thumbnail {
+        thumb_entry.set_text(&t.to_string_lossy());
+    }
+    let thumb_pick = gtk::Button::with_label("…");
+    thumb_pick.set_tooltip_text(Some("Choose a thumbnail image (jpg or png)"));
+    let entry = thumb_entry.clone();
+    thumb_pick.connect_clicked(move |b| {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images (jpg, png)"));
+        filter.add_mime_type("image/jpeg");
+        filter.add_mime_type("image/png");
+        let dialog = gtk::FileDialog::builder().title("Thumbnail").modal(true).default_filter(&filter).build();
+        let entry = entry.clone();
+        dialog.open(b.root().and_downcast::<gtk::Window>().as_ref(), gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let thumb_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    thumb_row.append(&thumb_entry);
+    thumb_row.append(&thumb_pick);
     let token = gtk::PasswordEntry::builder().show_peek_icon(true).build();
 
     let grid = form_grid();
     form_row(&grid, 0, "Title", &title_entry);
     form_row(&grid, 1, "Description", &description_box);
-    form_row(&grid, 2, "Access token", &token);
+    form_row(&grid, 2, "Thumbnail", &thumb_row);
+    form_row(&grid, 3, "Privacy", &privacy);
+    form_row(&grid, 4, "Category", &category);
+    form_row(&grid, 5, "Access token", &token);
     let hint = label(&format!("The token is kept in your keyring and given only to {}.", uploader.plugin.name), &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
-    grid.attach(&hint, 1, 3, 1, 1);
+    grid.attach(&hint, 1, 6, 1, 1);
+    let file = draft.file;
 
     // Fill in the token saved last time.
     let id = uploader.plugin.id.clone();
@@ -281,6 +313,9 @@ pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: cr
             file: file.clone(),
             title: title_entry.text().trim().to_string(),
             description: buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string(),
+            privacy: tempo_plugin::PRIVACY.get(privacy.selected() as usize).unwrap_or(&"private").to_string(),
+            category: tempo_plugin::CATEGORIES.get(category.selected() as usize).unwrap_or(&"Film & Animation").to_string(),
+            thumbnail: Some(thumb_entry.text().trim().to_string()).filter(|t| !t.is_empty()).map(std::path::PathBuf::from),
             token: token.text().to_string(),
         };
         let (state, uploader, parent) = (state.clone(), uploader.clone(), parent_widget.clone());

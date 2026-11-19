@@ -45,8 +45,16 @@
 > filters needs no `main.lua`. See `assets/plugins/filters/plugin.toml`.
 >
 > **Upload targets** work: an `[[uploader]]` entry (`id`, `name`, `function`) appears in
-> **Share…** on a finished export. Its function gets
-> `{ title, description, token, file_name, size }` and may return the video's address. It can
+> **Share…** on a finished export, and as an **Upload directly to {name}** section in Render
+> Settings (title, description, thumbnail, privacy, category; saved per queued job, sent when
+> the render finishes using the keyring token, or through the upload dialog when none is saved).
+> Its function gets
+> `{ title, description, privacy, category, token, file_name, size }` plus, when the user chose a
+> cover image, `thumbnail_name` and `thumbnail_size`. `privacy` is `private`, `unlisted` or
+> `public`; `category` is YouTube's category name, such as `Film & Animation`. The function may
+> return the video's address. `tempo.http.upload{ ..., thumbnail = true }` sends the cover image
+> instead of the video (the script never sees either path). Plugins written before these fields
+> existed keep working; the fields are just extra. It can
 > call `tempo.http.request{ url, method, headers, body }`,
 > `tempo.http.upload{ url, method, headers, field, form }` (sends the exported file, as the
 > body or as form field `field`), `tempo.json.encode/decode` and `tempo.notify`. Requests go
