@@ -249,10 +249,19 @@ impl ExportPage {
         let p = page.clone();
         page.range.connect_selected_notify(move |_| p.update_size_cards());
         let p = page.clone();
+        // The file name follows the open timeline; edits to the same timeline keep what was typed.
+        let shown = std::cell::Cell::new(state.with_timeline(|t| t.id));
         state.connect(move |change| {
             p.update_size_cards();
             match change {
-                Change::Project => p.load_defaults(),
+                Change::Project => {
+                    shown.set(p.state.with_timeline(|t| t.id));
+                    p.load_defaults();
+                }
+                Change::Timeline if shown.get() != p.state.with_timeline(|t| t.id) => {
+                    shown.set(p.state.with_timeline(|t| t.id));
+                    p.file_name.set_text(&p.state.with_project(default_file_name).unwrap_or_default());
+                }
                 // The Share menus list the upload targets of enabled plugins.
                 Change::Plugins => p.rebuild_queue(),
                 _ => {}
