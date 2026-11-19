@@ -44,6 +44,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gio, GLib, Gst  # noqa: E402
 
+from e2e_find import E2EError, FindMixin, center  # noqa: E402  (re-exported for scenarios)
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 DEFAULT_APP = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "e2e-bin" / "tempo"  # copied there by scripts/e2e.sh
@@ -61,17 +63,7 @@ KEYSYMS = {
 STEP_DELAY = 0.03  # between low-level input events, like a quick human
 
 
-class E2EError(AssertionError):
-    """A failed expectation or a harness step that did not happen in time."""
-
-
 # ---- Small helpers ---------------------------------------------------------------------
-
-
-def center(rect):
-    """Middle of an [x, y, w, h] rectangle."""
-    x, y, w, h = rect
-    return (x + w / 2.0, y + h / 2.0)
 
 
 def keysym(name: str) -> int:
@@ -183,7 +175,7 @@ class Control:
 # ---- Session -------------------------------------------------------------------------------
 
 
-class Session:
+class Session(FindMixin):
     """Compositor + app + input + screenshots for one test. Use as a context manager."""
 
     def __init__(self, project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None, start_timeout=60.0):
@@ -392,14 +384,22 @@ class Session:
         self.control.call("wait-idle")
 
     def settle(self, quiet=0.25, timeout=5.0):
-        """Wait until the screen has not changed for `quiet` seconds (or `timeout`)."""
+        """Wait until what the screen shows is unchanged over `quiet` seconds (or `timeout`).
+        Compares pixels, not frame arrival: some widgets redraw identical content constantly."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
-                since = time.monotonic() - self._frame_at
-            if since >= quiet:
+                a = self._frame
+            time.sleep(quiet)
+            with self._lock:
+                b = self._frame
+            if a is b or a.data == b.data:
                 return
-            time.sleep(0.05)
+
+    def _after_input(self):
+        # Animations (dialogs, revealers) move widgets after the input is handled.
+        self.wait_idle()
+        self.settle(quiet=0.1, timeout=1.0)
 
     # -- D-Bus, RemoteDesktop, ScreenCast
 
@@ -488,7 +488,7 @@ class Session:
             self.mouse_up(button)
         for m in reversed(mods):
             self._rd("NotifyKeyboardKeysym", "(ub)", MODIFIERS[m], False)
-        self.wait_idle()
+        self._after_input()
 
     def double_click(self, x, y):
         self.click(x, y, count=2)
@@ -521,13 +521,13 @@ class Session:
         self.mouse_up()
         for m in reversed(mods):
             self._rd("NotifyKeyboardKeysym", "(ub)", MODIFIERS[m], False)
-        self.wait_idle()
+        self._after_input()
 
     def scroll(self, x, y, steps=1, horizontal=False):
         """Mouse wheel at x,y: positive steps scroll down (or right)."""
         self.move(x, y)
         self._rd("NotifyPointerAxisDiscrete", "(ui)", 1 if horizontal else 0, int(steps))
-        self.wait_idle()
+        self._after_input()
 
     def key(self, combo: str):
         """Press and release a key with modifiers: "ctrl+t", "shift+[", "alt+t", "BackSpace", "Up"."""
@@ -541,7 +541,7 @@ class Session:
         self._rd("NotifyKeyboardKeysym", "(ub)", sym, False)
         for k in reversed(held):
             self._rd("NotifyKeyboardKeysym", "(ub)", k, False)
-        self.wait_idle()
+        self._after_input()
 
     def type_text(self, text: str):
         """Type text character by character (the compositor adds Shift where needed)."""
@@ -549,7 +549,7 @@ class Session:
             sym = keysym(ch)
             self._rd("NotifyKeyboardKeysym", "(ub)", sym, True)
             self._rd("NotifyKeyboardKeysym", "(ub)", sym, False)
-        self.wait_idle()
+        self._after_input()
 
     # -- looking
 
@@ -586,158 +586,7 @@ class Session:
         """Setup only: run a GAction or TEMPO_ACTIONS step inside the app. Do not use it
         for what a test is meant to check; drive that with real input."""
         self.control.call(f"action {step}")
-        self.wait_idle()
-
-    # -- finding things
-
-    def widgets(self, text=None, type=None, tooltip=None, css=None, contains=None, geometry=None):
-        """Mapped widgets matching all the given filters (exact `text`, substring `contains`)."""
-        found = []
-        for w in (geometry or self.geometry())["widgets"]:
-            if text is not None and w.get("text") != text:
-                continue
-            if contains is not None and contains not in (w.get("text") or ""):
-                continue
-            if type is not None and w["type"] != type:
-                continue
-            if tooltip is not None and tooltip not in (w.get("tooltip") or ""):
-                continue
-            if css is not None and css not in w["css"]:
-                continue
-            if w["rect"][2] <= 0 or w["rect"][3] <= 0:
-                continue
-            found.append(w)
-        return found
-
-    def widget(self, timeout=5.0, **filters):
-        """The first widget matching `filters` (see `widgets`), waiting for it to appear."""
-        return self.wait_for(lambda: next(iter(self.widgets(**filters)), None), f"a widget {filters}", timeout)
-
-    def row_widgets(self, label: str, type: str, geometry=None):
-        """The `type` widgets on the same row as the label `label` (Inspector, dialogs), left
-        to right: right of the label, vertical middle within the label's height."""
-        geo = geometry or self.geometry()
-        for lab in self.widgets(text=label, type="GtkLabel", geometry=geo):
-            lx, ly, lw, lh = lab["rect"]
-            cy = ly + lh / 2
-            found = [w for w in self.widgets(type=type, geometry=geo) if w["rect"][0] >= lx + lw - 2 and abs(w["rect"][1] + w["rect"][3] / 2 - cy) <= max(lh, 14)]
-            if found:
-                return sorted(found, key=lambda w: w["rect"][0])
-        return []
-
-    def row_widget(self, label: str, type: str, index=0, timeout=5.0):
-        """The index-th `type` widget on the row of `label` (see `row_widgets`), scrolled
-        into view, waiting for it to appear."""
-        def find():
-            found = self.row_widgets(label, type)
-            return found[index] if len(found) > index else None
-        self.wait_for(find, f"a {type} on the row of {label!r}", timeout)
-        return self.scroll_into_view(find)
-
-    def scroll_into_view(self, find, attempts=20):
-        """Scroll the wheel over the enclosing GtkScrolledWindow until `find()`'s widget is
-        fully inside it; return the widget as it is then."""
-        for _ in range(attempts):
-            geo = self.geometry()
-            w = find()
-            sw = self.ancestor(next((g for g in geo["widgets"] if g["id"] == w["id"] and g["type"] == w["type"]), w), "GtkScrolledWindow", geo)
-            if sw is None:
-                return w
-            sx, sy, swid, sh = sw["rect"]
-            x, y, wid, h = w["rect"]
-            if y >= sy and y + h <= sy + sh:
-                return w
-            self.scroll(sx + swid / 2, sy + sh / 2, 2 if y + h > sy + sh else -2)
-            self.settle(quiet=0.15)
-        raise E2EError(f"could not scroll {w.get('type')} {w.get('text')!r} into view")
-
-    def ancestor(self, widget, type, geometry):
-        """The nearest enclosing widget of `type` (e.g. the button around a label)."""
-        items = geometry["widgets"]
-        parent = widget.get("parent")
-        while parent is not None:
-            if items[parent]["type"] == type:
-                return items[parent]
-            parent = items[parent].get("parent")
-        return None
-
-    def descendants(self, widget, type=None, geometry=None):
-        """Widgets inside `widget` (optionally only of `type`)."""
-        geo = geometry or self.geometry()
-        inside, out = {widget["id"]}, []
-        for w in geo["widgets"]:
-            if w.get("parent") in inside:
-                inside.add(w["id"])
-                if type is None or w["type"] == type:
-                    out.append(w)
-        return out
-
-    def fill(self, widget, text, enter=True):
-        """Click into a text field (an Entry, a SpinButton's text, ...), select all, type
-        `text`, and press Return. Clicks the GtkText part, never a +/- button."""
-        if widget["type"] != "GtkText":
-            texts = self.descendants(widget, "GtkText")
-            widget = texts[0] if texts else widget
-        self.click(*center(widget["rect"]))
-        self.key("ctrl+a")
-        self.type_text(text)
-        if enter:
-            self.key("Return")
-
-    def open_panel(self, label):
-        """Click a top-bar panel toggle ("Media Pool", "Effects", "Inspector") unless it is on."""
-        def toggle():
-            geo = self.geometry()
-            for lab in self.widgets(text=label, type="GtkLabel", geometry=geo):
-                button = self.ancestor(lab, "GtkToggleButton", geo)
-                if button:
-                    return button
-            raise E2EError(f"no panel toggle labelled {label!r}")
-
-        if not toggle()["active"]:
-            self.click(*center(toggle()["rect"]))
-            self.wait_for(lambda: toggle()["active"], f"the {label} panel to open")
-            self.settle()
-
-    def timeline(self):
-        return self.state()["project"]["timeline"]
-
-    def tracks(self):
-        return self.timeline()["tracks"]
-
-    def track_name(self, track):
-        return ("V" if track["kind"] == "Video" else "A") + str(track["kind_index"])
-
-    def track(self, name):
-        return next((t for t in self.tracks() if self.track_name(t) == name), None)
-
-    def transitions(self, track="V1"):
-        t = self.track(track)
-        return t["transitions"] if t else []
-
-    def clip(self, track="V1", index=0, geometry=None):
-        """Geometry entry of the index-th clip on a track, left to right."""
-        clips = sorted((c for c in (geometry or self.geometry())["timeline"]["clips"] if c["track"] == track), key=lambda c: c["in_us"])
-        return clips[index]
-
-    def transition_geo(self, track="V1", index=0):
-        items = sorted((t for t in self.geometry()["timeline"]["transitions"] if t["track"] == track), key=lambda t: t["start_us"])
-        return items[index]
-
-    def cut_point(self, track="V1", index=0):
-        """Screen point of the index-th cut between two clips on a track, at mid-row height."""
-        geo = self.geometry()
-        a, b = self.clip(track, index, geo), self.clip(track, index + 1, geo)
-        x, y = b["rect"][0], a["rect"][1] + a["rect"][3] / 2
-        cx, cy, cw, ch = geo["timeline"]["canvas"]
-        if not (cx <= x <= cx + cw):
-            raise E2EError(f"cut {index} on {track} is off-screen at x={x:.0f}; call fit_timeline() first")
-        return (x, y)
-
-    def fit_timeline(self):
-        """Shift+Z: zoom the timeline to show everything (needed after panels change size)."""
-        self.key("shift+z")
-        self.settle()
+        self._after_input()
 
 
 # ---- Assertions ------------------------------------------------------------------------------
@@ -762,6 +611,9 @@ def expect_near(actual, expected, tolerance, what):
 
 
 def load_scenario(spec: str):
+    # Scenarios may import shared steps from scenarios/_helpers.py.
+    if str(HERE / "scenarios") not in sys.path:
+        sys.path.insert(0, str(HERE / "scenarios"))
     path = Path(spec)
     if not path.exists():
         matches = sorted((HERE / "scenarios").glob(f"*{spec}*.py"))

@@ -51,4 +51,6 @@ def run(s):
     for t in added:
         expect_near(t["duration_us"], frames_us(20), 1000, "transition length after Set as Default Duration")
     expect_eq(sorted(t["ease"] for t in added), ["In", "None"], "only the edited transition eases in")
+    # Nothing else moved on the way (a stray wheel over a slider would change it).
+    expect_eq(sorted(round(t["end_ratio"], 2) for t in added), [0.8, 1.0], "End Ratio kept")
     s.screenshot("3_default_used")

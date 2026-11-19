@@ -73,6 +73,13 @@ anything missing. No root, no X server, no other compositor.
 | `07_trim` | nothing selected: Shift+[ trims the clip under the playhead's head, Shift+] another's tail, gaps left, Ctrl+Z twice restores |
 | `08_ease_pixels` | Dip To Color dissolve from red: the viewer at 25 % reads about (126,0,0) linear and (221,0,0) with Ease In |
 | `09_isolation` | the guarantees above |
+| `10_transition_switch` | Inspector Video switch off: transition `enabled` false, the viewer at the cut shows a hard cut (pure red), Ctrl+Z restores |
+| `11_curve_graph` | Inspector curve graph: double-click adds a key, dragging it up raises its value, right-click removes it |
+| `12_marker_colours` | marker popup: 16 colour dots in Resolve order, a point marker's Duration reads 00:00:00:01, click Cocoa: marker colour Cocoa |
+| `13_timeline_portrait` | Ctrl+N with Use Project Settings off, 1080 x 1920, 25 fps: timeline fps 25/1 and that resolution, the viewer picture is portrait |
+| `14_edge_tooltip` | dragging a transition edge shows the "+ss:ff / ss:ff" tooltip at the pointer (mid-drag screenshot) and lengthens it |
+| `15_landing_box` | dragging a Media Pool clip over V1 draws the landing box in the video clip colour (not green) on V1, green on A1 |
+| `16_drop_across_audio` | a Cross Dissolve dragged across the A1 cut and onto the V1 cut is accepted and centred |
 
 ## Results
 
@@ -120,8 +127,14 @@ Rules that keep scenarios honest and stable:
   `row_widget("End Ratio", "GtkSpinButton")`) and timeline items by time
   (`clip`, `cut_point`, `transition_geo`). Pixel positions change with every layout tweak.
 * **Wait for outcomes**, never `sleep`: `s.wait_for(lambda: ..., "what", timeout=5)`.
-  Input methods already wait until the app is idle.
+  Input methods already wait until the app is idle and the screen has stopped changing
+  (up to 1 s), so dialog and revealer animations finish before the next step.
 * Opening a panel narrows the timeline: call `fit_timeline()` after `open_panel()`.
+* Wheel input over a GtkScale, GtkSpinButton or GtkDropDown changes its value.
+  `row_widget` scrolls by wheeling over a plain label in the same GtkScrolledWindow.
+* Steps several scenarios share live in `scenarios/_helpers.py` (`select_cut`,
+  `add_transition_at_cut`, `seek_by_ruler`, `viewer_colour`); files starting with `_`
+  are not scenarios.
 * Times in the state are microseconds; the fixture is 30 fps (a frame is 33 334 µs).
 * A different project: set `PROJECT = "/path/to.tempo"` in the scenario module.
 
@@ -136,7 +149,7 @@ with t.Session(project="../../target/e2e-media/fixture.tempo", report_dir="/tmp/
 EOF
 ```
 
-## API reference (`tests/e2e/tempo_e2e.py`)
+## API reference (`tests/e2e/tempo_e2e.py`, finders in `tests/e2e/e2e_find.py`)
 
 `Session(project=None, report_dir=None, size=(1600, 1000), app=None, extra_env=None)` —
 context manager. `extra_env` adds variables for the app (e.g. `{"GDK_DEBUG": "events,dnd"}`).
@@ -172,7 +185,7 @@ Looking:
 | `fit_timeline()` | Shift+Z |
 | `tracks()`, `track("V1")`, `track_name(t)`, `transitions("V1")`, `timeline()` | from `state()` |
 | `clip("V1", i)`, `transition_geo("V1", i)`, `cut_point("V1", i)` | from `geometry()`, left to right |
-| `wait_for(fn, what, timeout=5)`, `wait_idle()`, `settle()` | waiting |
+| `wait_for(fn, what, timeout=5)`, `wait_idle()`, `settle(quiet=0.25, timeout=5)` | waiting; `settle` returns when two frames `quiet` apart have the same pixels |
 | `action(step)` | setup only: a GAction name (`win.zoom-fit`) or a `TEMPO_ACTIONS` step (`seek:2.5`) |
 | `note(key, value)` | put a measurement in `result.json` |
 
@@ -199,7 +212,7 @@ All in `crates/tempo-ui/src/app.rs`, active only when the variable is set:
 | `X exited with N` | That process died; its log tail is in the message and in the report dir. |
 | A click or key does nothing | Is the point on screen (`geometry()`), the panel open, the timeline fitted? `extra_env={"GDK_DEBUG": "events"}` logs every event the app gets to `app.log`. |
 | A drop does nothing | The target refused it: a Cross Dissolve cannot go where there is no media to overlap (no handles) or over an audio track. `GDK_DEBUG=dnd` shows accept/refuse in `app.log`; `drag(..., via=[...])` steers around refusing places. |
-| Screenshot older than expected | Screenshots wait for the app to be idle and the screen to be still for 0.25 s; for slow work (decoding) `wait_for` a state change first. |
+| Screenshot older than expected | Screenshots wait for the app to be idle and the pixels to be unchanged for 0.25 s; for slow work (decoding) `wait_for` a state change first. |
 
 ## Known limits
 
