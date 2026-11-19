@@ -648,7 +648,8 @@ impl Worker {
                 Wanted::Color(color, opacity) => (Uuid::from_u128(color.iter().fold(0u128, |a, c| a << 8 | (c * 255.0) as u128) | 1 << 100), (opacity * 1000.0) as i64),
             })
             .collect();
-        if key == self.last_shown && self.exact {
+        // An empty picture is always published: after a timeline switch it must replace the old frame.
+        if !key.is_empty() && key == self.last_shown && self.exact {
             return;
         }
 

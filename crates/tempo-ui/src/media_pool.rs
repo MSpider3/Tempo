@@ -563,6 +563,14 @@ fn item_factory(on_menu: MenuHandler) -> gtk::SignalListItemFactory {
             let id = obj.borrow::<Item>().id.to_string();
             Some(gdk::ContentProvider::for_value(&id.to_value()))
         });
+        // The picture under the pointer is the clip's thumbnail, as in Resolve.
+        let weak_item = list_item.downgrade();
+        drag.connect_drag_begin(move |source, _| {
+            let thumb = weak_item.upgrade().and_then(|i| i.item()).and_downcast::<glib::BoxedAnyObject>().and_then(|o| o.borrow::<Item>().thumbnail.clone());
+            if let Some(t) = thumb {
+                source.set_icon(Some(&t), 0, 0);
+            }
+        });
         cell.add_controller(drag);
 
         let click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
