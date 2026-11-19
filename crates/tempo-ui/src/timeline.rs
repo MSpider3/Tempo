@@ -212,6 +212,11 @@ mod imp {
         pub drop_at: Cell<Option<(Uuid, i64, i64)>>,
         /// A Media Pool clip is over where new tracks would be made for it: (video, audio).
         pub ghost: Cell<Option<(bool, bool)>>,
+        /// Told whenever `ghost` changes, so the track headers can show their ghost rows.
+        pub ghost_cb: RefCell<Option<Rc<dyn Fn(Option<(bool, bool)>)>>>,
+        /// Where a Media Pool clip dragged over the timeline would land: start, end, whether
+        /// it brings sound, and the pointer's y.
+        pub preview: Cell<Option<(i64, i64, bool, f64)>>,
         /// Edit animation: 1.0 at rest, else how far the move from the `from` values has run.
         pub tween_e: Cell<f64>,
         pub tween_t0: Cell<i64>,
@@ -255,6 +260,8 @@ mod imp {
                 hover: Cell::new(None),
                 drop_at: Cell::new(None),
                 ghost: Cell::new(None),
+                ghost_cb: RefCell::new(None),
+                preview: Cell::new(None),
                 tween_e: Cell::new(1.0),
                 tween_t0: Cell::new(0),
                 tween_on: Cell::new(false),
@@ -941,7 +948,12 @@ impl TimelineCanvas {
                 (None, Some(id)) => c.ghost_for(id, y),
                 _ => None,
             };
-            if c.imp().ghost.replace(ghost) != ghost {
+            c.set_ghost(ghost);
+            let preview = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
+                (None, Some(id)) => c.preview_for(id, x, y),
+                _ => None,
+            };
+            if c.imp().preview.replace(preview) != preview {
                 c.redraw();
             }
             let plan = kind.map(|kind| c.plan_drop(kind, x, y));
@@ -957,7 +969,8 @@ impl TimelineCanvas {
         let c = self.downgrade();
         drop.connect_leave(move |_| {
             if let Some(c) = c.upgrade() {
-                if c.imp().drop_at.take().is_some() || c.imp().ghost.take().is_some() {
+                c.set_ghost(None);
+                if c.imp().drop_at.take().is_some() | c.imp().preview.take().is_some() {
                     c.redraw();
                 }
             }
@@ -966,21 +979,80 @@ impl TimelineCanvas {
         drop.connect_drop(move |_, value, x, y| {
             let Some(c) = c.upgrade() else { return false };
             c.imp().drop_at.set(None);
-            c.imp().ghost.set(None);
+            c.set_ghost(None);
+            c.imp().preview.set(None);
             let Ok(text) = value.get::<String>() else { return false };
             if let Some(kind) = text.strip_prefix(TRANSITION_PREFIX) {
                 return c.drop_transition(kind, x, y);
             }
             let Ok(id) = Uuid::parse_str(&text) else { return false };
             let (at, _) = c.snap(c.us_at(x), &[]);
-            if let Some(lanes) = c.ghost_for(id, y) {
-                return c.drop_on_new_tracks(id, at, lanes);
+            let was_empty = c.state().with_timeline(|t| t.tracks.iter().all(|tr| tr.clips.is_empty())).unwrap_or(false);
+            let done = if let Some(lanes) = c.ghost_for(id, y) {
+                c.drop_on_new_tracks(id, at, lanes)
+            } else {
+                let track = c.row_at(y).map(|r| r.track_id);
+                actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
+                true
+            };
+            // The first clip on an empty timeline zooms the view to fit it, as Resolve does.
+            if done && was_empty {
+                c.zoom_fit();
             }
-            let track = c.row_at(y).map(|r| r.track_id);
-            actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
-            true
+            done
         });
         self.add_controller(drop);
+    }
+
+    fn set_ghost(&self, ghost: Option<(bool, bool)>) {
+        if self.imp().ghost.replace(ghost) != ghost {
+            if let Some(cb) = self.imp().ghost_cb.borrow().clone() {
+                cb(ghost);
+            }
+            self.redraw();
+        }
+    }
+
+    /// Tell `f` whenever ghost tracks appear or go away.
+    pub fn connect_ghost(&self, f: impl Fn(Option<(bool, bool)>) + 'static) {
+        *self.imp().ghost_cb.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Where a Media Pool source dragged to (x, y) would land: start, end, sound, y.
+    fn preview_for(&self, id: Uuid, x: f64, y: f64) -> Option<(i64, i64, bool, f64)> {
+        let state = self.state();
+        let at = state.frame_floor(self.snap(self.us_at(x), &[]).0);
+        let nil = Some(Uuid::nil());
+        let clips = actions::clips_for_source(&state, id, at, nil, nil);
+        let (first, last) = (clips.first()?, clips.last()?);
+        Some((first.timeline_in, last.timeline_out, clips.iter().any(|c| c.clip_type == ClipType::Audio), y))
+    }
+
+    /// The green box showing where the dragged clip will land, on its video and audio lanes.
+    fn draw_drop_preview(&self, s: &gtk::Snapshot, rows: &[Row], (start, end, sound, y): (i64, i64, bool, f64), w: f32) {
+        let ghost = self.imp().ghost.get();
+        let audio_y = rows.last().map_or(RULER_H, |r| r.y + r.h);
+        let dest_audio = self.state().dest_audio.get();
+        let mut lanes: Vec<(f32, f32)> = Vec::new();
+        if let Some((video, audio)) = ghost {
+            if video {
+                lanes.push((RULER_H, GHOST_BAND_H));
+            }
+            if audio {
+                lanes.push((audio_y, AUDIO_H));
+            }
+        } else if let Some(row) = rows.iter().find(|r| y >= r.y as f64 && y < (r.y + r.h) as f64) {
+            lanes.push((row.y, row.h));
+            if sound && row.kind == TrackKind::Video {
+                lanes.extend(rows.iter().find(|r| r.kind == TrackKind::Audio && r.index == dest_audio).map(|r| (r.y, r.h)));
+            }
+        }
+        let (x0, x1) = ((self.x_of(start) as f32).max(-8.0), (self.x_of(end) as f32).min(w + 8.0));
+        for (ly, lh) in lanes {
+            let area = graphene::Rect::new(x0, ly + 1.0, (x1 - x0).max(2.0), lh - 3.0);
+            s.append_color(&gdk::RGBA::new(0.25, 0.75, 0.35, 0.35), &area);
+            s.append_border(&gsk::RoundedRect::from_rect(area, 3.0), &[2.0; 4], &[gdk::RGBA::new(0.3, 0.85, 0.4, 1.0); 4]);
+        }
     }
 
     /// The new tracks a source dropped at `y` would get, if any.
@@ -1030,12 +1102,11 @@ impl TimelineCanvas {
         let next = |kind: TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
         let (v, a) = (next(TrackKind::Video), next(TrackKind::Audio));
         let audio_y = rows.last().map_or(RULER_H, |r| r.y + r.h);
-        let accent = css_color(self, "tempo_accent");
         let lane = |y: f32, h: f32, text: String| {
             let area = graphene::Rect::new(0.0, y, w, h);
-            s.append_color(&gdk::RGBA::new(0.1, 0.1, 0.12, 0.92), &area);
-            s.append_border(&gsk::RoundedRect::from_rect(area, 0.0), &[1.0; 4], &[accent; 4]);
-            self.text(s, &text, 8.0, y + h / 2.0 - 8.0, &accent, true, 160.0);
+            s.append_color(&css_color(self, "tempo_bg_surface"), &area);
+            s.append_color(&css_color(self, "tempo_line_soft"), &graphene::Rect::new(0.0, y + h - 1.0, w, 1.0));
+            self.text(s, &text, 8.0, y + h / 2.0 - 8.0, &css_color(self, "tempo_text_dim"), false, 160.0);
         };
         if video {
             lane(RULER_H, GHOST_BAND_H, format!("V{v}  Video {v}"));
@@ -1686,6 +1757,9 @@ impl TimelineCanvas {
         if let Some(lanes) = imp.ghost.get() {
             self.draw_ghost_lanes(s, &rows, lanes, w);
         }
+        if let Some(p) = imp.preview.get() {
+            self.draw_drop_preview(s, &rows, p, w);
+        }
         // Divider between video and audio tracks.
         if let Some(first_audio) = rows.iter().find(|r| r.kind == TrackKind::Audio) {
             s.append_color(&soft, &rect(0.0, first_audio.y - DIVIDER_H, w, DIVIDER_H));
@@ -1899,6 +1973,7 @@ impl TimelineArea {
         let canvas = TimelineCanvas::new(state, viewer);
 
         let timecode_label = label("00:00:00:00", &["tempo-timecode-big"]);
+        let tc_on_switch = timecode_label.clone();
         let timecode_box = gtk::Box::builder().css_classes(["timecode-box"]).halign(gtk::Align::Fill).build();
         timecode_label.set_halign(gtk::Align::Center);
         timecode_label.set_width_chars(11);
@@ -1931,11 +2006,27 @@ impl TimelineArea {
         root.append(&audio_meter(state));
 
         let s = state.clone();
-        let rebuild = move || build_headers(&s, &header_rows);
+        let rows_box = header_rows.clone();
+        let rebuild = move || build_headers(&s, &rows_box);
         rebuild();
+        let s = state.clone();
         state.connect(move |change| {
             if matches!(change, Change::Project | Change::Timeline | Change::Options) {
                 rebuild();
+            }
+            // Switching timelines can leave the playhead at 0 -> 0, so no position event comes.
+            if matches!(change, Change::Project | Change::Timeline) {
+                tc_on_switch.set_text(&s.position_tc(s.playhead_us()));
+            }
+        });
+        // Ghost tracks get a header too while a clip is dragged toward them.
+        canvas.connect_ghost(move |ghost| {
+            let (video, audio) = ghost.unwrap_or_default();
+            if let Some(w) = header_rows.first_child().and_then(|b| b.first_child()) {
+                w.set_visible(video);
+            }
+            if let Some(w) = header_rows.last_child().and_then(|b| b.first_child()) {
+                w.set_visible(audio);
             }
         });
 
@@ -1948,7 +2039,21 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
         container.remove(&child);
     }
     let rows = state.with_timeline(rows).unwrap_or_default();
-    container.append(&gtk::Box::builder().height_request(GHOST_BAND_H as i32).build());
+    let next = |kind: TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
+    let channels = state.with_timeline(|t| t.tracks.iter().find(|tr| tr.kind == TrackKind::Audio).map(|tr| tr.audio_type.label())).flatten().unwrap_or("2.0");
+    let ghost_header = |class: &str, h: i32, text: String, extra: Option<&str>| {
+        let slot = gtk::Box::builder().height_request(h).build();
+        let header = gtk::Box::builder().spacing(4).hexpand(true).css_classes(["track-header", class]).build();
+        header.append(&gtk::Button::builder().label(text).css_classes(["tool", "track-name"]).valign(gtk::Align::Center).sensitive(false).build());
+        if let Some(e) = extra {
+            header.append(&label(e, &["tempo-dim"]));
+        }
+        header.set_visible(false);
+        slot.append(&header);
+        slot
+    };
+    container.append(&ghost_header("video", GHOST_BAND_H as i32, format!("V{}", next(TrackKind::Video)), None));
+    let ghost_audio_n = next(TrackKind::Audio);
     let mut divider_done = false;
     for row in rows {
         if row.kind == TrackKind::Audio && !divider_done {
@@ -2041,6 +2146,7 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
 
         container.append(&header);
     }
+    container.append(&ghost_header("audio", AUDIO_H as i32, format!("A{ghost_audio_n}"), Some(channels)));
 }
 
 /// Two bars showing the output level, left and right. Redrawn only when the level changes.
