@@ -138,7 +138,11 @@ impl Transition {
             let span = self.end_ratio - self.start_ratio;
             return if span.abs() < f32::EPSILON { 1.0 } else { ((0.5 - self.start_ratio) / span).clamp(0.0, 1.0) };
         }
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        // Keys may make the mix non-monotonic: find the first sample at or past half, then refine.
+        const STEPS: u32 = 1024;
+        let first = (0..=STEPS).find(|&i| self.progress_at(i as f32 / STEPS as f32) >= 0.5);
+        let Some(i) = first else { return 1.0 };
+        let (mut lo, mut hi) = (i.saturating_sub(1) as f32 / STEPS as f32, i as f32 / STEPS as f32);
         for _ in 0..24 {
             let mid = (lo + hi) / 2.0;
             if self.progress_at(mid) < 0.5 {
@@ -1087,5 +1091,12 @@ mod tests {
         let layers = tl.tracks[0].transition_layers(&sources);
         let clip = layers.clips.iter().find(|c| c.id == a).unwrap();
         assert_eq!(clip.fade_factor(500_000), 0.5);
+    }
+
+    #[test]
+    fn half_point_is_the_first_crossing_with_a_non_monotonic_curve() {
+        let mut t = Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::DipToColor, S, TransitionAlignment::Centered);
+        t.curve = vec![[0.2, 0.7], [0.5, 0.2]];
+        assert!((t.half_point() - 0.1428).abs() < 0.002);
     }
 }
