@@ -870,7 +870,7 @@ impl Project {
     /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.
     pub fn timeline_list(&self) -> Vec<(Uuid, String)> {
         let mut list: Vec<_> = std::iter::once(&self.timeline).chain(&self.timelines).map(|t| (t.id, t.name.clone())).collect();
-        list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        list.sort_by_key(|a| a.1.to_lowercase());
         list
     }
 
