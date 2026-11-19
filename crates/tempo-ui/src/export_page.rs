@@ -14,8 +14,10 @@ use gtk4::gio;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use tempo_export::{bitrate_for_size, chapters_from_markers, export_timeline, format_chapter_list, youtube_problems, Chapter, Fit, TimelineExport};
+use tempo_plugin::UploadInput;
 use tempo_timeline::Project;
 
+use crate::plugins::Uploader;
 use crate::state::{AppState, Change};
 use crate::util::{css_color, label, pill, tool_button};
 
@@ -53,6 +55,25 @@ enum Status {
     Cancelled,
 }
 
+/// Where a job's upload to a plugin stands.
+#[derive(Clone, PartialEq)]
+enum UploadState {
+    Waiting,
+    Uploading,
+    /// Sent; the address when the plugin returned one.
+    Done(Option<String>),
+    Failed(String),
+    /// No saved token: the upload dialog was opened for the user.
+    NeedsToken,
+}
+
+/// What to send once the render finishes. The values are per job.
+struct UploadPlan {
+    uploader: Uploader,
+    input: UploadInput,
+    state: UploadState,
+}
+
 struct Job {
     name: String,
     /// "<project> | <timeline>", as Resolve's Deliver queue shows it.
@@ -64,6 +85,21 @@ struct Job {
     status: Status,
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
+    upload: Option<UploadPlan>,
+}
+
+/// The "Upload directly to" section of Render Settings.
+struct UploadForm {
+    section: gtk::Box,
+    enabled: gtk::CheckButton,
+    pick: gtk::DropDown,
+    pick_model: gtk::StringList,
+    title: gtk::Entry,
+    description: gtk::TextView,
+    thumbnail_on: gtk::CheckButton,
+    thumbnail: gtk::Entry,
+    privacy: gtk::DropDown,
+    category: gtk::DropDown,
 }
 
 pub struct ExportPage {
@@ -79,6 +115,7 @@ pub struct ExportPage {
     fit: gtk::DropDown,
     fit_row: gtk::Box,
     chapters: gtk::CheckButton,
+    upload: UploadForm,
     range: gtk::DropDown,
     format_index: Cell<usize>,
     /// The format toggles, in the order of `FORMATS`.
@@ -141,11 +178,14 @@ impl ExportPage {
         add.set_margin_end(12);
         add.set_margin_bottom(12);
 
+        let upload = UploadForm::new();
+        let settings = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        settings.append(&grid);
+        settings.append(&upload.section);
         let left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).width_request(360).css_classes(["tempo-surface", "tempo-sep-right"]).build();
         left.append(&title);
         left.append(&strip_scroll);
-        left.append(&grid);
-        left.append(&gtk::Box::builder().vexpand(true).build());
+        left.append(&gtk::ScrolledWindow::builder().child(&settings).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
         left.append(&add);
 
         // ---- Centre: viewer and range ---------------------------------------
@@ -190,6 +230,7 @@ impl ExportPage {
             fit,
             fit_row,
             chapters,
+            upload,
             range,
             format_index: Cell::new(0),
             format_buttons: RefCell::new(Vec::new()),
@@ -261,15 +302,70 @@ impl ExportPage {
                 Change::Timeline if shown.get() != p.state.with_timeline(|t| t.id) => {
                     shown.set(p.state.with_timeline(|t| t.id));
                     p.file_name.set_text(&p.state.with_project(default_file_name).unwrap_or_default());
+                    p.reset_upload_title();
                 }
                 // The Share menus list the upload targets of enabled plugins.
-                Change::Plugins => p.rebuild_queue(),
+                Change::Plugins => {
+                    p.sync_uploaders();
+                    p.rebuild_queue();
+                }
                 _ => {}
             }
         });
+        let p = page.clone();
+        page.upload.pick.connect_selected_notify(move |_| p.sync_uploader_label());
+        page.sync_uploaders();
         page.load_defaults();
         page.rebuild_queue();
         page
+    }
+
+    fn reset_upload_title(&self) {
+        self.upload.title.set_text(&self.state.with_project(|p| p.timeline.name.clone()).unwrap_or_default());
+    }
+
+    fn selected_uploader(&self) -> Option<Uploader> {
+        self.state.uploaders.borrow().get(self.upload.pick.selected() as usize).cloned()
+    }
+
+    fn sync_uploader_label(&self) {
+        let name = self.selected_uploader().map(|u| u.name).unwrap_or_default();
+        self.upload.enabled.set_label(Some(&format!("Upload directly to {name}")));
+    }
+
+    /// Show the section only while an enabled plugin offers an uploader.
+    fn sync_uploaders(&self) {
+        let names: Vec<String> = self.state.uploaders.borrow().iter().map(|u| u.name.clone()).collect();
+        let keep = self.upload.pick.selected();
+        self.upload.pick_model.splice(0, self.upload.pick_model.n_items(), &names.iter().map(String::as_str).collect::<Vec<_>>());
+        self.upload.pick.set_selected(if (keep as usize) < names.len() { keep } else { 0 });
+        self.upload.pick.set_visible(names.len() > 1);
+        self.upload.section.set_visible(!names.is_empty());
+        self.sync_uploader_label();
+    }
+
+    /// The upload to attach to a job being queued, or None when the box is not ticked.
+    /// `Err` carries a message for the user.
+    fn upload_plan(&self, output: &std::path::Path, chapters: &[Chapter]) -> Result<Option<UploadPlan>, String> {
+        let form = &self.upload;
+        let Some(uploader) = self.selected_uploader().filter(|_| form.enabled.is_active()) else { return Ok(None) };
+        let thumbnail = form.thumbnail.text().trim().to_string();
+        if form.thumbnail_on.is_active() && thumbnail.is_empty() {
+            return Err("Choose a thumbnail image, or untick Upload Thumbnail.".into());
+        }
+        let buffer = form.description.buffer();
+        let description = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        let title = form.title.text().trim().to_string();
+        let input = UploadInput {
+            file: output.to_path_buf(),
+            title: if title.is_empty() { self.state.with_project(|p| p.timeline.name.clone()).unwrap_or_default() } else { title },
+            description: tempo_plugin::description_with_chapters(&description, &format_chapter_list(chapters)),
+            privacy: tempo_plugin::PRIVACY.get(form.privacy.selected() as usize).unwrap_or(&"private").to_string(),
+            category: tempo_plugin::CATEGORIES.get(form.category.selected() as usize).unwrap_or(&"Film & Animation").to_string(),
+            thumbnail: (form.thumbnail_on.is_active()).then(|| PathBuf::from(thumbnail)),
+            token: String::new(),
+        };
+        Ok(Some(UploadPlan { uploader, input, state: UploadState::Waiting }))
     }
 
     pub fn connect_activity(&self, f: impl Fn(Option<String>) + 'static) {
@@ -405,7 +501,17 @@ impl ExportPage {
             hardware: self.state.settings.borrow().hardware_encode && max_video_kbps.is_none(),
             max_video_kbps,
         };
+        let upload = match self.upload_plan(&settings.output, &settings.chapters) {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.state.message(message);
+                return false;
+            }
+        };
+        // Like Resolve: the next job starts without the last cover image.
+        self.upload.thumbnail.set_text("");
         self.jobs.borrow_mut().push(Job {
+            upload,
             label: job_label(&project),
             name,
             format: format!("{} · {} × {}", f.ratio, width, height),
@@ -493,6 +599,7 @@ impl ExportPage {
         let page = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let cancel_flag = cancel.clone();
+            let settings_output = settings.output.clone();
             let limited = settings.max_video_kbps.is_some();
             let result = gio::spawn_blocking(move || {
                 export_timeline(&project, &settings, &cancel_flag, |p| progress.store((p * 1000.0) as u32, Ordering::Relaxed))
@@ -510,13 +617,59 @@ impl ExportPage {
                 Ok(Err(e)) => (Status::Failed(e.to_string()), Some("Export failed".to_string())),
                 Err(_) => (Status::Failed("The export stopped unexpectedly.".into()), Some("Export failed".to_string())),
             };
+            let rendered = status == Status::Done;
+            let output = settings_output;
             if let Some(job) = page.jobs.borrow_mut().get_mut(index) {
                 job.status = status;
             }
             if let Some(t) = toast {
                 page.state.message(t);
             }
+            if rendered {
+                page.start_upload(output);
+            }
             page.start_next();
+        });
+    }
+
+    fn set_upload_state(self: &Rc<Self>, output: &std::path::Path, state: UploadState) {
+        if let Some(plan) = self.jobs.borrow_mut().iter_mut().find(|j| j.settings.output == output).and_then(|j| j.upload.as_mut()) {
+            plan.state = state;
+        }
+        self.rebuild_queue();
+    }
+
+    /// Send a rendered job to its plugin on a worker, with the token saved in the keyring.
+    fn start_upload(self: &Rc<Self>, output: PathBuf) {
+        let Some((uploader, input)) = self.jobs.borrow().iter().find(|j| j.settings.output == output).and_then(|j| j.upload.as_ref().map(|u| (u.uploader.clone(), u.input.clone()))) else { return };
+        self.set_upload_state(&output, UploadState::Uploading);
+        let page = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let (plugin, function, mut sent) = (uploader.plugin.clone(), uploader.function.clone(), input.clone());
+            let result = gio::spawn_blocking(move || match crate::plugins::saved_token(&plugin.id) {
+                Some(token) => {
+                    sent.token = token;
+                    tempo_plugin::run_upload(&plugin, &function, sent).map(Some)
+                }
+                None => Ok(None),
+            })
+            .await;
+            let state = match result {
+                Ok(Ok(Some(out))) => {
+                    for message in out.messages.into_iter().take(3) {
+                        page.state.message(message);
+                    }
+                    UploadState::Done(out.url)
+                }
+                // Nothing saved yet: let the user paste a token in the usual dialog.
+                Ok(Ok(None)) => {
+                    crate::dialogs::upload(&page.root, &page.state, uploader.clone(), input);
+                    UploadState::NeedsToken
+                }
+                Ok(Err(e)) => UploadState::Failed(e.to_string()),
+                Err(_) => UploadState::Failed("The upload stopped unexpectedly.".into()),
+            };
+            page.set_upload_state(&output, state);
         });
     }
 
@@ -604,6 +757,11 @@ impl ExportPage {
         path.set_tooltip_text(Some(&job.settings.output.to_string_lossy()));
         body.append(&path);
 
+        if let (Some(plan), true) = (&job.upload, matches!(job.status, Status::Waiting | Status::Rendering)) {
+            let l = status_line(&format!("↑ Will upload to {}", plan.uploader.name), &["tempo-small", "tempo-dim"]);
+            l.set_tooltip_text(Some(&format!("Privacy: {} · Category: {}", plan.input.privacy, plan.input.category)));
+            body.append(&l);
+        }
         match &job.status {
             Status::Waiting => body.append(&status_line("Waiting", &["tempo-small", "tempo-dim"])),
             Status::Rendering => {
@@ -615,6 +773,9 @@ impl ExportPage {
             }
             Status::Done => {
                 body.append(&status_line("✓ Completed", &["tempo-small"]));
+                if let Some(plan) = &job.upload {
+                    body.append(&upload_status(plan));
+                }
                 body.append(&self.done_actions(index, job));
             }
             Status::Failed(reason) => {
@@ -684,10 +845,18 @@ impl ExportPage {
         for uploader in self.state.uploaders.borrow().iter().cloned() {
             let item = gtk::Button::builder().label(format!("Upload to {}…", uploader.name)).css_classes(["link-text"]).halign(gtk::Align::Start).build();
             let (state, file, name, popover_owner) = (self.state.clone(), output.clone(), job.name.clone(), share.clone());
-            let description = format_chapter_list(&job.settings.chapters);
+            // The values queued with the job, or fresh ones for a job queued without upload.
+            let draft = job.upload.as_ref().map(|u| u.input.clone()).unwrap_or_else(|| UploadInput {
+                file,
+                title: name,
+                description: format_chapter_list(&job.settings.chapters),
+                privacy: tempo_plugin::PRIVACY[0].into(),
+                category: tempo_plugin::CATEGORIES[0].into(),
+                ..Default::default()
+            });
             item.connect_clicked(move |b| {
                 popover_owner.popdown();
-                crate::dialogs::upload(b, &state, uploader.clone(), file.clone(), &name, &description);
+                crate::dialogs::upload(b, &state, uploader.clone(), draft.clone());
             });
             list.append(&item);
         }
@@ -741,6 +910,94 @@ fn copy_chapters(state: &Rc<AppState>, widget: &impl IsA<gtk::Widget>, chapters:
         }
     });
     dialog.present(Some(widget));
+}
+
+/// One line for a job card: how its upload is going.
+fn upload_status(plan: &UploadPlan) -> gtk::Widget {
+    let name = &plan.uploader.name;
+    match &plan.state {
+        UploadState::Waiting => status_line(&format!("↑ Upload to {name} is next"), &["tempo-small", "tempo-dim"]).upcast(),
+        UploadState::Uploading => status_line(&format!("Uploading to {name}…"), &["tempo-small", "tempo-dim"]).upcast(),
+        UploadState::NeedsToken => status_line(&format!("Upload to {name} needs a token: use the dialog, or Share…"), &["tempo-small", "tempo-dim"]).upcast(),
+        UploadState::Failed(e) => {
+            let l = status_line(&format!("⚠ Upload to {name} failed: {e}"), &["tempo-small", "error-text"]);
+            l.set_wrap(true);
+            l.upcast()
+        }
+        UploadState::Done(Some(url)) => {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            row.append(&status_line("✓ Uploaded:", &["tempo-small"]));
+            row.append(&gtk::LinkButton::builder().uri(url).label(url).css_classes(["tempo-small"]).build());
+            row.upcast()
+        }
+        UploadState::Done(None) => status_line(&format!("✓ Uploaded to {name}"), &["tempo-small"]).upcast(),
+    }
+}
+
+impl UploadForm {
+    fn new() -> Self {
+        let enabled = gtk::CheckButton::with_label("Upload directly to");
+        let pick_model = gtk::StringList::new(&[]);
+        let pick = gtk::DropDown::builder().model(&pick_model).visible(false).margin_start(12).margin_end(12).build();
+        let title = gtk::Entry::builder().hexpand(true).build();
+        let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
+        let description = gtk::ScrolledWindow::builder().child(&text).min_content_height(90).css_classes(["card"]).build();
+        let thumbnail_on = gtk::CheckButton::with_label("Upload Thumbnail");
+        let thumbnail = gtk::Entry::builder().hexpand(true).placeholder_text("Thumbnail path").sensitive(false).build();
+        let pick_file = gtk::Button::with_label("…");
+        pick_file.set_tooltip_text(Some("Choose a thumbnail image (jpg or png)"));
+        pick_file.set_sensitive(false);
+        let privacy = gtk::DropDown::from_strings(&["Private", "Unlisted", "Public"]);
+        let category = gtk::DropDown::from_strings(&tempo_plugin::CATEGORIES);
+
+        let thumb_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        thumb_row.append(&thumbnail);
+        thumb_row.append(&pick_file);
+        let fields = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(8).margin_start(12).margin_end(12).visible(false).build();
+        let row = |r: i32, name: &str, w: &gtk::Widget| {
+            let l = label(name, &["tempo-dim"]);
+            l.set_xalign(1.0);
+            l.set_valign(gtk::Align::Start);
+            fields.attach(&l, 0, r, 1, 1);
+            fields.attach(w, 1, r, 1, 1);
+        };
+        row(0, "Title", title.upcast_ref());
+        row(1, "Description", description.upcast_ref());
+        fields.attach(&thumbnail_on, 1, 2, 1, 1);
+        row(3, "Thumbnail", thumb_row.upcast_ref());
+        row(4, "Privacy", privacy.upcast_ref());
+        row(5, "Category", category.upcast_ref());
+
+        let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(14).margin_bottom(8).visible(false).build();
+        let head = gtk::Box::builder().margin_start(12).margin_end(12).build();
+        head.append(&enabled);
+        section.append(&head);
+        section.append(&pick);
+        section.append(&fields);
+
+        let f = fields.clone();
+        enabled.connect_toggled(move |c| f.set_visible(c.is_active()));
+        let (entry, button) = (thumbnail.clone(), pick_file.clone());
+        thumbnail_on.connect_toggled(move |c| {
+            entry.set_sensitive(c.is_active());
+            button.set_sensitive(c.is_active());
+        });
+        let entry = thumbnail.clone();
+        pick_file.connect_clicked(move |b| {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Images (jpg, png)"));
+            filter.add_mime_type("image/jpeg");
+            filter.add_mime_type("image/png");
+            let dialog = gtk::FileDialog::builder().title("Thumbnail").modal(true).default_filter(&filter).build();
+            let entry = entry.clone();
+            dialog.open(b.root().and_downcast::<gtk::Window>().as_ref(), gio::Cancellable::NONE, move |result| {
+                if let Some(path) = result.ok().and_then(|f| f.path()) {
+                    entry.set_text(&path.to_string_lossy());
+                }
+            });
+        });
+        Self { section, enabled, pick, pick_model, title, description: text, thumbnail_on, thumbnail, privacy, category }
+    }
 }
 
 fn reveal(widget: &impl IsA<gtk::Widget>, file: &std::path::Path) {
