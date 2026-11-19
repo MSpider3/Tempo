@@ -373,9 +373,9 @@ impl Inspector {
         });
         let durations = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         durations.append(&seconds);
-        durations.append(&label("s", &["tempo-dim"]));
+        durations.append(&label("Seconds", &["tempo-dim"]));
         durations.append(&frame_spin);
-        durations.append(&label("frames", &["tempo-dim"]));
+        durations.append(&label("Frames", &["tempo-dim"]));
         durations.set_tooltip_text(Some(&format!("Longest {:.2} s ({} frames)", view.max_us as f64 / 1e6, us_to_frame(view.max_us, view.fps))));
         grid.attach(&durations, 1, 1, 1, 1);
 
