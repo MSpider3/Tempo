@@ -33,7 +33,7 @@ fn marker_tip(timecode: &str, name: &str) -> String {
 
 pub const RULER_H: f32 = 48.0;
 /// Empty space above the top video track, where a clip dragged there gets a new track.
-const GHOST_BAND_H: f32 = 40.0;
+const GHOST_BAND_H: f32 = VIDEO_H;
 const VIDEO_H: f32 = 60.0;
 const AUDIO_H: f32 = 54.0;
 const DIVIDER_H: f32 = 2.0;
@@ -139,9 +139,18 @@ fn offset_label(us: i64, fps: f64) -> String {
     format!("{}{:02}:{:02}", if us < 0 { "-" } else { "" }, frames / fps_i, frames % fps_i)
 }
 
-/// Resolve's tooltip while a transition's edge is dragged: the change over the new length.
-fn length_tip(from: i64, to: i64, fps: f64) -> String {
-    format!("{}{}\n{}", if to >= from { "+" } else { "" }, offset_label(to - from, fps), offset_label(to, fps))
+/// Resolve's tooltip while a transition's edge is dragged: how far the edge under the
+/// pointer has moved (right is +, left is -), over the new length. A transition centred
+/// on a cut moves both edges, so the length changes twice as fast as the one edge.
+fn length_tip(from: i64, to: i64, left_edge: bool, both_free: bool, fps: f64) -> String {
+    let grown = (to - from) / if both_free { 2 } else { 1 };
+    let moved = if left_edge { -grown } else { grown };
+    format!("{}{}\n{}", if moved >= 0 { "+" } else { "" }, offset_label(moved, fps), offset_label(to, fps))
+}
+
+/// Size of a probe thumbnail (raw RGBA) from its byte count.
+fn thumbnail_size(len: usize) -> Option<(usize, usize)> {
+    [(160, 90), (320, 180), (96, 54)].into_iter().find(|(w, h)| w * h * 4 == len)
 }
 
 /// The name a transition box shows, as Resolve names them.
@@ -217,6 +226,9 @@ mod imp {
         /// Where a Media Pool clip dragged over the timeline would land: start, end, whether
         /// it brings sound, and the pointer's y.
         pub preview: Cell<Option<(i64, i64, bool, f64)>>,
+        /// The Media Pool source being dragged, and the textures of source thumbnails.
+        pub drop_source: Cell<Option<Uuid>>,
+        pub thumbs: RefCell<HashMap<Uuid, Option<gdk::Texture>>>,
         /// Edit animation: 1.0 at rest, else how far the move from the `from` values has run.
         pub tween_e: Cell<f64>,
         pub tween_t0: Cell<i64>,
@@ -262,6 +274,8 @@ mod imp {
                 ghost: Cell::new(None),
                 ghost_cb: RefCell::new(None),
                 preview: Cell::new(None),
+                drop_source: Cell::new(None),
+                thumbs: RefCell::new(HashMap::new()),
                 tween_e: Cell::new(1.0),
                 tween_t0: Cell::new(0),
                 tween_on: Cell::new(false),
@@ -949,6 +963,7 @@ impl TimelineCanvas {
                 _ => None,
             };
             c.set_ghost(ghost);
+            c.imp().drop_source.set(text.as_deref().and_then(|s| Uuid::parse_str(s).ok()));
             let preview = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
                 (None, Some(id)) => c.preview_for(id, x, y),
                 _ => None,
@@ -1028,31 +1043,69 @@ impl TimelineCanvas {
         Some((first.timeline_in, last.timeline_out, clips.iter().any(|c| c.clip_type == ClipType::Audio), y))
     }
 
-    /// The green box showing where the dragged clip will land, on its video and audio lanes.
+    /// The boxes showing where the dragged clip will land, as Resolve draws them: the
+    /// video lane in the video clip colour with the clip's thumbnail and name, the audio lane green.
     fn draw_drop_preview(&self, s: &gtk::Snapshot, rows: &[Row], (start, end, sound, y): (i64, i64, bool, f64), w: f32) {
         let ghost = self.imp().ghost.get();
         let audio_y = rows.last().map_or(RULER_H, |r| r.y + r.h);
         let dest_audio = self.state().dest_audio.get();
-        let mut lanes: Vec<(f32, f32)> = Vec::new();
+        // (top, height, is a video lane)
+        let mut lanes: Vec<(f32, f32, bool)> = Vec::new();
         if let Some((video, audio)) = ghost {
             if video {
-                lanes.push((RULER_H, GHOST_BAND_H));
+                lanes.push((RULER_H, GHOST_BAND_H, true));
             }
             if audio {
-                lanes.push((audio_y, AUDIO_H));
+                lanes.push((audio_y, AUDIO_H, false));
             }
         } else if let Some(row) = rows.iter().find(|r| y >= r.y as f64 && y < (r.y + r.h) as f64) {
-            lanes.push((row.y, row.h));
+            lanes.push((row.y, row.h, row.kind == TrackKind::Video));
             if sound && row.kind == TrackKind::Video {
-                lanes.extend(rows.iter().find(|r| r.kind == TrackKind::Audio && r.index == dest_audio).map(|r| (r.y, r.h)));
+                lanes.extend(rows.iter().find(|r| r.kind == TrackKind::Audio && r.index == dest_audio).map(|r| (r.y, r.h, false)));
             }
         }
         let (x0, x1) = ((self.x_of(start) as f32).max(-8.0), (self.x_of(end) as f32).min(w + 8.0));
-        for (ly, lh) in lanes {
+        for (ly, lh, video) in lanes {
             let area = graphene::Rect::new(x0, ly + 1.0, (x1 - x0).max(2.0), lh - 3.0);
-            s.append_color(&gdk::RGBA::new(0.25, 0.75, 0.35, 0.35), &area);
-            s.append_border(&gsk::RoundedRect::from_rect(area, 3.0), &[2.0; 4], &[gdk::RGBA::new(0.3, 0.85, 0.4, 1.0); 4]);
+            let rounded = gsk::RoundedRect::from_rect(area, 3.0);
+            if !video {
+                s.append_color(&gdk::RGBA::new(0.25, 0.75, 0.35, 0.35), &area);
+                s.append_border(&rounded, &[2.0; 4], &[gdk::RGBA::new(0.3, 0.85, 0.4, 1.0); 4]);
+                continue;
+            }
+            let body = css_color(self, "tempo_clip_video_top");
+            let bar = css_color(self, "tempo_clip_video");
+            s.push_rounded_clip(&rounded);
+            s.append_color(&gdk::RGBA::new(body.red(), body.green(), body.blue(), 0.85), &area);
+            let bar_y = area.y() + area.height() - NAME_BAR_H;
+            s.append_color(&gdk::RGBA::new(bar.red(), bar.green(), bar.blue(), 0.9), &graphene::Rect::new(area.x(), bar_y, area.width(), NAME_BAR_H));
+            if let Some((texture, name)) = self.drop_source_look() {
+                let side = bar_y - area.y();
+                s.push_clip(&graphene::Rect::new(area.x(), area.y(), area.width(), side));
+                s.append_texture(&texture, &graphene::Rect::new(area.x(), area.y(), side * 16.0 / 9.0, side));
+                s.pop();
+                self.text(s, &name, area.x() + 6.0, bar_y + 3.0, &gdk::RGBA::WHITE, true, area.width() - 10.0);
+            }
+            s.pop();
+            s.append_border(&rounded, &[2.0; 4], &[css_color(self, "tempo_accent"); 4]);
         }
+    }
+
+    /// The dragged Media Pool source's thumbnail (made once) and file name.
+    fn drop_source_look(&self) -> Option<(gdk::Texture, String)> {
+        let id = self.imp().drop_source.get()?;
+        let state = self.state();
+        let name = state.with_project(|p| p.sources.get(&id).and_then(|src| src.path.file_name().map(|n| n.to_string_lossy().into_owned()))).flatten()?;
+        let mut cache = self.imp().thumbs.borrow_mut();
+        let texture = cache
+            .entry(id)
+            .or_insert_with(|| {
+                let data = state.with_project(|p| p.sources.get(&id).and_then(|src| src.thumbnail_data.clone())).flatten()?;
+                let (w, h) = thumbnail_size(data.len())?;
+                Some(gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(data), w * 4).upcast::<gdk::Texture>())
+            })
+            .clone()?;
+        Some((texture, name))
     }
 
     /// The new tracks a source dropped at `y` would get, if any.
@@ -1352,7 +1405,7 @@ impl TimelineCanvas {
             Some(Drag::Transition { left, both, from, to, max, .. }) => {
                 let fps = state.with_project(|p| p.timeline_fps()).unwrap_or_default();
                 *to = actions::dragged_length(*from, delta_us, *left, *both, *max, fps);
-                *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, state.fps())));
+                *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, *left, *both, state.fps())));
             }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
                 let raw = (*orig_in + delta_us).max(0);
@@ -1840,6 +1893,10 @@ impl TimelineCanvas {
             s.push_rounded_clip(&rounded);
             s.append_linear_gradient(&area, &graphene::Point::new(x0, top), &graphene::Point::new(x1, top), &stops);
             self.text(s, &transition_name(&t.kind), x0.max(0.0) + 4.0, top + (height - 16.0).max(0.0) / 2.0, &gdk::RGBA::WHITE, true, x1 - x0.max(0.0) - 8.0);
+            if !t.enabled {
+                // Switched off, as Resolve greys it: still there and selectable, but dim.
+                s.append_color(&gdk::RGBA::new(0.16, 0.16, 0.18, 0.7), &area);
+            }
             s.pop();
             let selected = state.edit_selection.get() == Some(EditSelection::Transition { track_id: track.id, clip_id: t.clip_id, edge: t.edge });
             if selected {
@@ -2219,6 +2276,28 @@ mod tests {
         assert_eq!((ease_out(0.0), ease_out(1.0), ease_out(2.0)), (0.0, 1.0, 1.0));
         // Fast first, slow last.
         assert!(ease_out(0.5) > 0.5);
+    }
+
+    #[test]
+    fn length_tip_reports_the_edge_movement_then_the_length() {
+        // Resolve: left edge of a 24-frame transition dragged 11 frames right.
+        assert_eq!(length_tip(24 * 41_667, 13 * 41_667, true, false, 24.0), "+00:11\n00:13");
+        // The right edge dragged 5 frames right lengthens it; left edge moving left is -.
+        assert_eq!(length_tip(10 * 41_667, 15 * 41_667, false, false, 24.0), "+00:05\n00:15");
+        assert_eq!(length_tip(10 * 41_667, 15 * 41_667, true, false, 24.0), "-00:05\n00:15");
+        // Centred on a cut both edges move, so each moves half the length change.
+        assert_eq!(length_tip(10 * 41_667, 14 * 41_667, false, true, 24.0), "+00:02\n00:14");
+    }
+
+    #[test]
+    fn thumbnail_size_matches_probe_sizes() {
+        assert_eq!(thumbnail_size(160 * 90 * 4), Some((160, 90)));
+        assert_eq!(thumbnail_size(7), None);
+    }
+
+    #[test]
+    fn ghost_band_is_a_full_video_track() {
+        assert_eq!(GHOST_BAND_H, VIDEO_H);
     }
 
     #[test]
