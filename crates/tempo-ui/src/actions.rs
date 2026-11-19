@@ -958,9 +958,21 @@ pub fn move_track(state: &Rc<AppState>, step: i32) {
 // ---- Markers ---------------------------------------------------------------
 
 pub fn marker_at_playhead(state: &AppState) -> Option<Marker> {
-    let pos = state.playhead_us();
-    let frame = state.frame_us();
-    state.with_timeline(|t| t.markers.iter().find(|m| (m.position_us - pos).abs() < frame).cloned()).flatten()
+    let (pos, frame) = (state.playhead_us(), state.frame_us());
+    state.with_timeline(|t| marker_on_frame(&t.markers, pos, frame).cloned()).flatten()
+}
+
+/// The marker on the same frame as `pos`.
+pub fn marker_on_frame(markers: &[Marker], pos: i64, frame_us: i64) -> Option<&Marker> {
+    markers.iter().find(|m| (m.position_us - pos).abs() < frame_us)
+}
+
+/// "Marker N" for a new marker: one more than the markers already there, and not a name in use.
+pub fn default_marker_name(others: &[Marker]) -> String {
+    (others.len() + 1..)
+        .map(|n| format!("Marker {n}"))
+        .find(|name| !others.iter().any(|m| &m.name == name))
+        .unwrap_or_default()
 }
 
 pub fn add_marker(state: &Rc<AppState>) -> Option<Marker> {
@@ -1059,6 +1071,23 @@ mod tests {
 
     fn clip(source_in: i64, length: i64) -> Clip {
         Clip::new(Uuid::new_v4(), Uuid::new_v4(), ClipType::Video, "c", 10_000_000, 10_000_000 + length, source_in, source_in + length)
+    }
+
+    #[test]
+    fn marker_names_count_up_and_skip_taken_ones() {
+        let m = |name: &str| Marker::new(0, name, MarkerColor::Blue);
+        assert_eq!(default_marker_name(&[]), "Marker 1");
+        assert_eq!(default_marker_name(&[m("Marker 1"), m("Section")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 2"), m("Intro")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 2")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 1"), m("Marker 3")]), "Marker 4");
+    }
+
+    #[test]
+    fn marker_is_found_only_on_the_same_frame() {
+        let markers = [Marker::new(1_000_000, "a", MarkerColor::Red)];
+        assert!(marker_on_frame(&markers, 1_020_000, 33_333).is_some());
+        assert!(marker_on_frame(&markers, 1_040_000, 33_333).is_none());
     }
 
     #[test]

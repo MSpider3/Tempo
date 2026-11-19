@@ -11,8 +11,8 @@ use crate::actions::{self, Place};
 use crate::inspector::Inspector;
 use crate::media_pool::MediaPool;
 use crate::state::{AppState, Change, Tool};
-use crate::timeline::{TimelineArea, MAX_PPS, MIN_PPS, TRANSITION_PREFIX};
-use crate::util::{divider, label, text_button, text_toggle, tool_button};
+use crate::timeline::{TimelineArea, TimelineCanvas, ZoomPreset, MAX_PPS, MIN_PPS, TRANSITION_PREFIX};
+use crate::util::{divider, label, text_button, text_toggle, tool_button, tool_toggle};
 use crate::viewer::Viewer;
 
 pub struct EditPage {
@@ -362,11 +362,23 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         actions::add_marker(&s);
     });
 
-    // Zoom: fit, minus, slider (logarithmic), plus.
+    // Zoom: the three presets, minus, slider (logarithmic), plus.
     let canvas = timeline.canvas.clone();
-    let fit = tool_button("zoom-fit-best-symbolic", "Zoom to fit (Shift+Z)");
-    let c = canvas.clone();
-    fit.connect_clicked(move |_| c.zoom_fit());
+    let fit = tool_toggle("zoom-fit-best-symbolic", "Full Extent Zoom (Shift+Z)");
+    let detail = tool_toggle("zoom-original-symbolic", "Detail Zoom");
+    let custom = tool_toggle("document-edit-symbolic", "Custom Zoom");
+    detail.set_group(Some(&fit));
+    custom.set_group(Some(&fit));
+    fit.set_active(true);
+    for (button, run) in [
+        (&fit, TimelineCanvas::zoom_fit as fn(&TimelineCanvas)),
+        (&detail, TimelineCanvas::zoom_detail),
+        (&custom, TimelineCanvas::zoom_custom),
+    ] {
+        // Clicked, not toggled: clicking the pressed preset again applies it again.
+        let c = canvas.clone();
+        button.connect_clicked(move |_| run(&c));
+    }
     let minus = tool_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
     let c = canvas.clone();
     minus.connect_clicked(move |_| c.set_pps(c.pps() / 1.4, None));
@@ -387,7 +399,17 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         glib::Propagation::Proceed
     });
     let z = zoom.clone();
-    canvas.connect_zoom(move |pps| z.set_value(to_slider(pps)));
+    let presets = [fit.clone(), detail.clone(), custom.clone()];
+    let c = canvas.clone();
+    canvas.connect_zoom(move |pps| {
+        z.set_value(to_slider(pps));
+        let pressed = match c.preset() {
+            ZoomPreset::Full => &presets[0],
+            ZoomPreset::Detail => &presets[1],
+            ZoomPreset::Custom => &presets[2],
+        };
+        pressed.set_active(true);
+    });
 
     let centre = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     for w in [
@@ -404,6 +426,8 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         marker.upcast_ref(),
         divider().upcast_ref(),
         fit.upcast_ref(),
+        detail.upcast_ref(),
+        custom.upcast_ref(),
         minus.upcast_ref(),
         zoom.upcast_ref(),
         plus.upcast_ref(),

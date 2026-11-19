@@ -18,6 +18,15 @@ use crate::state::{timecode, AppState, Change, Tool};
 use crate::util::{css_color, label};
 use crate::viewer::Viewer;
 
+/// Timecode over name: the tooltip of a marker.
+fn marker_tip(timecode: &str, name: &str) -> String {
+    if name.is_empty() {
+        timecode.to_string()
+    } else {
+        format!("{timecode}\n{name}")
+    }
+}
+
 pub const RULER_H: f32 = 48.0;
 const VIDEO_H: f32 = 60.0;
 const AUDIO_H: f32 = 54.0;
@@ -26,6 +35,10 @@ const NAME_BAR_H: f32 = 22.0;
 const EDGE_GRAB_PX: f64 = 6.0;
 /// A press becomes a drag only after the pointer has travelled this far.
 const DRAG_START_PX: f64 = 4.0;
+/// How wide a marker is to grab in the ruler, either side of its line.
+const MARKER_GRAB_PX: f64 = 6.0;
+/// Detail Zoom shows about this many seconds across the view.
+const DETAIL_ZOOM_SECONDS: f64 = 4.0;
 const SNAP_PX: f64 = 8.0;
 /// Fade handles: how far from a clip's top corner they can be grabbed, and their size.
 const FADE_GRAB_PX: f64 = 7.0;
@@ -76,9 +89,37 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
     out
 }
 
+/// The three zoom preset buttons left of the zoom slider.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZoomPreset {
+    Full,
+    Detail,
+    Custom,
+}
+
+/// Pixels per second that fit `seconds` across a view `width` pixels wide.
+fn detail_pps(width: f64, seconds: f64) -> f64 {
+    (width / seconds).clamp(MIN_PPS, MAX_PPS)
+}
+
+/// `ss:ff` with a leading `-` when negative, for the tooltip of a drag.
+fn offset_label(us: i64, fps: f64) -> String {
+    let fps_i = fps.round().max(1.0) as i64;
+    let frames = (us.unsigned_abs() as f64 * fps / 1_000_000.0 + 0.1).floor() as i64;
+    format!("{}{:02}:{:02}", if us < 0 { "-" } else { "" }, frames / fps_i, frames % fps_i)
+}
+
+/// The marker whose line is within `grab_px` of `x`, the nearest one.
+fn marker_near(markers: &[tempo_timeline::Marker], x: f64, grab_px: f64, x_of: impl Fn(i64) -> f64) -> Option<&tempo_timeline::Marker> {
+    let dist = |m: &&tempo_timeline::Marker| (x_of(m.position_us) - x).abs();
+    markers.iter().filter(|m| dist(m) <= grab_px).min_by(|a, b| dist(a).total_cmp(&dist(b)))
+}
+
 #[derive(Clone)]
 enum Drag {
     Scrub,
+    /// A marker dragged along the ruler: where it was and where it would land.
+    Marker { id: Uuid, from: i64, to: i64 },
     Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid },
     /// `roll` moves the cut between two touching clips (Shift in Trim mode).
     Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
@@ -113,6 +154,11 @@ mod imp {
         pub zoom_listener: RefCell<Option<Box<dyn Fn(f64)>>>,
         /// Zoom-to-fit was asked for before the widget had a size.
         pub fit_pending: Cell<bool>,
+        /// Which zoom preset button is pressed, and the zoom the user last set by hand.
+        pub preset: Cell<ZoomPreset>,
+        pub custom_pps: Cell<f64>,
+        /// A small black tooltip drawn at the pointer: x, y, text.
+        pub tip: RefCell<Option<(f64, f64, String)>>,
         /// The right-click menu while it is open.
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         /// The playhead, drawn on its own layer above the canvas so moving it does
@@ -139,6 +185,9 @@ mod imp {
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
                 zoom_listener: RefCell::new(None),
                 fit_pending: Cell::new(false),
+                preset: Cell::new(ZoomPreset::Full),
+                custom_pps: Cell::new(20.0),
+                tip: RefCell::new(None),
                 menu: RefCell::new(None),
                 playhead_layer: RefCell::new(None),
             }
@@ -285,8 +334,34 @@ impl TimelineCanvas {
         let anchor = anchor_x.unwrap_or(self.x_of(self.imp().playhead.get()).clamp(0.0, self.width() as f64));
         let t = self.us_at(anchor);
         self.imp().pps.set(pps.clamp(MIN_PPS, MAX_PPS));
+        // Zooming by hand is the Custom Zoom, which the preset button returns to.
+        self.imp().custom_pps.set(self.pps());
+        self.imp().preset.set(ZoomPreset::Custom);
         self.set_scroll(t as f64 / 1_000_000.0 * self.pps() - anchor);
         self.notify_zoom();
+    }
+
+    pub fn preset(&self) -> ZoomPreset {
+        self.imp().preset.get()
+    }
+
+    /// Zoom to `pps` with the playhead in the middle of the view.
+    fn zoom_centred(&self, pps: f64, preset: ZoomPreset) {
+        let imp = self.imp();
+        imp.pps.set(pps.clamp(MIN_PPS, MAX_PPS));
+        imp.preset.set(preset);
+        self.set_scroll(imp.playhead.get() as f64 / 1_000_000.0 * self.pps() - self.width() as f64 / 2.0);
+        self.notify_zoom();
+    }
+
+    /// Detail Zoom: a few seconds across the view, centred on the playhead.
+    pub fn zoom_detail(&self) {
+        self.zoom_centred(detail_pps(self.width() as f64, DETAIL_ZOOM_SECONDS), ZoomPreset::Detail);
+    }
+
+    /// Custom Zoom: back to the zoom last set by hand, centred on the playhead.
+    pub fn zoom_custom(&self) {
+        self.zoom_centred(self.imp().custom_pps.get(), ZoomPreset::Custom);
     }
 
     /// Called with the new pixels-per-second whenever the zoom changes.
@@ -303,9 +378,11 @@ impl TimelineCanvas {
     pub fn zoom_fit(&self) {
         if self.width() < 100 {
             self.imp().fit_pending.set(true);
+            self.imp().preset.set(ZoomPreset::Full);
             return;
         }
         self.imp().fit_pending.set(false);
+        self.imp().preset.set(ZoomPreset::Full);
         let end = self.state().with_timeline(|t| t.tracks.iter().map(|tr| tr.duration_us()).max().unwrap_or(0)).unwrap_or(0);
         // An empty timeline shows its first minute.
         let dur = if end > 0 { end as f64 / 1_000_000.0 } else { 60.0 };
@@ -379,6 +456,11 @@ impl TimelineCanvas {
     /// start of the timeline. Clips in `ignore` (the ones being moved) do not count,
     /// or a clip would stick to where it and its linked partner already are.
     fn snap(&self, us: i64, ignore: &[Uuid]) -> (i64, bool) {
+        self.snap_skipping(us, ignore, None)
+    }
+
+    /// `snap`, without the marker `skip_marker` (the one being dragged).
+    fn snap_skipping(&self, us: i64, ignore: &[Uuid], skip_marker: Option<Uuid>) -> (i64, bool) {
         let state = self.state();
         if !state.snapping.get() {
             return (us, false);
@@ -388,7 +470,7 @@ impl TimelineCanvas {
         let best = state
             .with_timeline(|t| {
                 let edges = t.tracks.iter().flat_map(|tr| tr.clips.iter()).filter(|c| !ignore.contains(&c.id)).flat_map(|c| [c.timeline_in, c.timeline_out]);
-                let markers = t.markers.iter().map(|m| m.position_us);
+                let markers = t.markers.iter().filter(|m| Some(m.id) != skip_marker).map(|m| m.position_us);
                 edges.chain(markers).chain([0, playhead]).filter(|p| (p - us).abs() <= threshold).min_by_key(|p| (p - us).abs())
             })
             .flatten();
@@ -586,8 +668,7 @@ impl TimelineCanvas {
                 return;
             }
             let state = c.state();
-            let near = |m: &&tempo_timeline::Marker| (c.x_of(m.position_us) - x).abs();
-            let marker = state.with_timeline(|t| t.markers.iter().filter(|m| near(m) <= 6.0).min_by(|a, b| near(a).total_cmp(&near(b))).cloned()).flatten();
+            let marker = state.with_timeline(|t| marker_near(&t.markers, x, MARKER_GRAB_PX, |us| c.x_of(us)).cloned()).flatten();
             if let Some(marker) = marker {
                 crate::dialogs::edit_marker(&c, &state, marker);
             }
@@ -600,6 +681,7 @@ impl TimelineCanvas {
         motion.connect_motion(move |_, x, y| {
             if let Some(c) = c.upgrade() {
                 c.imp().pointer_x.set(x);
+                c.hover_tip(x, y);
                 let tool = c.state().tool.get();
                 let hit = c.hit(x, y);
                 if c.imp().hover.replace(hit.as_ref().map(|(_, id, _)| *id)) != hit.as_ref().map(|(_, id, _)| *id) {
@@ -630,6 +712,7 @@ impl TimelineCanvas {
         motion.connect_leave(move |_| {
             if let Some(c) = c.upgrade() {
                 c.state().hint(None);
+                c.hover_tip(-1.0, -1.0);
                 if c.imp().hover.take().is_some() {
                     c.redraw();
                 }
@@ -704,7 +787,12 @@ impl TimelineCanvas {
         }
 
         if y < RULER_H as f64 {
-            *imp.drag.borrow_mut() = Some(Drag::Scrub);
+            // The playhead goes to the click either way; on a marker the drag moves the marker.
+            let marker = state.with_timeline(|t| marker_near(&t.markers, x, MARKER_GRAB_PX, |us| self.x_of(us)).map(|m| m.id)).flatten();
+            *imp.drag.borrow_mut() = Some(match marker.and_then(|id| state.with_timeline(|t| t.markers.iter().find(|m| m.id == id).map(|m| m.position_us)).flatten().map(|at| (id, at))) {
+                Some((id, at)) => Drag::Marker { id, from: at, to: at },
+                None => Drag::Scrub,
+            });
             self.scrub(x);
             return;
         }
@@ -844,6 +932,23 @@ impl TimelineCanvas {
         popover.popup();
     }
 
+    /// The two-line tooltip of the marker under the pointer in the ruler.
+    fn hover_tip(&self, x: f64, y: f64) {
+        let imp = self.imp();
+        if imp.drag.borrow().is_some() {
+            return;
+        }
+        let state = self.state();
+        let tip = (y >= 0.0 && y < RULER_H as f64)
+            .then(|| state.with_timeline(|t| marker_near(&t.markers, x, MARKER_GRAB_PX, |us| self.x_of(us)).map(|m| marker_tip(&timecode(m.position_us, state.fps()), &m.name))).flatten())
+            .flatten()
+            .map(|text| (x, y, text));
+        if *imp.tip.borrow() != tip {
+            *imp.tip.borrow_mut() = tip;
+            self.queue_draw();
+        }
+    }
+
     fn scrub(&self, x: f64) {
         let us = self.us_at(x).min(self.state().player.duration_us());
         if let Some(v) = self.imp().viewer.borrow().as_ref() {
@@ -869,6 +974,12 @@ impl TimelineCanvas {
         let delta_us = ((x - px) / self.pps() * 1_000_000.0) as i64;
         let mut drag = imp.drag.borrow_mut();
         match drag.as_mut() {
+            Some(Drag::Marker { id, from, to }) => {
+                let (at, hit) = self.snap_skipping((*from + delta_us).max(0), &[], Some(*id));
+                *to = if hit { at } else { state.frame_floor(at) };
+                let name = state.with_timeline(|t| t.markers.iter().find(|m| m.id == *id).map(|m| m.name.clone())).flatten().unwrap_or_default();
+                *imp.tip.borrow_mut() = Some((x, y, marker_tip(&timecode(*to, state.fps()), &name)));
+            }
             Some(Drag::Fade { edge, from, to, .. }) => {
                 // Toward the middle of the clip lengthens the fade.
                 *to = (*from + if *edge == FadeEdge::In { delta_us } else { -delta_us }).max(0);
@@ -896,6 +1007,7 @@ impl TimelineCanvas {
                     state.frame_floor(raw)
                 };
                 *new_in = snapped.max(0);
+                *imp.tip.borrow_mut() = Some((x, y, offset_label(*new_in - *orig_in, state.fps())));
                 if let Some(row) = self.row_at(y) {
                     if row.kind == *kind && !row.locked {
                         *to_track = row.track_id;
@@ -939,6 +1051,7 @@ impl TimelineCanvas {
                     }
                 };
                 *delta = target.clamp(low, high.max(low)) - base;
+                *imp.tip.borrow_mut() = Some((x, y, offset_label(*delta, state.fps())));
             }
             _ => return,
         }
@@ -949,9 +1062,17 @@ impl TimelineCanvas {
     fn on_release(&self) {
         let imp = self.imp();
         imp.snap_line.set(None);
+        imp.tip.take();
         let drag = imp.drag.borrow_mut().take();
         let state = self.state();
         match drag {
+            Some(Drag::Marker { id, from, to }) if to != from => {
+                let moved = state.with_timeline(|t| t.markers.iter().find(|m| m.id == id).cloned()).flatten();
+                if let Some(mut marker) = moved {
+                    marker.position_us = to;
+                    actions::update_marker(&state, marker);
+                }
+            }
             Some(Drag::Move { clip, from_track, orig_in, new_in, to_track, .. }) => {
                 if state.selected_ids().len() > 1 {
                     // Several clips (or a clip and its sound) move together in time.
@@ -1277,8 +1398,13 @@ impl TimelineCanvas {
         }
 
         // Markers.
+        let moving_marker = match &*imp.drag.borrow() {
+            Some(Drag::Marker { id, to, .. }) => Some((*id, *to)),
+            _ => None,
+        };
         for m in &timeline.markers {
-            let x = self.x_of(m.position_us) as f32;
+            let at = moving_marker.filter(|(id, _)| *id == m.id).map_or(m.position_us, |(_, to)| to);
+            let x = self.x_of(at) as f32;
             if x < -10.0 || x > w + 10.0 {
                 continue;
             }
@@ -1302,6 +1428,27 @@ impl TimelineCanvas {
         if let Some(us) = imp.snap_line.get() {
             s.append_color(&white, &rect(self.x_of(us) as f32, RULER_H, 1.0, h - RULER_H));
         }
+
+        if let Some((x, y, text)) = imp.tip.borrow().as_ref() {
+            self.draw_tip(s, *x as f32, *y as f32, text);
+        }
+    }
+
+    /// A small black tooltip below and right of the pointer.
+    fn draw_tip(&self, s: &gtk::Snapshot, x: f32, y: f32, text: &str) {
+        let layout = self.create_pango_layout(Some(text));
+        let (tw, th) = layout.pixel_size();
+        let (bw, bh) = (tw as f32 + 12.0, th as f32 + 6.0);
+        let bx = (x + 12.0).min(self.width() as f32 - bw - 2.0).max(2.0);
+        let by = y + 18.0;
+        let bounds = graphene::Rect::new(bx, by, bw, bh);
+        s.push_rounded_clip(&gsk::RoundedRect::from_rect(bounds, 3.0));
+        s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.9), &bounds);
+        s.pop();
+        s.save();
+        s.translate(&graphene::Point::new(bx + 6.0, by + 3.0));
+        s.append_layout(&layout, &gdk::RGBA::WHITE);
+        s.restore();
     }
 
     fn draw_playhead(&self, s: &gtk::Snapshot) {
@@ -1569,4 +1716,37 @@ fn audio_meter(state: &Rc<AppState>) -> gtk::DrawingArea {
         glib::ControlFlow::Continue
     });
     meter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempo_timeline::{Marker, MarkerColor};
+
+    #[test]
+    fn offset_label_shows_sign_and_frames() {
+        assert_eq!(offset_label(0, 24.0), "00:00");
+        assert_eq!(offset_label(-(3 * 1_000_000 + 5 * 41_667), 24.0), "-03:05");
+        assert_eq!(offset_label(1_000_000, 30.0), "01:00");
+    }
+
+    #[test]
+    fn detail_zoom_fits_a_few_seconds() {
+        assert_eq!(detail_pps(800.0, 4.0), 200.0);
+        assert_eq!(detail_pps(100_000.0, 4.0), MAX_PPS);
+    }
+
+    #[test]
+    fn marker_near_picks_the_closest_within_reach() {
+        let markers = [Marker::new(1_000_000, "a", MarkerColor::Blue), Marker::new(1_100_000, "b", MarkerColor::Blue)];
+        let x_of = |us: i64| us as f64 / 10_000.0; // 100 px per second
+        assert_eq!(marker_near(&markers, 109.0, 6.0, x_of).map(|m| m.name.as_str()), Some("b"));
+        assert!(marker_near(&markers, 50.0, 6.0, x_of).is_none());
+    }
+
+    #[test]
+    fn marker_tip_has_timecode_over_name() {
+        assert_eq!(marker_tip("00:00:01:00", "Intro"), "00:00:01:00\nIntro");
+        assert_eq!(marker_tip("00:00:01:00", ""), "00:00:01:00");
+    }
 }
