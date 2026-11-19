@@ -531,12 +531,6 @@ pub fn add_standard_transitions(state: &Rc<AppState>, video: bool, audio: bool) 
     add_transitions(state, video.then_some(TransitionKind::CrossDissolve), audio);
 }
 
-/// The Effects panel's Cross Dissolve before transitions were objects.
-// shortcut: kept so older callers build; remove once nothing calls it.
-pub fn cross_dissolve(state: &Rc<AppState>, _seconds: f64) {
-    add_transition(state, TransitionKind::CrossDissolve);
-}
-
 /// The edits Add Transition works on: the selected edit point or transition with the
 /// edits linked to it, else both ends of every selected clip. (track, kind, position).
 fn edits_to_fill(state: &AppState) -> Vec<(Uuid, TrackKind, i64)> {
