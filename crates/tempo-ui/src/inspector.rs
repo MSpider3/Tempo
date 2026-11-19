@@ -8,7 +8,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use tempo_timeline::{
     frame_to_us, us_to_frame, Clip, ClipType, Command, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand, SetTransitionCommand,
-    TitleType, Transition, TransitionAlignment, TransitionEdge, TransitionKind,
+    TitleType, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind,
 };
 use uuid::Uuid;
 
@@ -314,15 +314,19 @@ impl Inspector {
         let sel = (track_id, clip_id, edge);
         let state = &self.state;
 
-        Self::row_label(&grid, 0, "Type");
-        let kinds = gtk::DropDown::from_strings(&["Cross Dissolve", "Dip To Color Dissolve"]);
-        kinds.set_selected(u32::from(t.kind == TransitionKind::DipToColor));
-        let s = state.clone();
-        kinds.connect_selected_notify(move |d| {
-            let kind = if d.selected() == 1 { TransitionKind::DipToColor } else { TransitionKind::CrossDissolve };
-            edit_transition(&s, sel, |t| t.kind = kind);
-        });
-        grid.attach(&kinds, 1, 0, 1, 1);
+        // Audio transitions (Cross Fade) have no type choice and no colour.
+        let video = has_video_controls(view.track_kind);
+        if video {
+            Self::row_label(&grid, 0, "Type");
+            let kinds = gtk::DropDown::from_strings(&["Cross Dissolve", "Dip To Color Dissolve"]);
+            kinds.set_selected(u32::from(t.kind == TransitionKind::DipToColor));
+            let s = state.clone();
+            kinds.connect_selected_notify(move |d| {
+                let kind = if d.selected() == 1 { TransitionKind::DipToColor } else { TransitionKind::CrossDissolve };
+                edit_transition(&s, sel, |t| t.kind = kind);
+            });
+            grid.attach(&kinds, 1, 0, 1, 1);
+        }
 
         Self::row_label(&grid, 1, "Duration");
         let frames = us_to_frame(t.duration_us, view.fps);
@@ -370,7 +374,7 @@ impl Inspector {
 
         // shortcut: Ease is saved in the file but not rendered yet (ramps are linear), so it has no control here; add the row back when the renderers apply it.
 
-        if t.kind == TransitionKind::DipToColor {
+        if video && t.kind == TransitionKind::DipToColor {
             Self::row_label(&grid, 4, "Color");
             let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
             button.set_rgba(&gtk::gdk::RGBA::new(t.color[0], t.color[1], t.color[2], 1.0));
@@ -461,6 +465,7 @@ struct TransitionView {
     transition: Transition,
     max_us: i64,
     edit_kind: EditKind,
+    track_kind: TrackKind,
     fps: RationalFps,
 }
 
@@ -475,7 +480,7 @@ impl TransitionView {
                 let clip = track.find_clip(clip_id)?;
                 let edit_kind = if edge == TransitionEdge::Out { EditKind::Tail } else { track.edit_at(clip.timeline_in)?.kind };
                 let max_us = track.max_transition_us(clip_id, edge, transition.alignment, &p.sources, p.fps);
-                Some(Self { transition, max_us, edit_kind, fps: p.fps })
+                Some(Self { transition, max_us, edit_kind, track_kind: track.kind, fps: p.fps })
             })
             .flatten()
     }
@@ -501,7 +506,16 @@ fn edit_transition(state: &Rc<AppState>, (track_id, clip_id, edge): TransitionRe
 }
 
 fn kind_name(kind: &TransitionKind) -> &'static str {
-    if *kind == TransitionKind::DipToColor { "Dip To Color Dissolve" } else { "Cross Dissolve" }
+    match kind {
+        TransitionKind::DipToColor => "Dip To Color Dissolve",
+        TransitionKind::Crossfade => "Cross Fade",
+        _ => "Cross Dissolve",
+    }
+}
+
+/// The Type dropdown and Color are video-only.
+fn has_video_controls(kind: TrackKind) -> bool {
+    kind == TrackKind::Video
 }
 
 fn seconds_to_frames(seconds: f64, fps: RationalFps) -> i64 {
@@ -525,6 +539,13 @@ fn alignment_enabled(kind: EditKind, alignment: TransitionAlignment) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audio_transition_panel_is_cross_fade_without_video_controls() {
+        assert_eq!(super::kind_name(&super::TransitionKind::Crossfade), "Cross Fade");
+        assert!(!super::has_video_controls(super::TrackKind::Audio));
+        assert!(super::has_video_controls(super::TrackKind::Video));
+    }
+
     use super::*;
 
     const FPS_30: RationalFps = RationalFps { num: 30, den: 1 };
