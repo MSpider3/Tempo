@@ -53,6 +53,8 @@ pub enum HintZone {
     ClipBody,
     ClipEdge,
     FadeHandle,
+    /// The start of a cross dissolve on the timeline.
+    TransitionEdge,
     Ruler,
     Viewer,
     MediaPool,
@@ -67,6 +69,7 @@ fn hint_actions(zone: HintZone) -> (&'static str, &'static [(&'static str, &'sta
         ),
         HintZone::ClipEdge => ("Drag to trim · Shift+drag in Trim mode rolls", &[("win.tool-trim", "Trim mode (ripples)"), ("win.tool-select", "Selection mode"), ("win.snap-toggle", "Snapping")]),
         HintZone::FadeHandle => ("Drag toward the middle to fade", &[("win.fade-in-to-playhead", "Fade in to playhead"), ("win.fade-out-to-playhead", "Fade out to playhead")]),
+        HintZone::TransitionEdge => ("Drag to make the dissolve longer or shorter", &[("win.transition-add", "Add dissolve"), ("win.undo", "Undo")]),
         HintZone::Ruler => ("Click or drag to move the playhead", &[("win.mark-in", "Mark In"), ("win.mark-out", "Mark Out"), ("win.marker-add", "Marker")]),
         HintZone::Viewer => ("", &[("win.play-toggle", "Play"), ("win.play-reverse", "Reverse"), ("win.stop", "Stop"), ("win.play-forward", "Forward"), ("win.viewer-toggle", "Source / timeline")]),
         HintZone::MediaPool => (
@@ -144,7 +147,7 @@ mod tests {
     #[test]
     fn every_hint_names_a_bound_action() {
         let binds = load();
-        for zone in [HintZone::ClipBody, HintZone::ClipEdge, HintZone::FadeHandle, HintZone::Ruler, HintZone::Viewer, HintZone::MediaPool] {
+        for zone in [HintZone::ClipBody, HintZone::ClipEdge, HintZone::FadeHandle, HintZone::TransitionEdge, HintZone::Ruler, HintZone::Viewer, HintZone::MediaPool] {
             for (action, _) in hint_actions(zone).1 {
                 assert!(binds.iter().any(|b| b.action == *action && !b.keys.is_empty()), "{action} has no key");
             }

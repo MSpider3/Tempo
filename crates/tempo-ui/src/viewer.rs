@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::{gio, glib};
 
 use crate::player::{Player, Snapshot};
 use crate::state::{timecode, AppState, Change};
@@ -24,6 +25,8 @@ pub struct Viewer {
     /// Called when "Dual viewer" is switched in the menu.
     dual_listener: RefCell<Option<Box<dyn Fn(bool)>>>,
     name: gtk::Label,
+    /// The name above the picture: in timeline mode, a menu of the project's timelines.
+    switcher: gtk::MenuButton,
     proxy_badge: gtk::Label,
     /// Shown while a Media Pool clip is in the viewer: the way back.
     back: gtk::Button,
@@ -77,7 +80,18 @@ impl Viewer {
         start.append(&quality);
         start.append(&back);
         header.set_start_widget(Some(&start));
-        header.set_center_widget(Some(&name));
+        let switcher = gtk::MenuButton::builder().child(&name).css_classes(["flat"]).build();
+        header.set_center_widget(Some(&switcher));
+        let actions = gio::SimpleActionGroup::new();
+        let open = gio::SimpleAction::new("open-timeline", Some(glib::VariantTy::STRING));
+        let s = state.clone();
+        open.connect_activate(move |_, target| {
+            if let Some(id) = target.and_then(|t| t.str()).and_then(|t| uuid::Uuid::parse_str(t).ok()) {
+                s.open_timeline(id);
+            }
+        });
+        actions.add_action(&open);
+        root.insert_action_group("viewer", Some(&actions));
         header.set_end_widget(Some(&end));
         root.append(&header);
 
@@ -130,6 +144,7 @@ impl Viewer {
             shown_source: Cell::new(None),
             dual_listener: RefCell::new(None),
             name,
+            switcher,
             proxy_badge,
             back,
             scrub,
@@ -312,6 +327,31 @@ impl Viewer {
         }
     }
 
+    /// Resolve's timeline menu: every timeline, then Create New Timeline.
+    fn refresh_timeline_menu(&self) {
+        let timelines = if self.source_only || self.state.source_mode() { None } else { self.state.with_project(|p| p.timeline_list()) };
+        self.switcher.set_always_show_arrow(timelines.is_some());
+        self.switcher.set_tooltip_text(timelines.as_ref().map(|_| "Timelines in this project"));
+        let Some(timelines) = timelines else {
+            self.switcher.set_menu_model(None::<&gio::MenuModel>);
+            return;
+        };
+        let list = gio::Menu::new();
+        for (id, name) in timelines {
+            let item = gio::MenuItem::new(Some(&name), None);
+            item.set_action_and_target_value(Some("viewer.open-timeline"), Some(&id.to_string().to_variant()));
+            list.append_item(&item);
+        }
+        let create = gio::Menu::new();
+        let item = gio::MenuItem::new(Some("Create New Timeline…"), None);
+        item.set_action_and_target_value(Some("win.do"), Some(&"win.new-timeline".to_variant()));
+        create.append_item(&item);
+        let menu = gio::Menu::new();
+        menu.append_section(None, &list);
+        menu.append_section(None, &create);
+        self.switcher.set_menu_model(Some(&menu));
+    }
+
     fn refresh(&self) {
         let state = &self.state;
         self.back.set_visible(!self.source_only && state.source_mode());
@@ -322,13 +362,14 @@ impl Viewer {
                 let title = match source.and_then(|id| p.sources.get(&id)) {
                     Some(s) => s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     None if self.source_only => "Source".to_string(),
-                    None => "Timeline".to_string(),
+                    None => p.timeline.name.clone(),
                 };
                 (p.width, p.height, title)
             })
             .unwrap_or((1920, 1080, String::new()));
         self.surface.set_frame_size(w, h);
         self.name.set_text(&title);
+        self.refresh_timeline_menu();
         // Shown while any clip is previewed from its proxy.
         let proxied = state.with_project(|p| p.sources.values().any(|s| s.proxy_ready)).unwrap_or(false);
         let uses_proxies = state.settings.borrow().playback_height != 0;

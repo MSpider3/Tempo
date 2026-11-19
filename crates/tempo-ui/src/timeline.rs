@@ -30,6 +30,8 @@ const SNAP_PX: f64 = 8.0;
 /// Fade handles: how far from a clip's top corner they can be grabbed, and their size.
 const FADE_GRAB_PX: f64 = 7.0;
 const FADE_HANDLE_PX: f32 = 8.0;
+/// What a transition dragged from the Effects panel carries, before its kind.
+pub const TRANSITION_PREFIX: &str = "transition:";
 pub const MIN_PPS: f64 = 0.5;
 pub const MAX_PPS: f64 = 400.0;
 
@@ -82,6 +84,8 @@ enum Drag {
     Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
     /// Dragging a fade handle: the fade length at the start of the drag and now.
     Fade { clip: Uuid, edge: FadeEdge, from: i64, to: i64 },
+    /// Dragging the start of a cross dissolve: its length then and now, and the most it can be.
+    Dissolve { clip: Uuid, from: i64, to: i64, max: i64 },
 }
 
 mod imp {
@@ -103,6 +107,8 @@ mod imp {
         /// The clip under the pointer, which shows its fade handles.
         pub hover: Cell<Option<Uuid>>,
         pub snap_line: Cell<Option<i64>>,
+        /// Where a transition being dragged over the timeline would go: track and time.
+        pub drop_at: Cell<Option<(Uuid, i64)>>,
         pub hadj: gtk::Adjustment,
         pub zoom_listener: RefCell<Option<Box<dyn Fn(f64)>>>,
         /// Zoom-to-fit was asked for before the widget had a size.
@@ -128,6 +134,7 @@ mod imp {
                 press_mods: Cell::new(gdk::ModifierType::empty()),
                 pointer_x: Cell::new(0.0),
                 hover: Cell::new(None),
+                drop_at: Cell::new(None),
                 snap_line: Cell::new(None),
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
                 zoom_listener: RefCell::new(None),
@@ -449,6 +456,89 @@ impl TimelineCanvas {
             .map(|(edge, _, length)| (id, edge, length))
     }
 
+    /// The start of a cross dissolve under the pointer: (clip, length, longest it can be).
+    /// Its end stays on the cut, as with Resolve's "End on Edit".
+    fn dissolve_hit(&self, x: f64, y: f64) -> Option<(Uuid, i64, i64)> {
+        let row = self.row_at(y).filter(|r| !r.locked)?;
+        // The dissolve box sits between the fade handles and the name bar.
+        let dy = y - row.y as f64;
+        if !(6.0..=(row.h - NAME_BAR_H) as f64).contains(&dy) {
+            return None;
+        }
+        self.state()
+            .with_timeline(|t| {
+                let track = t.find_track(row.track_id)?;
+                track.clips.iter().find_map(|c| {
+                    let length = c.properties.dissolve_in_us.min(c.to_timeline_floor_us(c.source_in));
+                    if length <= 0 {
+                        return None;
+                    }
+                    let previous = track.clips.iter().find(|p| p.timeline_out == c.timeline_in)?.duration_us();
+                    let (start, cut) = (self.x_of(c.timeline_in - length), self.x_of(c.timeline_in));
+                    // A short dissolve leaves the half nearer the cut for trimming.
+                    ((start - x).abs() <= EDGE_GRAB_PX.min((cut - start) / 2.0)).then(|| (c.id, length, actions::dissolve_room(c, previous, i64::MAX).0))
+                })
+            })
+            .flatten()
+    }
+
+    /// Where a transition dropped at a point goes: the clip under it (or whose edge
+    /// is within reach), the nearer of its edges, and that edge's time.
+    fn transition_target(&self, x: f64, y: f64) -> Option<(Row, Uuid, TrimEdge, i64)> {
+        let (row, id, edge) = self.hit(x, y)?;
+        let (tin, tout) = self.state().with_timeline(|t| t.find_clip(id).map(|(_, c)| (c.timeline_in, c.timeline_out)))??;
+        let edge = edge.unwrap_or(if x - self.x_of(tin) <= self.x_of(tout) - x { TrimEdge::In } else { TrimEdge::Out });
+        Some((row, id, edge, if edge == TrimEdge::In { tin } else { tout }))
+    }
+
+    /// Drop a transition from the Effects panel at a point, as Resolve does: a
+    /// cross dissolve on a cut joins the two clips; on a clip edge with nothing
+    /// next to it, it fades from or to black. Fades go on the clip under the pointer.
+    pub fn drop_transition(&self, kind: &str, x: f64, y: f64) -> bool {
+        let state = self.state();
+        let Some((row, id, edge, at)) = self.transition_target(x, y) else {
+            state.message("Drop a transition on a cut, or on the start or end of a clip.");
+            return false;
+        };
+        if row.locked {
+            state.message("That track is locked. Click its lock in the track header to edit it.");
+            return false;
+        }
+        let seconds = actions::STANDARD_TRANSITION_S;
+        // The clip that starts at this edit point, when another clip ends there.
+        let incoming = state
+            .with_timeline(|t| {
+                let track = t.find_track(row.track_id)?;
+                match edge {
+                    TrimEdge::In => track.has_clip_ending_at(at).then_some(id),
+                    TrimEdge::Out => track.clips.iter().find(|c| c.timeline_in == at && c.id != id).map(|c| c.id),
+                }
+            })
+            .flatten();
+        let fade_in = match kind {
+            "cross-dissolve" => match incoming {
+                Some(into) => {
+                    state.select(Some(into));
+                    actions::cross_dissolve(&state, seconds);
+                    return true;
+                }
+                None => edge == TrimEdge::In,
+            },
+            "fade-in" => true,
+            "fade-out" => false,
+            "fade-in-out" => {
+                state.select(Some(id));
+                actions::set_fade(&state, true, seconds);
+                actions::set_fade(&state, false, seconds);
+                return true;
+            }
+            _ => return false,
+        };
+        state.select(Some(id));
+        actions::set_fade(&state, fade_in, seconds);
+        true
+    }
+
     fn install_controllers(&self) {
         // Press, drag, release.
         let drag = gtk::GestureDrag::new();
@@ -487,6 +577,23 @@ impl TimelineCanvas {
         });
         self.add_controller(click);
 
+        // Double-click a marker in the ruler to edit it, as in Resolve.
+        let double = gtk::GestureClick::new();
+        let c = self.downgrade();
+        double.connect_pressed(move |_, presses, x, y| {
+            let Some(c) = c.upgrade() else { return };
+            if presses != 2 || y >= RULER_H as f64 {
+                return;
+            }
+            let state = c.state();
+            let near = |m: &&tempo_timeline::Marker| (c.x_of(m.position_us) - x).abs();
+            let marker = state.with_timeline(|t| t.markers.iter().filter(|m| near(m) <= 6.0).min_by(|a, b| near(a).total_cmp(&near(b))).cloned()).flatten();
+            if let Some(marker) = marker {
+                crate::dialogs::edit_marker(&c, &state, marker);
+            }
+        });
+        self.add_controller(double);
+
         // Pointer shape near clip edges.
         let motion = gtk::EventControllerMotion::new();
         let c = self.downgrade();
@@ -498,17 +605,21 @@ impl TimelineCanvas {
                 if c.imp().hover.replace(hit.as_ref().map(|(_, id, _)| *id)) != hit.as_ref().map(|(_, id, _)| *id) {
                     c.redraw();
                 }
+                let on_fade = c.fade_hit(x, y).is_some();
+                let on_dissolve = !on_fade && c.dissolve_hit(x, y).is_some();
                 let zone = if y < RULER_H as f64 {
                     Some(HintZone::Ruler)
-                } else if c.fade_hit(x, y).is_some() {
+                } else if on_fade {
                     Some(HintZone::FadeHandle)
+                } else if on_dissolve {
+                    Some(HintZone::TransitionEdge)
                 } else {
                     hit.as_ref().map(|(_, _, edge)| if edge.is_some() { HintZone::ClipEdge } else { HintZone::ClipBody })
                 };
                 c.state().hint(zone);
                 let cursor = match (tool, hit) {
                     (Tool::Blade, Some(_)) => Some("crosshair"),
-                    (Tool::Select | Tool::Trim, _) if c.fade_hit(x, y).is_some() => Some("ew-resize"),
+                    (Tool::Select | Tool::Trim, _) if on_fade || on_dissolve => Some("ew-resize"),
                     (Tool::Select | Tool::Trim, Some((_, _, Some(_)))) => Some("col-resize"),
                     _ => None,
                 };
@@ -541,12 +652,39 @@ impl TimelineCanvas {
         });
         self.add_controller(scroll);
 
-        // Clips dragged in from the Media Pool carry the source id as text.
+        // Clips dragged in from the Media Pool carry the source id as text,
+        // transitions from the Effects panel TRANSITION_PREFIX and their kind.
         let drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
+        drop.set_preload(true);
+        let c = self.downgrade();
+        drop.connect_motion(move |target, x, y| {
+            if let Some(c) = c.upgrade() {
+                let transition = target.value().and_then(|v| v.get::<String>().ok()).is_some_and(|s| s.starts_with(TRANSITION_PREFIX));
+                // Show the edit point the transition would go on.
+                let at = if transition { c.transition_target(x, y).map(|(row, _, _, at)| (row.track_id, at)) } else { None };
+                if c.imp().drop_at.replace(at) != at {
+                    c.redraw();
+                }
+            }
+            gdk::DragAction::COPY
+        });
+        let c = self.downgrade();
+        drop.connect_leave(move |_| {
+            if let Some(c) = c.upgrade() {
+                if c.imp().drop_at.take().is_some() {
+                    c.redraw();
+                }
+            }
+        });
         let c = self.downgrade();
         drop.connect_drop(move |_, value, x, y| {
             let Some(c) = c.upgrade() else { return false };
-            let Some(id) = value.get::<String>().ok().and_then(|s| Uuid::parse_str(&s).ok()) else { return false };
+            c.imp().drop_at.set(None);
+            let Ok(text) = value.get::<String>() else { return false };
+            if let Some(kind) = text.strip_prefix(TRANSITION_PREFIX) {
+                return c.drop_transition(kind, x, y);
+            }
+            let Ok(id) = Uuid::parse_str(&text) else { return false };
             let (at, _) = c.snap(c.us_at(x), &[]);
             let track = c.row_at(y).map(|r| r.track_id);
             actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
@@ -577,6 +715,13 @@ impl TimelineCanvas {
                 state.select(Some(id));
             }
             *imp.drag.borrow_mut() = Some(Drag::Fade { clip: id, edge, from: length, to: length });
+            return;
+        }
+        if let Some((id, length, max)) = self.dissolve_hit(x, y).filter(|_| plain && state.tool.get() != Tool::Blade) {
+            if !state.is_selected(id) {
+                state.select(Some(id));
+            }
+            *imp.drag.borrow_mut() = Some(Drag::Dissolve { clip: id, from: length, to: length, max });
             return;
         }
 
@@ -728,6 +873,12 @@ impl TimelineCanvas {
                 // Toward the middle of the clip lengthens the fade.
                 *to = (*from + if *edge == FadeEdge::In { delta_us } else { -delta_us }).max(0);
             }
+            Some(Drag::Dissolve { clip, from, to, max }) => {
+                // The start follows the pointer, in whole frames; the end stays on the cut.
+                let cut = state.with_timeline(|t| t.find_clip(*clip).map(|(_, c)| c.timeline_in)).flatten().unwrap_or(0);
+                let shortest = state.frame_us().min(*max);
+                *to = (cut - state.frame_floor(cut - (*from - delta_us).clamp(shortest, *max))).clamp(shortest, *max);
+            }
             Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
                 let raw = (*orig_in + delta_us).max(0);
                 let moving = self.moving_with(*clip);
@@ -821,6 +972,14 @@ impl TimelineCanvas {
                 if let Some(edited) = edited {
                     state.execute(Box::new(EditClipCommand::new(if edge == FadeEdge::In { "Fade In" } else { "Fade Out" }, edited)));
                 }
+            }
+            Some(Drag::Dissolve { clip, from, to, .. }) if to != from => {
+                // Linked sound with its own dissolve changes with the picture.
+                let linked: Vec<Uuid> = state
+                    .with_timeline(|t| state.linked_to(clip).into_iter().filter(|id| t.find_clip(*id).is_some_and(|(_, c)| c.properties.dissolve_in_us > 0)).collect())
+                    .unwrap_or_default();
+                let targets: Vec<(Uuid, i64)> = std::iter::once(clip).chain(linked).map(|id| (id, to)).collect();
+                actions::set_dissolves(&state, &targets, "Transition Duration");
             }
             // Trim mode ripples (later clips follow), or rolls the cut with Shift.
             // Selection mode leaves a gap.
@@ -1039,11 +1198,21 @@ impl TimelineCanvas {
                     self.text(s, "Media offline", x0.max(0.0) + 6.0, body.y() + 4.0, &white, true, x1 - x0.max(0.0) - 10.0);
                 }
                 s.pop();
-                // A cross dissolve is marked by a box reaching back over the previous clip.
-                if clip.properties.dissolve_in_us > 0 && track.has_clip_ending_at(clip.timeline_in) {
-                    let lead = (clip.properties.dissolve_in_us.min(clip.to_timeline_floor_us(clip.source_in)) as f64 / 1_000_000.0 * self.pps()) as f32;
-                    let mark = gsk::RoundedRect::from_rect(rect(x0 - lead, y + 6.0, lead * 2.0, row.h - NAME_BAR_H - 10.0), 3.0);
+                // A cross dissolve is marked by a box over the end of the previous clip,
+                // from where it starts to the cut; a line across it shows the blend.
+                let dissolve = match &dragging {
+                    Some(Drag::Dissolve { clip: id, to, .. }) if *id == clip.id => Some(*to),
+                    _ => Some(clip.properties.dissolve_in_us.min(clip.to_timeline_floor_us(clip.source_in))),
+                };
+                if let Some(length) = dissolve.filter(|d| *d > 0 && track.has_clip_ending_at(clip.timeline_in)) {
+                    let lead = (length as f64 / 1_000_000.0 * self.pps()) as f32;
+                    let area = rect(x0 - lead, y + 6.0, lead, row.h - NAME_BAR_H - 10.0);
+                    let mark = gsk::RoundedRect::from_rect(area, 3.0);
                     s.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.4), mark.bounds());
+                    let blend = gsk::PathBuilder::new();
+                    blend.move_to(area.x(), area.y() + area.height());
+                    blend.line_to(area.x() + area.width(), area.y());
+                    s.append_stroke(&blend.to_path(), &gsk::Stroke::new(1.0), &gdk::RGBA::new(1.0, 1.0, 1.0, 0.6));
                     s.append_border(&mark, &[1.0; 4], &[gdk::RGBA::new(1.0, 1.0, 1.0, 0.6); 4]);
                 }
                 // Fades: a ramp from the corner down to where the fade ends, and handles
@@ -1085,6 +1254,10 @@ impl TimelineCanvas {
                 } else {
                     s.append_border(&rounded, &[1.0; 4], &[gdk::RGBA::new(0.0, 0.0, 0.0, 0.3); 4]);
                 }
+            }
+            // The edit point a transition dragged over the timeline would go on.
+            if let Some((_, at)) = imp.drop_at.get().filter(|(track, _)| *track == row.track_id) {
+                s.append_color(&accent, &rect(self.x_of(at) as f32 - 2.0, row.y + 1.0, 4.0, row.h - 3.0));
             }
             if let Some(gap) = state.gap.get().filter(|g| g.track == row.track_id) {
                 let (g0, g1) = ((self.x_of(gap.start) as f32).max(-8.0), (self.x_of(gap.end) as f32).min(w + 8.0));

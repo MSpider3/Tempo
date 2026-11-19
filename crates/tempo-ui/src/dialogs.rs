@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, MAX_SPEED, MIN_SPEED};
+use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
 
 use crate::actions;
 use crate::keybinds;
@@ -131,6 +131,39 @@ pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker:
         _ => {}
     });
     dialog.present(Some(parent));
+}
+
+/// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
+/// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
+pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let Some(default) = state.with_project(|p| p.next_timeline_name()) else { return };
+    let name = gtk::Entry::builder().text(&default).activates_default(true).build();
+    let tracks = |label| {
+        let spin = gtk::SpinButton::with_range(1.0, 8.0, 1.0);
+        spin.update_property(&[gtk::accessible::Property::Label(label)]);
+        spin
+    };
+    let video = tracks("No. of Video Tracks");
+    let audio = tracks("No. of Audio Tracks");
+    let grid = form_grid();
+    form_row(&grid, 0, "Timeline Name", &name);
+    form_row(&grid, 1, "No. of Video Tracks", &video);
+    form_row(&grid, 2, "No. of Audio Tracks", &audio);
+
+    let dialog = adw::AlertDialog::builder().heading("Create New Timeline").extra_child(&grid).build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+    let state = state.clone();
+    let field = name.clone();
+    dialog.connect_response(Some("create"), move |_, _| {
+        let typed = field.text().trim().to_string();
+        let title = if typed.is_empty() { default.clone() } else { typed };
+        state.add_timeline(Timeline::with_tracks(title, video.value_as_int() as u32, audio.value_as_int() as u32));
+    });
+    dialog.present(Some(parent));
+    name.grab_focus();
 }
 
 /// Resolve's Change Clip Speed (R): a speed in percent, and Ripple Sequence (on by

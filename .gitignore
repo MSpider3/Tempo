@@ -14,3 +14,9 @@ massif.out.*
 .vscode/
 .idea/
 *.swp
+
+# Reference binaries
+/davci resolve 20
+/davci resolve 20/
+/davinci resolve 20
+/davinci resolve 20/

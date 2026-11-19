@@ -6,6 +6,35 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Drag transitions from the Effects panel onto the timeline**, as in DaVinci Resolve.
+  - A Cross Dissolve dropped on a cut joins the two clips.
+  - Dropped on the start or end of a clip with nothing next to it, it fades from or to black.
+  - Fade In, Fade Out and Fade In and Out go on the clip they are dropped on.
+  - While you drag, the edit point it will go on is marked.
+  - Clicking an item still applies it to the selected clip.
+- **Drag the start of a cross dissolve** to make it longer or shorter, in whole frames. Its
+  end stays on the cut (Resolve's "End on Edit").
+
+### Changed
+
+- New transitions are one second long, Resolve's standard transition duration. This was half
+  a second.
+- A cross dissolve into a clip that has no footage before its start no longer refuses. The
+  clip's start is trimmed to make room, and later clips and its linked sound move with it.
+  This is the "trim clips" choice Resolve offers for insufficient handles. `Ctrl+Z` undoes it.
+
+### Fixed
+
+- The cross dissolve box on the timeline reached past the cut into the next clip. It now
+  covers only the part before the cut, where the dissolve plays.
+- The icon column of the Effects panel items stretched across half the row.
+- Fedora 45 (FFmpeg 9):
+  - Export failed for titles containing `%`.
+  - Sound was slightly wrong just after a seek, because AAC and Opus need a short pre-roll.
+  - The export progress bar could step backwards.
+
 ## [0.2.0] - 2026-10-21
 
 Alpha. Built for slower computers first:

@@ -833,7 +833,11 @@ impl MainWindow {
                                     (0, 0) => String::new(),
                                     (i, o) => format!("(fade {:.2}/{:.2})", i as f64 / 1e6, o as f64 / 1e6),
                                 };
-                                format!("{sel}{}{off}{fades}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
+                                let dissolve = match p.dissolve_in_us {
+                                    0 => String::new(),
+                                    d => format!("(dissolve {:.2} from {:.2})", d as f64 / 1e6, c.source_in as f64 / 1e6),
+                                };
+                                format!("{sel}{}{off}{fades}{dissolve}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
                             })
                             .collect();
                         let kind = if row.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" };
@@ -964,6 +968,13 @@ impl MainWindow {
             }
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
             "dissolve" => actions::cross_dissolve(&self.state, num(0).unwrap_or(0.5)),
+            // Drop a transition from the Effects panel at a time on a track, as the mouse would.
+            "droptransition" => {
+                if let Some((x, y)) = num(1).and_then(|s| canvas.point_for(s, parts.get(2).copied().unwrap_or("V1"))) {
+                    let placed = canvas.drop_transition(parts.first().copied().unwrap_or("cross-dissolve"), x, y);
+                    tracing::info!("droptransition {args}: placed={placed}");
+                }
+            }
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
             "panel" => match parts.first().copied() {
                 Some("effects") => self.panel_buttons[1].set_active(true),
@@ -1113,6 +1124,8 @@ impl MainWindow {
                 }
             }
 
+            "win.new-timeline" => dialogs::new_timeline(&self.window, state),
+
             // Markers
             "win.marker-add" => {
                 actions::add_marker(state);
@@ -1196,7 +1209,7 @@ impl MainWindow {
                 state.linked_selection.set(!state.linked_selection.get());
                 state.emit(Change::Options);
             }
-            "win.transition-add" => actions::cross_dissolve(state, 0.5),
+            "win.transition-add" => actions::cross_dissolve(state, actions::STANDARD_TRANSITION_S),
             "win.clip-speed" => dialogs::change_clip_speed(&self.window, state),
             "win.fade-in" => actions::set_fade(state, true, 0.5),
             "win.fade-out" => actions::set_fade(state, false, 0.5),

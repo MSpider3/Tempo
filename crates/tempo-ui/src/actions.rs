@@ -7,7 +7,7 @@ use tempo_timeline::{
     AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
     ClipEffect, EditClipCommand, InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
     PropertyChange, ReplaceClipCommand, SetClipPropertyCommand, SplitClipCommand, TitleData,
-    TitleType, TrackKind, TrimClipCommand, TrimEdge,
+    TitleType, TrackKind, TrimClipCommand, TrimEdge, RippleTrimCommand,
 };
 use uuid::Uuid;
 
@@ -342,40 +342,100 @@ pub fn add_filter(state: &Rc<AppState>, filter: &ClipEffect) {
     }
 }
 
-/// Cross dissolve from the previous clip into each selected clip. The incoming
-/// clip needs footage before its In point to dissolve from.
+/// Resolve's standard transition duration (Preferences, Editing): one second.
+pub const STANDARD_TRANSITION_S: f64 = 1.0;
+
+/// Cross dissolve from the previous clip into each selected clip.
 pub fn cross_dissolve(state: &Rc<AppState>, seconds: f64) {
     let wanted = (seconds.max(0.0) * 1_000_000.0) as i64;
+    let targets: Vec<(Uuid, i64)> = all_selected(state).into_iter().map(|(_, c)| (c.id, wanted)).collect();
+    if targets.is_empty() {
+        if state.selection.get().is_none() {
+            state.message("Select the clip that should dissolve in.");
+        }
+        return;
+    }
+    set_dissolves(state, &targets, "Cross Dissolve");
+}
+
+/// How long a cross dissolve into `clip` can be, given the length of the clip
+/// touching its start, and how much of its start must be trimmed so there is
+/// footage before its In point to dissolve from.
+pub(crate) fn dissolve_room(clip: &Clip, previous_us: i64, wanted_us: i64) -> (i64, i64) {
+    let length = wanted_us.max(0).min(previous_us / 2).min(clip.duration_us() / 2);
+    let head = clip.to_timeline_floor_us(clip.source_in);
+    (length, (length - head).max(0))
+}
+
+/// Give each clip (id, length) a cross dissolve from the clip touching its start,
+/// as one undo step. A clip without enough footage before its In point has its
+/// start trimmed to make room, later clips and its linked sound following:
+/// Resolve's "trim clips" answer to insufficient handles.
+pub fn set_dissolves(state: &Rc<AppState>, targets: &[(Uuid, i64)], name: &str) -> bool {
     let frame = state.frame_us();
     let mut reason: Option<&str> = None;
-    let mut commands: Vec<Box<dyn Command>> = Vec::new();
-    for (track, clip) in all_selected(state) {
-        // Length of the clip this one touches, if any.
-        let previous = state
-            .with_timeline(|t| t.find_track(track).and_then(|tr| tr.clips.iter().find(|c| c.timeline_out == clip.timeline_in).map(|c| c.duration_us())))
+    let mut edits: Vec<Box<dyn Command>> = Vec::new();
+    // Clip, how much to trim off its start, and its link.
+    let mut trims: Vec<(Uuid, i64, Option<Uuid>)> = Vec::new();
+    for (id, wanted) in targets {
+        let found = state
+            .with_timeline(|t| {
+                let (track, clip) = t.find_clip(*id).filter(|(track, _)| !track.locked)?;
+                let previous = track.clips.iter().find(|c| c.timeline_out == clip.timeline_in).map(|c| c.duration_us());
+                Some((clip.clone(), previous))
+            })
             .flatten();
+        let Some((clip, previous)) = found else { continue };
         let Some(previous) = previous else {
-            reason = Some("A cross dissolve needs a clip touching the start of the selected one.");
+            reason = Some("A cross dissolve needs a clip touching the start of this one.");
             continue;
         };
-        let length = if wanted == 0 { 0 } else { wanted.min(clip.to_timeline_floor_us(clip.source_in)).min(previous / 2) };
-        if wanted > 0 && length < frame {
-            reason = Some("This clip starts at the very beginning of its footage, so there is nothing to dissolve from. Trim its start a little first.");
+        let (length, raw_trim) = dissolve_room(&clip, previous, *wanted);
+        if *wanted > 0 && length < frame {
+            reason = Some("These clips are too short for a dissolve.");
             continue;
         }
+        // Whole frames, so the clip's end stays on a frame.
+        let trim = if raw_trim > 0 { clip.timeline_out - state.frame_floor(clip.timeline_out - raw_trim) } else { 0 };
         let mut edited = clip.clone();
         edited.properties.dissolve_in_us = length;
         if edited != clip {
-            commands.push(Box::new(EditClipCommand::new("Cross Dissolve", edited)));
+            edits.push(Box::new(EditClipCommand::new(name, edited)));
+        }
+        if trim > 0 {
+            trims.push((clip.id, trim, clip.properties.link));
         }
     }
-    if !commands.is_empty() {
-        state.execute(Box::new(CompositeCommand::new("Cross Dissolve", commands)));
-    } else if let Some(reason) = reason {
-        state.message(reason);
-    } else if state.selection.get().is_none() {
-        state.message("Select the clip that should dissolve in.");
+    // Linked clips are trimmed by the same amount, so picture and sound stay in step.
+    let partners: Vec<(Uuid, i64, Option<Uuid>)> = state
+        .with_timeline(|t| {
+            let mut out = Vec::new();
+            for (_, amount, link) in trims.iter().filter(|(_, _, link)| link.is_some()) {
+                for c in t.tracks.iter().filter(|tr| !tr.locked).flat_map(|tr| tr.clips.iter()).filter(|c| c.properties.link == *link) {
+                    if !trims.iter().chain(out.iter()).any(|(id, ..)| *id == c.id) {
+                        out.push((c.id, *amount, *link));
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+    trims.extend(partners);
+    if edits.is_empty() && trims.is_empty() {
+        if let Some(reason) = reason {
+            state.message(reason);
+        }
+        return false;
     }
+    let trimmed = !trims.is_empty();
+    // The dissolves are set first, on the clips as they are now; the trims then keep them.
+    let commands: Vec<Box<dyn Command>> =
+        edits.into_iter().chain(trims.into_iter().map(|(id, amount, _)| Box::new(RippleTrimCommand::new(id, TrimEdge::In, amount)) as Box<dyn Command>)).collect();
+    let done = state.execute(Box::new(CompositeCommand::new(name, commands)));
+    if done && trimmed {
+        state.message("There was no footage before the clip's start to dissolve from, so its start was trimmed to make room. Ctrl+Z puts it back.");
+    }
+    done
 }
 
 /// Link or unlink the selected clips (Resolve's Ctrl+Alt+L).
@@ -616,7 +676,7 @@ pub fn trim_to_playhead(state: &Rc<AppState>, edge: TrimEdge, ripple: bool) {
         };
         (pos > clip.timeline_in && pos < clip.timeline_out).then(|| -> Box<dyn Command> {
             if ripple {
-                Box::new(tempo_timeline::RippleTrimCommand::new(clip.id, edge, delta))
+                Box::new(RippleTrimCommand::new(clip.id, edge, delta))
             } else {
                 Box::new(TrimClipCommand::new(clip.id, edge, delta))
             }
@@ -829,7 +889,7 @@ pub fn trim_clip(state: &Rc<AppState>, clip_id: Uuid, edge: TrimEdge, delta_us: 
         .into_iter()
         .map(|id| -> Box<dyn Command> {
             if ripple {
-                Box::new(tempo_timeline::RippleTrimCommand::new(id, edge, delta_us))
+                Box::new(RippleTrimCommand::new(id, edge, delta_us))
             } else {
                 Box::new(TrimClipCommand::new(id, edge, delta_us))
             }
@@ -983,5 +1043,31 @@ pub fn mark_clip(state: &Rc<AppState>) {
         state.mark_in.set(Some(a));
         state.mark_out.set(Some(b));
         state.emit(Change::Options);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(source_in: i64, length: i64) -> Clip {
+        Clip::new(Uuid::new_v4(), Uuid::new_v4(), ClipType::Video, "c", 10_000_000, 10_000_000 + length, source_in, source_in + length)
+    }
+
+    #[test]
+    fn dissolve_uses_handles_and_trims_only_what_is_missing() {
+        // Two seconds of footage before the In point: a one-second dissolve fits.
+        assert_eq!(dissolve_room(&clip(2_000_000, 8_000_000), 8_000_000, 1_000_000), (1_000_000, 0));
+        // A clip placed from the start of its file has none: its start gives up a second.
+        assert_eq!(dissolve_room(&clip(0, 8_000_000), 8_000_000, 1_000_000), (1_000_000, 1_000_000));
+        // Part handles: only the missing part is trimmed.
+        assert_eq!(dissolve_room(&clip(400_000, 8_000_000), 8_000_000, 1_000_000), (1_000_000, 600_000));
+    }
+
+    #[test]
+    fn dissolve_is_at_most_half_of_either_clip() {
+        assert_eq!(dissolve_room(&clip(5_000_000, 8_000_000), 1_200_000, 2_000_000).0, 600_000);
+        assert_eq!(dissolve_room(&clip(5_000_000, 1_000_000), 8_000_000, 2_000_000).0, 500_000);
+        assert_eq!(dissolve_room(&clip(0, 8_000_000), 8_000_000, 0), (0, 0));
     }
 }

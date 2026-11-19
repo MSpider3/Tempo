@@ -2,7 +2,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use crate::error::{ProjectError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 pub struct Migration {
     pub version: u32,
@@ -20,6 +20,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "Clip speed: source and timeline lengths may differ",
         sql: include_str!("migrations/002_clip_speed.sql"),
+    },
+    Migration {
+        version: 3,
+        description: "Several timelines per project",
+        sql: include_str!("migrations/003_timelines.sql"),
     },
 ];
 

@@ -205,6 +205,9 @@ impl MediaPool {
         }
         let import = gio::Menu::new();
         import.append(Some("Import Media…"), Some("pool.import"));
+        let new_timeline = gio::MenuItem::new(Some("Create New Timeline…"), None);
+        new_timeline.set_action_and_target_value(Some("win.do"), Some(&"win.new-timeline".to_variant()));
+        import.append_item(&new_timeline);
         menu.append_section(None, &import);
 
         if let Some(old) = self.menu.take() {

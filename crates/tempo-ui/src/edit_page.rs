@@ -11,7 +11,7 @@ use crate::actions::{self, Place};
 use crate::inspector::Inspector;
 use crate::media_pool::MediaPool;
 use crate::state::{AppState, Change, Tool};
-use crate::timeline::{TimelineArea, MAX_PPS, MIN_PPS};
+use crate::timeline::{TimelineArea, MAX_PPS, MIN_PPS, TRANSITION_PREFIX};
 use crate::util::{divider, label, text_button, text_toggle, tool_button};
 use crate::viewer::Viewer;
 
@@ -220,9 +220,11 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         sub.set_xalign(0.0);
         list.append(&sub);
     };
-    let item = |name: &str, tip: &str, icon: &str, run: Box<dyn Fn(&Rc<AppState>)>| {
+    // `drag`: a transition kind that can also be dragged onto the timeline.
+    let item = |name: &str, tip: &str, icon: &str, drag: Option<&str>, run: Box<dyn Fn(&Rc<AppState>)>| {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let cell = gtk::Box::builder().width_request(56).css_classes(["effect-icon"]).build();
+        // hexpand(false): the centred icon inside must not stretch the cell across the row.
+        let cell = gtk::Box::builder().width_request(56).hexpand(false).css_classes(["effect-icon"]).build();
         let image = gtk::Image::from_icon_name(icon);
         image.set_hexpand(true);
         image.set_halign(gtk::Align::Center);
@@ -235,30 +237,42 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         let button = gtk::Button::builder().child(&content).tooltip_text(tip).css_classes(["effect-row"]).build();
         let s = state.clone();
         button.connect_clicked(move |_| run(&s));
+        if let Some(kind) = drag {
+            let source = gtk::DragSource::builder().actions(gtk::gdk::DragAction::COPY).build();
+            let payload = format!("{TRANSITION_PREFIX}{kind}");
+            source.connect_prepare(move |_, _, _| Some(gtk::gdk::ContentProvider::for_value(&payload.to_value())));
+            // The icon follows the pointer.
+            let icon = cell.clone();
+            source.connect_drag_begin(move |source, _| source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&icon))), 28, 12));
+            button.add_controller(source);
+        }
         list.append(&button);
     };
 
-    heading("Transitions", "Click to apply to the selected clip");
+    let standard = actions::STANDARD_TRANSITION_S;
+    heading("Transitions", "Drag onto a cut or the start or end of a clip, or click to apply to the selected clip");
     item(
         "Cross Dissolve",
-        "Dissolve from the previous clip into the selected clip (Ctrl+T)",
+        "Dissolve from the previous clip into the selected clip (Ctrl+T). On a clip edge with no clip next to it, fades from or to black",
         "media-seek-backward-symbolic",
-        Box::new(|s| actions::cross_dissolve(s, 0.5)),
+        Some("cross-dissolve"),
+        Box::new(move |s| actions::cross_dissolve(s, standard)),
     );
-    item("Fade In", "Fade the selected clip in over half a second", "go-first-symbolic", Box::new(|s| actions::set_fade(s, true, 0.5)));
-    item("Fade Out", "Fade the selected clip out over half a second", "go-last-symbolic", Box::new(|s| actions::set_fade(s, false, 0.5)));
+    item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some("fade-in"), Box::new(move |s| actions::set_fade(s, true, standard)));
+    item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some("fade-out"), Box::new(move |s| actions::set_fade(s, false, standard)));
     item(
         "Fade In and Out",
-        "Fade the selected clip in and out",
+        "Fade the selected clip in and out over one second each",
         "media-playback-start-symbolic",
-        Box::new(|s| {
-            actions::set_fade(s, true, 0.5);
-            actions::set_fade(s, false, 0.5);
+        Some("fade-in-out"),
+        Box::new(move |s| {
+            actions::set_fade(s, true, standard);
+            actions::set_fade(s, false, standard);
         }),
     );
     heading("Titles", "Click to add at the playhead");
-    item("Text", "A title in the middle of the picture", "document-edit-symbolic", Box::new(|s| actions::add_title(s, false)));
-    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", Box::new(|s| actions::add_title(s, true)));
+    item("Text", "A title in the middle of the picture", "document-edit-symbolic", None, Box::new(|s| actions::add_title(s, false)));
+    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", None, Box::new(|s| actions::add_title(s, true)));
 
     heading("Filters", "Click to apply to the selected clip");
     // Filters come from plugins, so this part is rebuilt when plugins change.

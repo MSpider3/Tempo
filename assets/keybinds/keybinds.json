@@ -233,6 +233,16 @@
    "resolve": "controlGotoOut"
   },
   {
+   "group": "File",
+   "action": "win.new-timeline",
+   "keys": [
+    "<Primary>n"
+   ],
+   "alt": [],
+   "label": "New Timeline",
+   "resolve": "fileNewTimeline"
+  },
+  {
    "group": "Markers",
    "action": "win.marker-add",
    "keys": [

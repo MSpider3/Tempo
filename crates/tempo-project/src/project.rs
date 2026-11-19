@@ -7,7 +7,7 @@ use tempfile::NamedTempFile;
 
 use tempo_timeline::types::{
     Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource, MediaType,
-    Project, RationalFps, TitleData, Track, TrackKind, Transition, TransitionAlignment,
+    Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition, TransitionAlignment,
     TransitionEdge, TransitionKind, UiState,
 };
 
@@ -79,6 +79,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
     tx.execute("DELETE FROM clips", [])?;
     tx.execute("DELETE FROM transitions", [])?;
     tx.execute("DELETE FROM markers", [])?;
+    tx.execute("DELETE FROM timelines", [])?;
 
     // 3. Save media sources
     for source in project.sources.values() {
@@ -127,8 +128,14 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         )?;
     }
 
-    // 4. Save tracks, clips, transitions
-    for track in &project.timeline.tracks {
+    // 4. Save every timeline: its tracks, clips, transitions and markers
+    for (timeline, open) in std::iter::once((&project.timeline, true)).chain(project.timelines.iter().map(|t| (t, false))) {
+    let timeline_id = timeline.id.to_string();
+    tx.execute(
+        "INSERT INTO timelines (id, name, is_open) VALUES (?1, ?2, ?3)",
+        params![timeline_id, timeline.name, open as i32],
+    )?;
+    for track in &timeline.tracks {
         let kind_int = match track.kind {
             TrackKind::Video => 0,
             TrackKind::Audio => 1,
@@ -136,8 +143,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
         tx.execute(
             "INSERT INTO tracks (
-                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 track.id.to_string(),
                 kind_int,
@@ -150,6 +157,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 track.height_px,
                 track.color,
                 track.sort_order,
+                timeline_id,
             ],
         )?;
 
@@ -234,8 +242,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         }
     }
 
-    // 5. Save markers
-    for marker in &project.timeline.markers {
+    // Markers
+    for marker in &timeline.markers {
         let color_int = match marker.color {
             MarkerColor::Red => 0,
             MarkerColor::Green => 1,
@@ -247,8 +255,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
         tx.execute(
             "INSERT INTO markers (
-                id, position_us, name, color, duration_us, note
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                id, position_us, name, color, duration_us, note, timeline_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 marker.id.to_string(),
                 marker.position_us,
@@ -256,8 +264,10 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 color_int,
                 marker.duration_us,
                 marker.note,
+                timeline_id,
             ],
         )?;
+    }
     }
 
     tx.commit()?;
@@ -381,7 +391,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     // 3. Load tracks
     let mut tracks = Vec::new();
     let mut track_stmt = conn.prepare(
-        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order
+        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id
          FROM tracks ORDER BY sort_order ASC",
     )?;
 
@@ -403,7 +413,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             _ => TrackKind::Audio,
         };
 
-        Ok(Track {
+        Ok((Track {
             id: Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
             kind,
             kind_index,
@@ -417,11 +427,14 @@ pub fn load_project(path: &Path) -> Result<Project> {
             sort_order,
             clips: Vec::new(),
             transitions: Vec::new(),
-        })
+        }, row.get::<_, Option<String>>(11)?))
     })?;
 
+    let mut track_owner = Vec::new();
     for trk in track_rows {
-        tracks.push(trk?);
+        let (track, owner) = trk?;
+        tracks.push(track);
+        track_owner.push(owner);
     }
 
     // 4. Load clips
@@ -549,7 +562,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     // 6. Load markers
     let mut markers = Vec::new();
     let mut marker_stmt = conn.prepare(
-        "SELECT id, position_us, name, color, duration_us, note
+        "SELECT id, position_us, name, color, duration_us, note, timeline_id
          FROM markers ORDER BY position_us ASC",
     )?;
 
@@ -570,21 +583,23 @@ pub fn load_project(path: &Path) -> Result<Project> {
             _ => MarkerColor::Purple,
         };
 
-        Ok(Marker {
+        Ok((Marker {
             id: Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
             position_us,
             name,
             color,
             duration_us,
             note,
-        })
+        }, row.get::<_, Option<String>>(6)?))
     })?;
 
+    let mut marker_owner = Vec::new();
     for m in marker_rows {
-        markers.push(m?);
+        let (marker, owner) = m?;
+        markers.push(marker);
+        marker_owner.push(owner);
     }
-
-    let timeline = tempo_timeline::types::Timeline { tracks, markers };
+    let (timeline, timelines) = group_timelines(&conn, tracks.into_iter().zip(track_owner), markers.into_iter().zip(marker_owner))?;
 
     Ok(Project {
         id,
@@ -598,9 +613,47 @@ pub fn load_project(path: &Path) -> Result<Project> {
         channels,
         proxy_dir,
         timeline,
+        timelines,
         sources,
         ui_state,
     })
+}
+
+/// Splits loaded tracks and markers into the open timeline and the others, by the
+/// timeline each row names. Rows naming none (files from before 0.3.0) go to the open one.
+fn group_timelines(
+    conn: &rusqlite::Connection,
+    tracks: impl Iterator<Item = (Track, Option<String>)>,
+    markers: impl Iterator<Item = (Marker, Option<String>)>,
+) -> Result<(Timeline, Vec<Timeline>)> {
+    let mut stmt = conn.prepare("SELECT id, name, is_open FROM timelines ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0)))?;
+    let mut all: Vec<(String, Timeline)> = Vec::new();
+    let mut open = 0;
+    for row in rows {
+        let (id, name, is_open) = row?;
+        let uuid = Uuid::parse_str(&id).map_err(|e| ProjectError::InvalidProject(format!("timeline id {id}: {e}")))?;
+        if is_open {
+            open = all.len();
+        }
+        all.push((id, Timeline { id: uuid, name, tracks: Vec::new(), markers: Vec::new() }));
+    }
+    if all.is_empty() {
+        let t = Timeline::new();
+        all.push((t.id.to_string(), t));
+    }
+    let slot = |owner: &Option<String>| owner.as_ref().and_then(|o| all.iter().position(|(id, _)| id == o)).unwrap_or(open);
+    let tracks: Vec<_> = tracks.map(|(t, o)| (slot(&o), t)).collect();
+    let markers: Vec<_> = markers.map(|(m, o)| (slot(&o), m)).collect();
+    for (i, t) in tracks {
+        all[i].1.tracks.push(t);
+    }
+    for (i, m) in markers {
+        all[i].1.markers.push(m);
+    }
+    let mut all: Vec<Timeline> = all.into_iter().map(|(_, t)| t).collect();
+    let timeline = all.remove(open);
+    Ok((timeline, all))
 }
 
 /// Computes the auto-save file path for a project file.
@@ -1003,6 +1056,40 @@ mod tests {
     }
 
     /// A saved one-clip project, then `sql` run on its file without foreign key checks.
+    #[test]
+    fn several_timelines_keep_their_own_clips_and_markers_and_which_is_open() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Two", 1920, 1080, RationalFps::FPS_30);
+        let first = project.timeline.id;
+        let track_id = project.timeline.tracks[0].id;
+        project.timeline.tracks[0].clips.push(Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000));
+        project.timeline.add_marker(Marker::new(0, "Section 15", MarkerColor::Blue));
+        project.add_timeline(Timeline::with_tracks("Section 15.5 Interlude", 1, 1));
+        project.timeline.add_marker(Marker::new(5, "Interlude", MarkerColor::Blue));
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.name, "Section 15.5 Interlude");
+        assert_eq!(loaded.timeline.tracks.len(), 2);
+        assert_eq!(loaded.timeline.markers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Interlude"]);
+        assert!(loaded.timeline.tracks.iter().all(|t| t.clips.is_empty()));
+        assert_eq!(loaded.timelines.len(), 1);
+        let other = &loaded.timelines[0];
+        assert_eq!((other.id, other.name.as_str()), (first, "Timeline 1"));
+        assert_eq!(other.tracks[0].clips.len(), 1);
+        assert_eq!(other.markers[0].name, "Section 15");
+    }
+
+    #[test]
+    fn files_from_before_timelines_load_as_one_timeline() {
+        let (file, clip_id) = tampered("DELETE FROM timelines; UPDATE tracks SET timeline_id = NULL; UPDATE markers SET timeline_id = NULL;");
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.name, "Timeline 1");
+        assert!(loaded.timelines.is_empty());
+        assert_eq!(loaded.timeline.tracks.len(), 4);
+        assert_eq!(loaded.timeline.tracks[0].clips[0].id, clip_id);
+    }
+
     fn tampered(sql: &str) -> (NamedTempFile, Uuid) {
         let file = NamedTempFile::new().unwrap();
         let mut project = Project::new("Tamper", 1920, 1080, RationalFps::FPS_30);

@@ -20,6 +20,10 @@ pub const OUT_CHANNELS: usize = 2;
 
 /// A jump further ahead than this seeks instead of decoding through.
 const SEEK_AHEAD_FRAMES: i64 = OUT_RATE as i64;
+/// Seek this far before the wanted time and decode up to it: the first frame
+/// decoded after a seek lacks the overlap from the frame before it (AAC, Opus),
+/// so it comes out wrong. 100 ms covers AAC's 21 ms and Opus's 80 ms pre-roll.
+const SEEK_PREROLL_US: i64 = 100_000;
 
 pub struct AudioReader {
     ictx: format::context::Input,
@@ -103,7 +107,7 @@ impl AudioReader {
     }
 
     fn seek(&mut self, us: i64) {
-        let ts = (us + self.start_us).max(0);
+        let ts = (us - SEEK_PREROLL_US + self.start_us).max(0);
         let _ = self.ictx.seek(ts, ..ts);
         self.decoder.flush();
         self.fifo.clear();
@@ -136,8 +140,11 @@ impl AudioReader {
         let mut resampled = ffmpeg_next::frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
             if !self.positioned {
-                let pts_us = to_us(decoded.pts().unwrap_or(0), self.time_base) - self.start_us;
-                self.fifo_frame = pts_us * OUT_RATE as i64 / 1_000_000;
+                // Straight from the time base: going through whole microseconds
+                // first can land one frame early (pts 91136/48000 s → 91135).
+                let (num, den) = (self.time_base.numerator() as i128, self.time_base.denominator().max(1) as i128);
+                let start = self.start_us as i128 * OUT_RATE as i128 / 1_000_000;
+                self.fifo_frame = (decoded.pts().unwrap_or(0) as i128 * num * OUT_RATE as i128 / den - start) as i64;
                 self.positioned = true;
             }
             if self.resampler.run(&decoded, &mut resampled).is_err() {
@@ -272,3 +279,4 @@ mod tests {
         assert!(peaks.iter().any(|p| *p > 0));
     }
 }
+

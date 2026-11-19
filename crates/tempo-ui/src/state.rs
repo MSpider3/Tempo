@@ -52,6 +52,8 @@ pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
     log: RefCell<CommandLog>,
+    /// The undo history of each timeline that is not open, so each keeps its own.
+    parked_logs: RefCell<std::collections::HashMap<Uuid, CommandLog>>,
     /// The clip the Inspector shows: the one clicked last.
     pub selection: Cell<Option<Uuid>>,
     /// Other clips selected with it (Ctrl+click, linked partners, Select All).
@@ -105,6 +107,7 @@ impl AppState {
             project: RefCell::new(None),
             path: RefCell::new(None),
             log: RefCell::new(CommandLog::new()),
+            parked_logs: RefCell::new(Default::default()),
             selection: Cell::new(None),
             extra_selection: RefCell::new(Vec::new()),
             tool: Cell::new(Tool::Select),
@@ -217,6 +220,7 @@ impl AppState {
         *self.project.borrow_mut() = project;
         *self.path.borrow_mut() = path;
         self.log.borrow_mut().clear();
+        self.parked_logs.borrow_mut().clear();
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
         self.gap.set(None);
@@ -234,6 +238,46 @@ impl AppState {
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Project);
+    }
+
+    /// Opens timeline `id`, as Resolve's timeline menu above the viewer does.
+    pub fn open_timeline(&self, id: Uuid) {
+        let from = self.with_timeline(|t| t.id);
+        if from != Some(id) && self.project.borrow_mut().as_mut().is_some_and(|p| p.open_timeline(id)) {
+            self.switched_timeline(from);
+        }
+    }
+
+    /// Adds `timeline` to the project and opens it (Create New Timeline).
+    pub fn add_timeline(&self, timeline: Timeline) {
+        let from = self.with_timeline(|t| t.id);
+        if self.project.borrow_mut().as_mut().map(|p| p.add_timeline(timeline)).is_none() {
+            return;
+        }
+        self.switched_timeline(from);
+        self.set_dirty(true);
+    }
+
+    /// After another timeline was opened: swap undo histories and start it from the top.
+    fn switched_timeline(&self, from: Option<Uuid>) {
+        self.player.pause();
+        let to = self.with_timeline(|t| t.id);
+        let log = to.and_then(|id| self.parked_logs.borrow_mut().remove(&id)).unwrap_or_else(CommandLog::new);
+        let old = self.log.replace(log);
+        if let Some(from) = from {
+            self.parked_logs.borrow_mut().insert(from, old);
+        }
+        self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
+        self.gap.set(None);
+        self.mark_in.set(None);
+        self.mark_out.set(None);
+        self.dest_video.set(1);
+        self.dest_audio.set(1);
+        self.sync_player();
+        self.player.seek(0, true);
+        self.emit(Change::Timeline);
+        self.emit(Change::Selection);
     }
 
     /// Hand the playback worker a fresh copy of the timeline.

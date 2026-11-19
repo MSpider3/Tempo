@@ -600,8 +600,17 @@ impl Track {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timeline {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    #[serde(default = "first_timeline_name")]
+    pub name: String,
     pub tracks: Vec<Track>,
     pub markers: Vec<Marker>,
+}
+
+/// The name a project's first timeline gets, as in Resolve.
+pub fn first_timeline_name() -> String {
+    "Timeline 1".to_string()
 }
 
 impl Default for Timeline {
@@ -613,13 +622,25 @@ impl Default for Timeline {
 impl Timeline {
     pub fn new() -> Self {
         Self {
+            id: Uuid::new_v4(),
+            name: first_timeline_name(),
             tracks: Vec::new(),
             markers: Vec::new(),
         }
     }
 
+    /// An empty timeline with `video` and `audio` tracks, as Resolve's Create New Timeline makes.
+    pub fn with_tracks(name: impl Into<String>, video: u32, audio: u32) -> Self {
+        let tracks = (1..=video)
+            .map(|i| Track::new(TrackKind::Video, i, format!("Video {i}"), i - 1))
+            .chain((1..=audio).map(|i| Track::new(TrackKind::Audio, i, format!("Audio {i}"), video + i - 1)));
+        Self { name: name.into(), tracks: tracks.collect(), ..Self::new() }
+    }
+
     pub fn new_default() -> Self {
         Self {
+            id: Uuid::new_v4(),
+            name: first_timeline_name(),
             tracks: vec![
                 Track::new(TrackKind::Video, 1, "Video 1", 0),
                 Track::new(TrackKind::Video, 2, "Video 2", 1),
@@ -836,12 +857,41 @@ pub struct Project {
     pub sample_rate: u32,
     pub channels: u32,
     pub proxy_dir: PathBuf,
+    /// The open timeline: every edit, the viewer and the player work on this one.
     pub timeline: Timeline,
+    /// The project's other timelines, waiting to be opened.
+    #[serde(default)]
+    pub timelines: Vec<Timeline>,
     pub sources: HashMap<Uuid, MediaSource>,
     pub ui_state: UiState,
 }
 
 impl Project {
+    /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.
+    pub fn timeline_list(&self) -> Vec<(Uuid, String)> {
+        let mut list: Vec<_> = std::iter::once(&self.timeline).chain(&self.timelines).map(|t| (t.id, t.name.clone())).collect();
+        list.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        list
+    }
+
+    /// Opens timeline `id`, putting the open one away. False when there is no such timeline.
+    pub fn open_timeline(&mut self, id: Uuid) -> bool {
+        let Some(i) = self.timelines.iter().position(|t| t.id == id) else { return false };
+        std::mem::swap(&mut self.timeline, &mut self.timelines[i]);
+        true
+    }
+
+    /// Adds `timeline` and opens it.
+    pub fn add_timeline(&mut self, timeline: Timeline) {
+        self.timelines.push(std::mem::replace(&mut self.timeline, timeline));
+    }
+
+    /// "Timeline N" with the first N no timeline uses yet.
+    pub fn next_timeline_name(&self) -> String {
+        let names = self.timeline_list();
+        (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n == c)).unwrap_or_default()
+    }
+
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: RationalFps) -> Self {
         let now = 0; // will be populated with unix us timestamp
         Self {
@@ -856,6 +906,7 @@ impl Project {
             channels: 2,
             proxy_dir: PathBuf::from("/tmp/tempo_proxies"),
             timeline: Timeline::new_default(),
+            timelines: Vec::new(),
             sources: HashMap::new(),
             ui_state: UiState::default(),
         }

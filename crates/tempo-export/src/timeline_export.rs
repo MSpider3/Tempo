@@ -137,7 +137,8 @@ fn fade_filters(p: &Piece, r0: i64, audio: bool) -> String {
 }
 
 /// The `drawtext` filter for a title. The text itself goes in a file, which
-/// avoids every quoting problem in the filter graph.
+/// avoids every quoting problem in the filter graph. `expansion=none` prints
+/// the text as written: FFmpeg 9 refuses a title holding a lone `%` otherwise.
 fn title_filter(title: &TitleData, props: &ClipProperties, text_file: &std::path::Path, sx: f32, sy: f32) -> String {
     let [r, g, b, a] = title.color;
     let alpha = a as f32 / 255.0 * props.opacity.clamp(0.0, 1.0);
@@ -153,7 +154,7 @@ fn title_filter(title: &TitleData, props: &ClipProperties, text_file: &std::path
         TitleType::LowerThird => "h*0.8-text_h/2",
     };
     let mut f = format!(
-        "drawtext=textfile='{}':font='{}{style}':fontsize={size:.1}:fontcolor=0x{r:02x}{g:02x}{b:02x}@{alpha:.3}:x=(w-text_w)/2+{:.1}:y={y}+{:.1}",
+        "drawtext=textfile='{}':expansion=none:font='{}{style}':fontsize={size:.1}:fontcolor=0x{r:02x}{g:02x}{b:02x}@{alpha:.3}:x=(w-text_w)/2+{:.1}:y={y}+{:.1}",
         text_file.display(),
         title.font_family.replace(['\'', ':', '\\'], ""),
         props.position_x * sx,
@@ -671,6 +672,8 @@ fn run_one(args: &[String], total: i64, text_files: &[(PathBuf, String)], cancel
     });
 
     let mut cancelled = false;
+    // FFmpeg 9 can report a slightly earlier time than its last line; the bar never goes back.
+    let mut shown = 0.0f32;
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
             if cancel.load(Ordering::Relaxed) {
@@ -679,7 +682,11 @@ fn run_one(args: &[String], total: i64, text_files: &[(PathBuf, String)], cancel
                 break;
             }
             if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
-                progress((us as f32 / total.max(1) as f32).clamp(0.0, 1.0));
+                let f = (us as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+                if f > shown {
+                    shown = f;
+                    progress(f);
+                }
             }
         }
     }
