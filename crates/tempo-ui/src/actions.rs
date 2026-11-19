@@ -1216,19 +1216,19 @@ pub fn goto_marker(state: &Rc<AppState>, forward: bool) {
 
 // ---- Navigation and marks ----------------------------------------------------
 
-/// Up / Down (Resolve's Previous / Next Edit). With an edit point or a transition
-/// selected, the playhead goes to the neighbouring edit on its track and that edit
+/// Up / Down (Resolve's Previous / Next Edit), measured from the playhead. With an edit
+/// point or a transition selected, the playhead goes to the neighbouring edit on its
+/// track and that edit
 /// becomes the selection, so Up, Ctrl+V, Up, Ctrl+V… pastes on every cut. Otherwise
 /// the playhead goes to the next or previous cut on any track.
 pub fn goto_edit(state: &Rc<AppState>, forward: bool) {
+    // The selected edit or transition only says which track to follow; the step is from the playhead.
     let from = match state.edit_selection.get() {
-        Some(EditSelection::Edit { track_id, position_us }) => Some((track_id, position_us)),
-        Some(EditSelection::Transition { track_id, .. }) => {
-            selected_transition(state).and_then(|(_, t)| state.with_timeline(|tl| transition_edit_us(tl.find_track(track_id)?, &t)).flatten()).map(|p| (track_id, p))
-        }
+        Some(EditSelection::Edit { track_id, .. } | EditSelection::Transition { track_id, .. }) => Some(track_id),
         None => None,
     };
-    if let Some((track_id, at)) = from {
+    if let Some(track_id) = from {
+        let at = state.player.position_us();
         let next = state
             .with_timeline(|t| {
                 let points = t.find_track(track_id)?.edit_points().into_iter().map(|e| e.position_us);
