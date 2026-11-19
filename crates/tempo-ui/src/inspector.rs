@@ -740,7 +740,7 @@ fn add_key(keys: &[[f32; 2]], u: f32, v: f32) -> Option<Vec<[f32; 2]>> {
 /// The curve editor under the Transition Curve row. Edits are one undo step each
 /// (a drag commits on release); the panel is rebuilt afterwards.
 fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk::DrawingArea {
-    let area = gtk::DrawingArea::builder().content_height(GRAPH_HEIGHT).hexpand(true).focusable(true).can_focus(true).build();
+    let area = gtk::DrawingArea::builder().content_height(GRAPH_HEIGHT).hexpand(true).focusable(true).can_focus(true).css_classes([crate::keybinds::OWNS_DELETE_KEYS]).build();
     area.set_tooltip_text(Some("Drag a key to move it. Double-click to add one. Right-click or Delete removes the selected key."));
     area.update_property(&[gtk::accessible::Property::Label("Transition curve graph")]);
     let shape = Rc::new(RefCell::new(t.clone()));
