@@ -119,6 +119,10 @@ fn effect_filters(props: &ClipProperties, sy: f32) -> String {
     out
 }
 
+/// `volume` is evaluated once per audio frame; 64-sample frames make a ramp rise in steps of
+/// about a millisecond, which cannot be heard.
+const SMOOTH_GAIN: &str = ",asetnsamples=n=64:p=0";
+
 /// Sound fade of a piece as a per-frame `volume`, measured against the whole clip so an export
 /// range that starts or ends inside a fade still hears the rest of the ramp.
 fn audio_fade_filters(p: &Piece, r0: i64) -> String {
@@ -133,8 +137,8 @@ fn audio_fade_filters(p: &Piece, r0: i64) -> String {
     }
     match terms.len() {
         0 => String::new(),
-        1 => format!(",volume='{}':eval=frame", terms[0]),
-        _ => format!(",volume='min({},{})':eval=frame", terms[0], terms[1]),
+        1 => format!("{SMOOTH_GAIN},volume='{}':eval=frame", terms[0]),
+        _ => format!("{SMOOTH_GAIN},volume='min({},{})':eval=frame", terms[0], terms[1]),
     }
 }
 
@@ -165,7 +169,7 @@ fn ramp_filters(p: &Piece, r0: i64, ramps: &std::collections::HashMap<uuid::Uuid
         let x = format!("clip((t+({offset}))/{span},0,1)");
         let x = if r.rising { x } else { format!("(1-{x})") };
         let gain = if r.equal_power { format!("sin(1.5707963*{x})") } else { x };
-        out.push_str(&format!(",volume='{gain}':eval=frame"));
+        out.push_str(&format!("{SMOOTH_GAIN},volume='{gain}':eval=frame"));
     }
     out
 }
@@ -1156,6 +1160,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!((70..180).contains(&start[0]), "{start:?}");
         assert!(mid[1] > 150 && mid[0] < 80, "{mid:?}");
+    }
+
+    /// Dip with Ease In, 1.5-2.5 s around the cut at 2.0 s; the sampled green must follow
+    /// `ColorLayer::opacity_at`, in a full export and in ranges that start or end inside it.
+    #[test]
+    fn eased_dip_follows_opacity_at_whole_and_ranged() {
+        use tempo_timeline::{TransitionEase, TransitionEdge::In, TransitionKind::DipToColor};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("ease");
+        let Some(project) = two_clip_project(&dir, TrackKind::Video, |clip| {
+            let mut t = transition(DipToColor, In)(clip)?;
+            t.color = [0.0, 1.0, 0.0];
+            t.ease = TransitionEase::In;
+            Some(t)
+        }) else {
+            return;
+        };
+        let track = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
+        let layer = track.transition_layers(&project.sources).color.remove(0);
+        // (range start, range end, timeline seconds to sample)
+        for (range, sample) in [(None, 1.75), (Some((0, 1_800_000)), 1.7), (Some((1_800_000, 3_000_000)), 2.1), (Some((1_700_000, 2_300_000)), 1.9)] {
+            let out = dir.join("out.mp4");
+            let settings = TimelineExport { range, ..settings(out.clone()) };
+            export_timeline(&project, &settings, &AtomicBool::new(false), |_| {}).unwrap();
+            let at = sample - range.map_or(0.0, |r| r.0 as f64 / 1e6);
+            let px = pixel_at(&out, at);
+            let expect = layer.opacity_at((sample * 1e6) as i64) * 255.0;
+            assert!((px[1] as f32 - expect).abs() < 30.0, "{range:?} at {sample}: green {} expected {expect}", px[1]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Sanity: the ease really bends the ramp away from a straight line at the quarter point.
+        assert!((layer.opacity_at(1_750_000) - 0.5).abs() > 0.05, "{}", layer.opacity_at(1_750_000));
+    }
+
+    #[test]
+    fn audio_fades_are_smooth_and_survive_a_range_cut() {
+        let Some(path) = sample() else { return };
+        let mut project = project_with_clip(path);
+        for clip in project.timeline.tracks.iter_mut().filter(|t| t.kind == TrackKind::Audio).flat_map(|t| t.clips.iter_mut().take(1)) {
+            clip.properties.fade_in_us = 800_000;
+        }
+        let out = std::env::temp_dir().join("tempo-export-afade.mp4");
+        for range in [None, Some((300_000, 900_000))] {
+            let e = TimelineExport { range, ..settings(out.clone()) };
+            let (args, _, _) = build_ffmpeg_args(&project, &e, None).unwrap();
+            let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+            assert!(graph.contains("asetnsamples=n=64:p=0,volume='clip((t+("), "{range:?}: {graph}");
+        }
     }
 
     #[test]
