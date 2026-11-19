@@ -259,20 +259,17 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         list.append(&g);
     };
     group("Dissolve");
-    item(
-        "Cross Dissolve",
-        "Dissolve from the previous clip into the next. Drag onto a cut or the start or end of a clip; on a clip edge with no clip next to it, fades from or to transparent",
-        "view-dual-symbolic",
-        Some("cross-dissolve"),
-        Box::new(|s| actions::add_transition(s, TransitionKind::CrossDissolve)),
-    );
-    item(
-        "Dip To Color Dissolve",
-        "Dissolve to a colour and then from it into the next clip (pick the colour in the Inspector). Drag onto a cut or the start or end of a clip",
-        "media-record-symbolic",
-        Some("dip-to-color"),
-        Box::new(|s| actions::add_transition(s, TransitionKind::DipToColor)),
-    );
+    for kind in TransitionKind::VIDEO_DISSOLVES {
+        let (tip, icon) = match kind {
+            TransitionKind::AdditiveDissolve => ("Dissolve by adding the two pictures together, so the middle is brighter. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            TransitionKind::BlurDissolve => ("Blur the outgoing clip while dissolving into the next, which sharpens. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            TransitionKind::DipToColor => ("Dissolve to a colour and then from it into the next clip (pick the colour in the Inspector; black or white for a fade to black or white). Drag onto a cut or the start or end of a clip", "media-record-symbolic"),
+            TransitionKind::NonAdditiveDissolve => ("Dissolve keeping the brighter of the two pictures at each point. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            _ => ("Dissolve from the previous clip into the next. Drag onto a cut or the start or end of a clip; on a clip edge with no clip next to it, fades from or to transparent", "view-dual-symbolic"),
+        };
+        let (name, id) = (kind.resolve_name(), kind.effect_id());
+        item(&name, tip, icon, id, Box::new(move |s| actions::add_transition(s, kind.clone())));
+    }
     group("Clip Fades");
     item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some("fade-in"), Box::new(move |s| actions::set_fade(s, true, standard)));
     item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some("fade-out"), Box::new(move |s| actions::set_fade(s, false, standard)));

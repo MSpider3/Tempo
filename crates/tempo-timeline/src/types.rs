@@ -466,6 +466,55 @@ pub enum TransitionKind {
     /// Resolve's "Dip To Color Dissolve": the picture dissolves to `Transition::color`
     /// over the first half and from it over the second.
     DipToColor,
+    /// Resolve's "Additive Dissolve": the two pictures add up, so the middle is brighter.
+    AdditiveDissolve,
+    /// Resolve's "Non-Additive Dissolve": each pixel takes the brighter of the two pictures.
+    NonAdditiveDissolve,
+    /// Resolve's "Blur Dissolve": the outgoing picture blurs as it dissolves into the
+    /// incoming one, which comes in blurred and sharpens.
+    BlurDissolve,
+}
+
+impl TransitionKind {
+    /// Resolve's Effects > Video Transitions > Dissolve, in its order (Smooth Cut, an
+    /// optical-flow effect, is not offered).
+    pub const VIDEO_DISSOLVES: [TransitionKind; 5] = [
+        TransitionKind::AdditiveDissolve,
+        TransitionKind::BlurDissolve,
+        TransitionKind::CrossDissolve,
+        TransitionKind::DipToColor,
+        TransitionKind::NonAdditiveDissolve,
+    ];
+
+    /// The name Resolve shows for this transition (Effects panel, Inspector, timeline box).
+    pub fn resolve_name(&self) -> String {
+        match self {
+            TransitionKind::AdditiveDissolve => "Additive Dissolve".into(),
+            TransitionKind::BlurDissolve => "Blur Dissolve".into(),
+            TransitionKind::CrossDissolve => "Cross Dissolve".into(),
+            TransitionKind::DipToColor => "Dip To Color Dissolve".into(),
+            TransitionKind::NonAdditiveDissolve => "Non-Additive Dissolve".into(),
+            TransitionKind::Crossfade => "Cross Fade".into(),
+            TransitionKind::Plugin(name) => name.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// The id the Effects panel drags for a video dissolve.
+    pub fn effect_id(&self) -> Option<&'static str> {
+        Some(match self {
+            TransitionKind::AdditiveDissolve => "additive-dissolve",
+            TransitionKind::BlurDissolve => "blur-dissolve",
+            TransitionKind::CrossDissolve => "cross-dissolve",
+            TransitionKind::DipToColor => "dip-to-color",
+            TransitionKind::NonAdditiveDissolve => "non-additive-dissolve",
+            _ => return None,
+        })
+    }
+
+    pub fn from_effect_id(id: &str) -> Option<TransitionKind> {
+        Self::VIDEO_DISSOLVES.into_iter().find(|k| k.effect_id() == Some(id))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1876,5 +1925,15 @@ mod tests {
         assert_ne!(ct.id, t.id);
         assert_eq!((ct.clip_id, ct.kind.clone(), ct.duration_us), (cpic.id, TransitionKind::DipToColor, 500_000));
         assert_eq!(p.duplicate_timeline(Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn video_dissolves_have_resolve_names_and_round_trip_their_drag_ids() {
+        let names: Vec<String> = TransitionKind::VIDEO_DISSOLVES.iter().map(TransitionKind::resolve_name).collect();
+        assert_eq!(names, ["Additive Dissolve", "Blur Dissolve", "Cross Dissolve", "Dip To Color Dissolve", "Non-Additive Dissolve"]);
+        for kind in TransitionKind::VIDEO_DISSOLVES {
+            assert_eq!(TransitionKind::from_effect_id(kind.effect_id().unwrap()), Some(kind));
+        }
+        assert_eq!(TransitionKind::from_effect_id("fade-in"), None);
     }
 }

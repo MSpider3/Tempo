@@ -228,6 +228,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 TransitionKind::FadeToWhite => (8, None),
                 TransitionKind::Plugin(pid) => (6, Some(pid.clone())),
                 TransitionKind::DipToColor => (9, None),
+                TransitionKind::AdditiveDissolve => (11, None),
+                TransitionKind::NonAdditiveDissolve => (12, None),
+                TransitionKind::BlurDissolve => (13, None),
             };
 
             let align_int = match trans.alignment {
@@ -583,6 +586,9 @@ pub fn load_project(path: &Path) -> Result<Project> {
             8 => TransitionKind::FadeToWhite,
             9 => TransitionKind::DipToColor,
             10 => TransitionKind::Crossfade,
+            11 => TransitionKind::AdditiveDissolve,
+            12 => TransitionKind::NonAdditiveDissolve,
+            13 => TransitionKind::BlurDissolve,
             _ => TransitionKind::Plugin(plugin_id.clone().unwrap_or_default()),
         };
 
@@ -1349,6 +1355,18 @@ mod tests {
         let ids = (a.id, b.id);
         project.timeline.tracks[0].clips = vec![a, b];
         (project, ids.0, ids.1)
+    }
+
+    #[test]
+    fn every_video_dissolve_kind_survives_save_and_load() {
+        for kind in TransitionKind::VIDEO_DISSOLVES {
+            let file = NamedTempFile::new().unwrap();
+            let (mut project, _, b) = two_clips();
+            project.timeline.tracks[0].transitions = vec![Transition::new(b, TransitionEdge::In, kind.clone(), 520_000, TransitionAlignment::Centered)];
+            save_project(&project, file.path()).unwrap();
+            let loaded = load_project(file.path()).unwrap();
+            assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, kind);
+        }
     }
 
     #[test]

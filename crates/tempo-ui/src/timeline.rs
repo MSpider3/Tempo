@@ -163,13 +163,7 @@ fn thumbnail_size(len: usize) -> Option<(usize, usize)> {
 
 /// The name a transition box shows, as Resolve names them.
 fn transition_name(kind: &TransitionKind) -> String {
-    match kind {
-        TransitionKind::CrossDissolve => "Cross Dissolve".into(),
-        TransitionKind::DipToColor => "Dip To Color Dissolve".into(),
-        TransitionKind::Crossfade => "Cross Fade".into(),
-        TransitionKind::Plugin(name) => name.clone(),
-        other => format!("{other:?}"),
-    }
+    kind.resolve_name()
 }
 
 /// Top and height of the transition boxes in a row: below the fade handles, above the name bar.
@@ -780,10 +774,8 @@ impl TimelineCanvas {
             return Err("That track is locked. Click its lock in the track header to edit it.");
         }
         let kind = match kind {
-            "cross-dissolve" => TransitionKind::CrossDissolve,
-            "dip-to-color" => TransitionKind::DipToColor,
             "fade-in" | "fade-out" | "fade-in-out" => return self.hit(x, y).map(|(row, id, _)| DropPlan::Fade(row, id)).ok_or("Drop a fade on a clip."),
-            _ => return Err("Tempo does not know that transition."),
+            id => TransitionKind::from_effect_id(id).ok_or("Tempo does not know that transition.")?,
         };
         let reach = (3.0 * EDGE_GRAB_PX / self.pps() * 1_000_000.0) as i64;
         let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind, self.state().standard_transition_us(), TransitionAlignment::Centered);

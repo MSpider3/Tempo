@@ -349,11 +349,13 @@ impl Inspector {
         let video = has_video_controls(view.track_kind);
         if video {
             Self::row_label(&grid, 0, "Transition Type");
-            let kinds = gtk::DropDown::from_strings(&["Cross Dissolve", "Dip To Color Dissolve"]);
-            kinds.set_selected(u32::from(t.kind == TransitionKind::DipToColor));
+            let names = TransitionKind::VIDEO_DISSOLVES.map(|k| k.resolve_name());
+            let kinds = gtk::DropDown::from_strings(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            let at = TransitionKind::VIDEO_DISSOLVES.iter().position(|k| *k == t.kind).unwrap_or(2);
+            kinds.set_selected(at as u32);
             let s = state.clone();
             kinds.connect_selected_notify(move |d| {
-                let kind = if d.selected() == 1 { TransitionKind::DipToColor } else { TransitionKind::CrossDissolve };
+                let Some(kind) = TransitionKind::VIDEO_DISSOLVES.get(d.selected() as usize).cloned() else { return };
                 edit_transition(&s, sel, |t| t.kind = kind);
             });
             grid.attach(&kinds, 1, 0, 1, 1);
@@ -688,12 +690,8 @@ fn playhead_fraction(playhead_us: i64, (start, end): (i64, i64)) -> Option<f32> 
     (end > start && (start..=end).contains(&playhead_us)).then(|| (playhead_us - start) as f32 / (end - start) as f32)
 }
 
-fn kind_name(kind: &TransitionKind) -> &'static str {
-    match kind {
-        TransitionKind::DipToColor => "Dip To Color Dissolve",
-        TransitionKind::Crossfade => "Cross Fade",
-        _ => "Cross Dissolve",
-    }
+fn kind_name(kind: &TransitionKind) -> String {
+    kind.resolve_name()
 }
 
 const GRAPH_HEIGHT: i32 = 110;
