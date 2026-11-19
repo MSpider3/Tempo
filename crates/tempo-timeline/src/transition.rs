@@ -48,6 +48,11 @@
 //! Ramps are linear; `Transition::ease` is stored for the renderers to apply. `Cut`
 //! transitions draw nothing. Other old kinds mix like a cross dissolve, except the black
 //! and white ones, which dip (see [`Transition::dip_color`]).
+//!
+//! Additive and Non-Additive Dissolves on a cut blend their `mix` pieces onto the picture
+//! under them ([`PictureBlend`] in `ClipProperties::blend`, see `add_blend_cut`). A Blur
+//! Dissolve mixes like a cross dissolve and puts a [`BlurRamp`] on every picture it shows
+//! (`ClipProperties::blur_ramps`, read with `Clip::transition_blur`).
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -174,6 +179,60 @@ impl Transition {
             _ => None,
         }
     }
+
+    /// How the pictures this transition mixes are drawn over each other.
+    pub fn blend(&self) -> PictureBlend {
+        match self.kind {
+            TransitionKind::AdditiveDissolve => PictureBlend::Screen,
+            TransitionKind::NonAdditiveDissolve => PictureBlend::Lighten,
+            _ => PictureBlend::Normal,
+        }
+    }
+}
+
+/// The strongest Blur Dissolve blur, as a radius in pixels of a 1080-line picture like a
+/// clip's blur filter: both renderers scale it by the frame height, so it looks the same at
+/// any size.
+pub const BLUR_DISSOLVE_PEAK: f32 = 40.0;
+
+/// How a picture is drawn onto the picture under it, weighted by its opacity:
+/// `under + opacity * (mode(under, picture) - under)`, as GTK and FFmpeg both do it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PictureBlend {
+    #[default]
+    Normal,
+    /// Additive Dissolve: `a + b - a*b`.
+    /// shortcut: Screen stands in for a true add (`a + b`), which GTK's renderer has no blend
+    /// mode for; it is as bright where either picture is dark and a little darker where both are
+    /// bright. Switch both renderers to an add together if the viewer gains a shader for it.
+    Screen,
+    /// Non-Additive Dissolve: the brighter of the two, per channel.
+    Lighten,
+}
+
+/// A Blur Dissolve's blur on a clip over a timeline span. The blur follows the transition's
+/// progress (so its Ratio, Ease and Curve), strongest where the progress reaches `peak_at`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlurRamp {
+    pub start_us: i64,
+    pub end_us: i64,
+    /// 0.5 across a cut (the outgoing picture blurs up, the incoming sharpens), 0.0 at a
+    /// head (the clip comes in blurred), 1.0 at a tail.
+    pub peak_at: f32,
+    pub transition: Box<Transition>,
+}
+
+impl Clip {
+    /// The Blur Dissolve blur at a timeline position, as a radius in pixels of a 1080-line
+    /// picture (0.0 outside its blur ramps). The viewer and the exporter both use this.
+    pub fn transition_blur(&self, time_us: i64) -> f32 {
+        let strength = |r: &BlurRamp| {
+            let p = r.transition.progress_at((time_us - r.start_us) as f32 / (r.end_us - r.start_us) as f32);
+            let w = if p <= r.peak_at { if r.peak_at > 0.0 { p / r.peak_at } else { 1.0 } } else { (1.0 - p) / (1.0 - r.peak_at) };
+            BLUR_DISSOLVE_PEAK * w.clamp(0.0, 1.0)
+        };
+        self.properties.blur_ramps.iter().filter(|r| r.end_us > r.start_us && (r.start_us..r.end_us).contains(&time_us)).map(strength).fold(0.0, f32::max)
+    }
 }
 
 /// What kind of edit point a position on a track is.
@@ -284,6 +343,21 @@ fn head_piece(clip: &Clip, len: i64, fade_in_us: i64, fade_out_us: i64) -> Clip 
     piece.source_in = (clip.source_in - clip.to_source_us(len)).max(0);
     piece.source_out = clip.source_in;
     set_fades(piece, fade_in_us, fade_out_us)
+}
+
+/// The clip over `from..to` of the timeline, its footage running on past its In or Out
+/// point into the handles where the span goes beyond the clip.
+fn retimed(clip: &Clip, from: i64, to: i64) -> Clip {
+    let mut piece = clip.clone();
+    piece.source_in = clip.source_offset_at(from).max(0);
+    piece.source_out = clip.source_offset_at(to);
+    piece.timeline_in = from;
+    piece.timeline_out = to;
+    piece
+}
+
+fn add_blur(clips: &mut [Clip], id: Uuid, ramp: BlurRamp) {
+    clips.iter_mut().filter(|c| c.id == id).for_each(|c| c.properties.blur_ramps.push(ramp.clone()));
 }
 
 /// `len` of the clip's footage from after its Out point, placed just after its end.
@@ -428,23 +502,46 @@ impl Track {
         for t in self.transitions.iter().filter(|t| t.enabled && t.kind != TransitionKind::Cut) {
             let dip = t.dip_color();
             // Sound mixes and a clip's own fades stay linear; only video follows the Inspector curve.
-            let shape = (self.kind == crate::types::TrackKind::Video && !t.is_linear()).then(|| Box::new(t.clone()));
+            let video = self.kind == crate::types::TrackKind::Video;
+            let shape = (video && !t.is_linear()).then(|| Box::new(t.clone()));
+            let blurs = video && t.kind == TransitionKind::BlurDissolve;
+            // A Blur Dissolve's ramp, put on every picture it shows over `start..end`.
+            let blur_ramp = |start_us, end_us, peak_at| BlurRamp { start_us, end_us, peak_at, transition: Box::new(t.clone()) };
             match self.shape(t) {
                 Some(Shape::Cut { outgoing, incoming, before, after }) => {
                     let before = before.min(head_room(incoming));
                     let after = after.min(tail_room(outgoing, sources));
-                    add_cut(&mut layers, outgoing, incoming, (before, after), dip, shape);
+                    let first_piece = layers.mix.len();
+                    match t.blend() {
+                        PictureBlend::Normal => add_cut(&mut layers, outgoing, incoming, (before, after), dip, shape),
+                        blend if video => add_blend_cut(&mut layers, outgoing, incoming, (before, after), t, blend),
+                        _ => add_cut(&mut layers, outgoing, incoming, (before, after), dip, shape),
+                    }
+                    if blurs && before + after > 0 {
+                        let ramp = blur_ramp(incoming.timeline_in - before, incoming.timeline_in + after, 0.5);
+                        let ids = [outgoing.id, incoming.id];
+                        let shown = layers.clips.iter_mut().filter(|c| ids.contains(&c.id)).chain(&mut layers.mix[first_piece..]);
+                        shown.for_each(|c| c.properties.blur_ramps.push(ramp.clone()));
+                    }
                 }
+                // shortcut: an Additive or Non-Additive head or tail fades like a Cross Dissolve,
+                // not blended with the tracks under it; give it a blended piece if that is wanted.
                 Some(Shape::Head(clip, len)) if len > 0 => match dip {
                     Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_in, end_us: clip.timeline_in + len, color, fade_in_us: 0, fade_out_us: len, shape }),
                     None => {
                         heads.insert(clip.id, (len, shape));
+                        if blurs {
+                            add_blur(&mut layers.clips, clip.id, blur_ramp(clip.timeline_in, clip.timeline_in + len, 0.0));
+                        }
                     }
                 },
                 Some(Shape::Tail(clip, len)) if len > 0 => match dip {
                     Some(color) => layers.color.push(ColorLayer { start_us: clip.timeline_out - len, end_us: clip.timeline_out, color, fade_in_us: len, fade_out_us: 0, shape }),
                     None => {
                         tails.insert(clip.id, (len, shape));
+                        if blurs {
+                            add_blur(&mut layers.clips, clip.id, blur_ramp(clip.timeline_out - len, clip.timeline_out, 1.0));
+                        }
                     }
                 },
                 _ => {}
@@ -546,6 +643,41 @@ fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, (bef
     // dip's middle may sit on an edge.
     let (fade_in_us, fade_out_us) = if shape.is_some() { (d, d) } else { (mid - start, end - mid) };
     layers.color.push(ColorLayer { start_us: start, end_us: end, color, fade_in_us, fade_out_us, shape });
+}
+
+/// An Additive or Non-Additive Dissolve on a cut. Each picture stays whole over its half
+/// and is blended on at `min(1, 2p)` (`p` the progress) over the other half: up to the
+/// middle A is whole under B coming in, from it B is whole under A going out, so the middle
+/// shows both whole, blended. The clips under the mix swap at the middle, not at the cut.
+fn add_blend_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, (before, after): (i64, i64), t: &Transition, blend: PictureBlend) {
+    let d = before + after;
+    if d <= 0 {
+        return;
+    }
+    let (start, end) = (incoming.timeline_in - before, incoming.timeline_in + after);
+    let mid = start + (t.half_point() as f64 * d as f64) as i64;
+    for c in &mut layers.clips {
+        if c.id == outgoing.id {
+            *c = retimed(c, c.timeline_in, mid);
+        } else if c.id == incoming.id {
+            *c = retimed(c, mid, c.timeline_out);
+        }
+    }
+    // Ratios doubled give `min(1, 2p)`; doubled less one give `max(0, 2p - 1)`, the part of
+    // the fade out done. Both fades span the whole transition, so their ramps are `p`'s.
+    let scaled = |shift: f32| Some(Box::new(Transition { start_ratio: 2.0 * t.start_ratio - shift, end_ratio: 2.0 * t.end_ratio - shift, ..t.clone() }));
+    if mid > start {
+        let mut piece = set_fades(retimed(incoming, start, mid), d, 0);
+        piece.properties.fade_in_shape = scaled(0.0);
+        piece.properties.blend = blend;
+        layers.mix.push(piece);
+    }
+    if end > mid {
+        let mut piece = set_fades(retimed(outgoing, mid, end), 0, d);
+        piece.properties.fade_out_shape = scaled(1.0);
+        piece.properties.blend = blend;
+        layers.mix.push(piece);
+    }
 }
 
 #[cfg(test)]
@@ -1112,5 +1244,102 @@ mod tests {
         let mut t = Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::DipToColor, S, TransitionAlignment::Centered);
         t.curve = vec![[0.2, 0.7], [0.5, 0.2]];
         assert!((t.half_point() - 0.1428).abs() < 0.002);
+    }
+
+    /// The picture at `t` with blend modes: A is 0.4, B 0.6, each drawn over what is under it
+    /// as `under + f * (mode(under, picture) - under)`, over black.
+    fn blended(layers: &TransitionLayers, t: i64) -> f32 {
+        let mut v = 0.0f32;
+        for c in layers.clips.iter().chain(&layers.mix).filter(|c| c.contains_point(t)) {
+            let x = if c.name == "a" { 0.4 } else { 0.6 };
+            let m = match c.properties.blend {
+                PictureBlend::Normal => x,
+                PictureBlend::Screen => v + x - v * x,
+                PictureBlend::Lighten => v.max(x),
+            };
+            v += c.fade_factor(t) * (m - v);
+        }
+        v
+    }
+
+    fn layers_with(kind: TransitionKind, alignment: TransitionAlignment, edit: impl FnOnce(&mut Transition)) -> TransitionLayers {
+        let (mut tl, sources, _, b) = setup();
+        let mut t = Transition::new(b, TransitionEdge::In, kind, S, alignment);
+        edit(&mut t);
+        tl.tracks[0].transitions.push(t);
+        tl.tracks[0].transition_layers(&sources)
+    }
+
+    #[test]
+    fn additive_dissolve_adds_the_pictures_brightest_in_the_middle() {
+        // Arrange: a centred 1 s Additive Dissolve on the cut at 4 s, [3.5 s, 4.5 s].
+        let layers = layers_with(TransitionKind::AdditiveDissolve, TransitionAlignment::Centered, |_| {});
+        // Act
+        let (start, quarter, mid, end) = (blended(&layers, 3_500_000), blended(&layers, 3_750_000), blended(&layers, 4 * S), blended(&layers, 4_500_000));
+        // Assert: A, then B added on at half strength, then both whole (screen 0.4, 0.6), then B.
+        assert!(close(start, 0.4) && close(end, 0.6), "{start} {end}");
+        assert!(close(quarter, 0.4 + 0.5 * 0.6 * 0.6), "{quarter}");
+        assert!(close(mid, 0.76) && mid > 0.5, "{mid}");
+        assert!(layers.mix.iter().all(|c| c.properties.blend == PictureBlend::Screen) && layers.mix.len() == 2);
+        // No jump either side of the middle.
+        assert!((blended(&layers, 4 * S - 40_000) - blended(&layers, 4 * S + 40_000)).abs() < 0.03);
+    }
+
+    #[test]
+    fn non_additive_dissolve_takes_the_brighter_picture_off_centre_too() {
+        // Arrange: ending on the cut, [3 s, 4 s], so the middle (3.5 s) lies inside A.
+        let layers = layers_with(TransitionKind::NonAdditiveDissolve, TransitionAlignment::EndAtCut, |_| {});
+        // Act
+        let (start, mid, late, after) = (blended(&layers, 3 * S), blended(&layers, 3_500_000), blended(&layers, 3_750_000), blended(&layers, 4 * S));
+        // Assert: from the middle on, B is whole under A fading out, so the end meets B.
+        assert!(close(start, 0.4) && close(mid, 0.6) && close(late, 0.6) && close(after, 0.6), "{start} {mid} {late} {after}");
+        let a = layers.clips.iter().find(|c| c.name == "a").unwrap();
+        assert_eq!(a.timeline_out, 3_500_000, "the pictures swap under the mix at its middle");
+        assert!(layers.mix.iter().all(|c| c.properties.blend == PictureBlend::Lighten));
+    }
+
+    #[test]
+    fn blend_dissolves_follow_the_ratio_and_curve() {
+        // Arrange: Start Ratio 50 %: the mix starts at its middle.
+        let ratio = layers_with(TransitionKind::AdditiveDissolve, TransitionAlignment::Centered, |t| t.start_ratio = 0.5);
+        // Eased in: at the middle of the span only a quarter of the mix is done.
+        let eased = layers_with(TransitionKind::NonAdditiveDissolve, TransitionAlignment::Centered, |t| t.ease = TransitionEase::In);
+        // Act / Assert
+        assert!(close(blended(&ratio, 3_500_000), 0.76), "{}", blended(&ratio, 3_500_000));
+        assert!(close(blended(&ratio, 4_500_000 - 1), 0.6));
+        // A whole under B at half strength (2 * 0.25): 0.4 + 0.5 * (max(0.4, 0.6) - 0.4) = 0.5.
+        assert!(close(blended(&eased, 4 * S), 0.5), "{}", blended(&eased, 4 * S));
+    }
+
+    #[test]
+    fn blur_dissolve_blurs_both_pictures_most_at_the_middle() {
+        // Arrange
+        let layers = layers_with(TransitionKind::BlurDissolve, TransitionAlignment::Centered, |_| {});
+        let blur = |t: i64| layers.clips.iter().chain(&layers.mix).filter(|c| c.contains_point(t)).map(|c| c.transition_blur(t)).collect::<Vec<_>>();
+        // Act / Assert: every picture shown carries the same blur, 0 -> peak -> 0.
+        assert_eq!(blur(3_400_000), vec![0.0]);
+        assert_eq!(blur(3_500_000), vec![0.0, 0.0]);
+        assert!(blur(3_750_000).iter().all(|b| close(*b, BLUR_DISSOLVE_PEAK / 2.0)), "{:?}", blur(3_750_000));
+        assert!(blur(4 * S).iter().all(|b| close(*b, BLUR_DISSOLVE_PEAK)), "{:?}", blur(4 * S));
+        assert!(blur(4_500_000 - 1).iter().all(|b| *b < 0.01));
+        // The mix is a cross dissolve's.
+        assert!(close(picture(&layers, 4 * S), 15.0));
+        assert!(layers.mix.iter().all(|c| c.properties.blend == PictureBlend::Normal));
+    }
+
+    #[test]
+    fn blur_dissolve_follows_the_ease_and_blurs_heads_from_the_start() {
+        // Arrange: eased in, the middle of the span is a quarter through the mix.
+        let eased = layers_with(TransitionKind::BlurDissolve, TransitionAlignment::Centered, |t| t.ease = TransitionEase::In);
+        let (mut tl, sources, a, _) = setup();
+        tl.tracks[0].transitions.push(Transition::new(a, TransitionEdge::In, TransitionKind::BlurDissolve, S, TransitionAlignment::Centered));
+        let head = tl.tracks[0].transition_layers(&sources);
+        let a_clip = head.clips.iter().find(|c| c.id == a).unwrap();
+        // Act / Assert
+        let b = eased.mix.iter().find(|c| c.contains_point(4 * S)).unwrap();
+        assert!(close(b.transition_blur(4 * S), BLUR_DISSOLVE_PEAK / 2.0));
+        assert!(close(a_clip.transition_blur(0), BLUR_DISSOLVE_PEAK) && close(a_clip.transition_blur(S / 2), BLUR_DISSOLVE_PEAK / 2.0));
+        assert_eq!(a_clip.transition_blur(S), 0.0);
+        assert!(close(a_clip.fade_factor(S / 2), 0.5), "a head still fades in");
     }
 }

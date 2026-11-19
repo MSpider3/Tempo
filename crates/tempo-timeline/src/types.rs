@@ -117,6 +117,14 @@ pub struct ClipProperties {
     pub fade_in_shape: Option<Box<Transition>>,
     #[serde(skip)]
     pub fade_out_shape: Option<Box<Transition>>,
+    /// Set by `Track::transition_layers` on the pieces of an Additive or Non-Additive
+    /// Dissolve: how the piece is drawn onto the picture under it. Never saved.
+    #[serde(skip)]
+    pub blend: crate::transition::PictureBlend,
+    /// Set by `Track::transition_layers` for Blur Dissolves: where this clip is blurred
+    /// (see `Clip::transition_blur`). Never saved.
+    #[serde(skip)]
+    pub blur_ramps: Vec<crate::transition::BlurRamp>,
     /// Cross dissolve: this clip starts appearing this long *before* its start,
     /// over the end of the clip it touches, using footage from before its In point.
     /// Deprecated: kept so old files still read; loading turns it into a `Transition`
@@ -160,6 +168,8 @@ impl Default for ClipProperties {
             fade_out_us: 0,
             fade_in_shape: None,
             fade_out_shape: None,
+            blend: crate::transition::PictureBlend::Normal,
+            blur_ramps: Vec::new(),
             dissolve_in_us: 0,
             link: None,
             effects: Vec::new(),
