@@ -16,6 +16,17 @@ All notable changes to Tempo are recorded here. The format follows
   - Clicking an item still applies it to the selected clip.
 - **Drag the start of a cross dissolve** to make it longer or shorter, in whole frames. Its
   end stays on the cut (Resolve's "End on Edit").
+- **Several timelines per project.**
+  - `Ctrl+N` opens Create New Timeline, with a name and the number of video and audio tracks.
+  - The Media Pool right-click menu has Create New Timeline too.
+  - The name above the viewer is a menu of the project's timelines, sorted by name. Pick one to
+    open it. The playhead goes to the start.
+  - Each timeline keeps its own clips, markers and undo history.
+  - Project files now use schema 3. Older files open as one timeline named "Timeline 1".
+- **Edit a marker** by double-clicking it in the timeline ruler. The Marker dialog sets its
+  name, colour and note, and removes it, as in Resolve.
+- Export render-queue jobs are named "<project> | <timeline>". Each job renders the timeline
+  that was open when it was queued.
 
 ### Changed
 

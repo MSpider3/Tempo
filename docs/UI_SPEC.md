@@ -223,6 +223,8 @@ GtkBox (vertical)
 - **Dual-viewer mode** (viewer menu, only offered when the window is 1600 px or wider):
   source on the left, timeline on the right, as in Resolve's default.
 - **Viewer menu:** Playback Quality (Full, Half, Quarter), Safe Area, Dual Viewer.
+- **Timeline menu:** the name in the header lists the project's timelines, sorted by name, and
+  ends with Create New Timeline. Picking one opens it, and the playhead goes to the start.
 - **Transport** buttons call the same actions as the keys.
 - **Cheaper decoding while overloaded:** when three of the last six frames took over 1.25 times
   their time, playback skips the deblocking filter and decodes at half height. It returns to
