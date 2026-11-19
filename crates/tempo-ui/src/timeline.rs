@@ -2,6 +2,7 @@
 //! plus a column of real widgets for the track headers.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use glib::subclass::prelude::*;
@@ -10,14 +11,14 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
 use tempo_timeline::{
-    ClipType, EditClipCommand, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
+    AddTrackCommand, Clip, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MarkerColor, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
     Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
 };
 use uuid::Uuid;
 
 use crate::actions::{self, Place};
 use crate::keybinds::HintZone;
-use crate::state::{timecode, AppState, Change, EditSelection, Tool};
+use crate::state::{AppState, Change, EditSelection, Tool};
 use crate::util::{css_color, label};
 use crate::viewer::Viewer;
 
@@ -46,6 +47,23 @@ const SNAP_PX: f64 = 8.0;
 /// Fade handles: how far from a clip's top corner they can be grabbed, and their size.
 const FADE_GRAB_PX: f64 = 7.0;
 const FADE_HANDLE_PX: f32 = 8.0;
+/// How long an edit takes to settle on screen.
+const TWEEN_US: i64 = 120_000;
+
+fn ease_out(p: f64) -> f64 {
+    let q = 1.0 - p.clamp(0.0, 1.0);
+    1.0 - q * q * q
+}
+
+fn lerp_i(from: i64, to: i64, e: f64) -> i64 {
+    from + ((to - from) as f64 * e).round() as i64
+}
+
+/// A clip dragged over the ruler, above the top video track, asks for new tracks.
+fn over_ghost_tracks(y: f64) -> bool {
+    y < RULER_H as f64
+}
+
 /// What a transition dragged from the Effects panel carries, before its kind.
 pub const TRANSITION_PREFIX: &str = "transition:";
 pub const MIN_PPS: f64 = 0.5;
@@ -183,6 +201,20 @@ mod imp {
         pub snap_line: Cell<Option<i64>>,
         /// Where something dragged from the Effects panel would land: track, start, end.
         pub drop_at: Cell<Option<(Uuid, i64, i64)>>,
+        /// A Media Pool clip is over the space above the top video track: whether its
+        /// sound also gets a new audio track.
+        pub ghost: Cell<Option<bool>>,
+        /// Edit animation: 1.0 at rest, else how far the move from the `from` values has run.
+        pub tween_e: Cell<f64>,
+        pub tween_t0: Cell<i64>,
+        pub tween_on: Cell<bool>,
+        pub tween_from: RefCell<HashMap<Uuid, (i64, i64)>>,
+        /// Where every clip is in the model, as of the last change.
+        pub tween_to: RefCell<HashMap<Uuid, (i64, i64)>>,
+        pub ph_from: Cell<i64>,
+        pub scroll_from: Cell<f64>,
+        /// Edits before this time (monotonic us) are the end of a drag, already on screen.
+        pub no_tween_until: Cell<i64>,
         pub hadj: gtk::Adjustment,
         pub zoom_listener: RefCell<Option<Box<dyn Fn(f64)>>>,
         /// Zoom-to-fit was asked for before the widget had a size.
@@ -214,6 +246,15 @@ mod imp {
                 pointer_x: Cell::new(0.0),
                 hover: Cell::new(None),
                 drop_at: Cell::new(None),
+                ghost: Cell::new(None),
+                tween_e: Cell::new(1.0),
+                tween_t0: Cell::new(0),
+                tween_on: Cell::new(false),
+                tween_from: RefCell::new(HashMap::new()),
+                tween_to: RefCell::new(HashMap::new()),
+                ph_from: Cell::new(0),
+                scroll_from: Cell::new(0.0),
+                no_tween_until: Cell::new(0),
                 snap_line: Cell::new(None),
                 hadj: gtk::Adjustment::new(0.0, 0.0, 1.0, 40.0, 200.0, 1.0),
                 zoom_listener: RefCell::new(None),
@@ -285,15 +326,12 @@ impl TimelineCanvas {
                 match change {
                     Change::Project => {
                         c.imp().scroll.set(0.0);
+                        c.imp().tween_e.set(1.0);
+                        *c.imp().tween_to.borrow_mut() = c.clip_spans();
                         c.update_adjustment();
                         c.redraw();
                     }
-                    Change::Timeline => {
-                        // An edit may have moved the playhead (after an insert, say).
-                        c.imp().playhead.set(c.state().playhead_us());
-                        c.update_adjustment();
-                        c.redraw();
-                    }
+                    Change::Timeline => c.on_timeline_changed(),
                     Change::Selection | Change::Options | Change::Waveform => c.redraw(),
                     _ => {}
                 }
@@ -313,6 +351,7 @@ impl TimelineCanvas {
             if let Some(c) = c.upgrade() {
                 if (c.imp().scroll.get() - adj.value()).abs() > 0.5 {
                     c.imp().scroll.set(adj.value());
+                    c.imp().scroll_from.set(adj.value());
                     c.redraw();
                 }
             }
@@ -333,12 +372,99 @@ impl TimelineCanvas {
         self.imp().pps.get()
     }
 
+    /// The scroll as drawn: it eases to a new value after an edit moved it.
+    fn shown_scroll(&self) -> f64 {
+        let imp = self.imp();
+        let e = imp.tween_e.get();
+        if e >= 1.0 { imp.scroll.get() } else { imp.scroll_from.get() + (imp.scroll.get() - imp.scroll_from.get()) * e }
+    }
+
+    fn shown_playhead(&self) -> i64 {
+        let imp = self.imp();
+        lerp_i(imp.ph_from.get(), imp.playhead.get(), imp.tween_e.get())
+    }
+
     fn x_of(&self, us: i64) -> f64 {
-        us as f64 / 1_000_000.0 * self.pps() - self.imp().scroll.get()
+        us as f64 / 1_000_000.0 * self.pps() - self.shown_scroll()
     }
 
     fn us_at(&self, x: f64) -> i64 {
-        (((x + self.imp().scroll.get()) / self.pps()) * 1_000_000.0).max(0.0) as i64
+        (((x + self.shown_scroll()) / self.pps()) * 1_000_000.0).max(0.0) as i64
+    }
+
+    fn clip_spans(&self) -> HashMap<Uuid, (i64, i64)> {
+        let spans = |t: &Timeline| t.tracks.iter().flat_map(|tr| tr.clips.iter().map(|c| (c.id, (c.timeline_in, c.timeline_out)))).collect();
+        self.state().with_timeline(spans).unwrap_or_default()
+    }
+
+    /// A clip's span as drawn: moving from where it was shown to where the model has it.
+    fn tweened(&self, id: Uuid, tin: i64, tout: i64) -> (i64, i64) {
+        let e = self.imp().tween_e.get();
+        match self.imp().tween_from.borrow().get(&id) {
+            Some(&(a, b)) if e < 1.0 => (lerp_i(a, tin, e), lerp_i(b, tout, e)),
+            _ => (tin, tout),
+        }
+    }
+
+    /// The timeline changed: ease clips, playhead and scroll from what was on screen to
+    /// the new place, unless the user dragged it there or it is playing (drawing only).
+    fn on_timeline_changed(&self) {
+        let imp = self.imp();
+        let state = self.state();
+        let e = imp.tween_e.get();
+        let (shown_scroll, shown_playhead) = (self.shown_scroll(), self.shown_playhead());
+        let new = self.clip_spans();
+        let still = imp.drag.borrow().is_some() || state.player.is_playing() || glib::monotonic_time() < imp.no_tween_until.get();
+        let mut from = HashMap::new();
+        if !still {
+            let (old, was) = (imp.tween_to.borrow(), imp.tween_from.borrow());
+            for (id, now) in &new {
+                let Some(&before) = old.get(id) else { continue };
+                let (a, b) = was.get(id).map_or(before, |&(a, b)| (lerp_i(a, before.0, e), lerp_i(b, before.1, e)));
+                if (a, b) != *now {
+                    from.insert(*id, (a, b));
+                }
+            }
+        }
+        // An edit may have moved the playhead (after an insert, say).
+        imp.playhead.set(state.playhead_us());
+        self.update_adjustment();
+        let moved = !from.is_empty() || (!still && (shown_playhead != imp.playhead.get() || (shown_scroll - imp.scroll.get()).abs() > 0.5));
+        *imp.tween_to.borrow_mut() = new;
+        *imp.tween_from.borrow_mut() = from;
+        imp.ph_from.set(shown_playhead);
+        imp.scroll_from.set(shown_scroll);
+        if moved {
+            self.start_tween();
+        } else {
+            imp.tween_e.set(1.0);
+        }
+        self.redraw();
+    }
+
+    fn start_tween(&self) {
+        let imp = self.imp();
+        imp.tween_e.set(0.0);
+        imp.tween_t0.set(0);
+        if imp.tween_on.replace(true) {
+            return;
+        }
+        self.add_tick_callback(|canvas, clock| {
+            let imp = canvas.imp();
+            let now = clock.frame_time();
+            if imp.tween_t0.get() == 0 {
+                imp.tween_t0.set(now);
+            }
+            let p = (now - imp.tween_t0.get()) as f64 / TWEEN_US as f64;
+            imp.tween_e.set(ease_out(p));
+            canvas.redraw();
+            if p >= 1.0 {
+                imp.tween_on.set(false);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
     }
 
     fn content_width(&self) -> f64 {
@@ -428,6 +554,7 @@ impl TimelineCanvas {
         if self.imp().playhead.replace(us) == us {
             return;
         }
+        self.imp().ph_from.set(us);
         // Keep the playhead in view: while playing, and after a key moved it
         // (End, next cut, next marker). Not while the user drags it by hand.
         let scrubbing = matches!(*self.imp().drag.borrow(), Some(Drag::Scrub));
@@ -802,6 +929,13 @@ impl TimelineCanvas {
             let kind = text.as_deref().and_then(|s| s.strip_prefix(TRANSITION_PREFIX));
             // Show where the transition would land; where it cannot go, refuse it
             // (Resolve's no-entry sign, over audio tracks for instance).
+            let ghost = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
+                (None, Some(id)) if over_ghost_tracks(y) => c.ghost_sound(id),
+                _ => None,
+            };
+            if c.imp().ghost.replace(ghost) != ghost {
+                c.redraw();
+            }
             let plan = kind.map(|kind| c.plan_drop(kind, x, y));
             let at = plan.as_ref().and_then(|p| p.as_ref().ok()).and_then(|p| c.drop_span(p));
             if c.imp().drop_at.replace(at) != at {
@@ -815,7 +949,7 @@ impl TimelineCanvas {
         let c = self.downgrade();
         drop.connect_leave(move |_| {
             if let Some(c) = c.upgrade() {
-                if c.imp().drop_at.take().is_some() {
+                if c.imp().drop_at.take().is_some() || c.imp().ghost.take().is_some() {
                     c.redraw();
                 }
             }
@@ -824,17 +958,80 @@ impl TimelineCanvas {
         drop.connect_drop(move |_, value, x, y| {
             let Some(c) = c.upgrade() else { return false };
             c.imp().drop_at.set(None);
+            c.imp().ghost.set(None);
             let Ok(text) = value.get::<String>() else { return false };
             if let Some(kind) = text.strip_prefix(TRANSITION_PREFIX) {
                 return c.drop_transition(kind, x, y);
             }
             let Ok(id) = Uuid::parse_str(&text) else { return false };
             let (at, _) = c.snap(c.us_at(x), &[]);
+            if over_ghost_tracks(y) && c.ghost_sound(id).is_some() {
+                return c.drop_on_new_tracks(id, at);
+            }
             let track = c.row_at(y).map(|r| r.track_id);
             actions::place_source(&c.state(), id, Place::Overwrite, Some(at), track);
             true
         });
         self.add_controller(drop);
+    }
+
+    /// Whether a Media Pool source dropped above the top video track brings sound along:
+    /// `None` when it has no picture, so there is nothing to put on a new video track.
+    fn ghost_sound(&self, id: Uuid) -> Option<bool> {
+        let (kind, sound) = self.state().with_project(|p| p.sources.get(&id).map(|s| (s.media_type, s.audio_channels.is_some()))).flatten()?;
+        (kind != MediaType::Audio).then_some(kind == MediaType::Video && sound)
+    }
+
+    /// Drop a source onto new tracks made for it (Resolve's ghost tracks): one undo step.
+    fn drop_on_new_tracks(&self, id: Uuid, at: i64) -> bool {
+        let state = self.state();
+        let Some(sound) = self.ghost_sound(id) else { return false };
+        let next = |kind: TrackKind| state.with_timeline(|t| t.tracks.iter().filter(|tr| tr.kind == kind).map(|tr| tr.kind_index).max().unwrap_or(0) + 1).unwrap_or(1);
+        let at = state.frame_floor(at);
+        let Some((name, duration, media_type)) = state.with_project(|p| {
+            p.sources.get(&id).map(|s| (s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), s.duration_us.max(1), s.media_type))
+        }).flatten() else { return false };
+        let len = if media_type == MediaType::Image { 5_000_000 } else { duration };
+        let mut commands: Vec<Box<dyn Command>> = Vec::new();
+        let mut clips = Vec::new();
+        for (kind, clip_type) in [(TrackKind::Video, ClipType::Video), (TrackKind::Audio, ClipType::Audio)] {
+            if kind == TrackKind::Audio && !sound {
+                continue;
+            }
+            let (n, clip_type) = (next(kind), if media_type == MediaType::Image { ClipType::Image } else { clip_type });
+            let add = AddTrackCommand::new(Track::new(kind, n, format!("{} {n}", if kind == TrackKind::Video { "Video" } else { "Audio" }), 0));
+            clips.push(Clip::new(add.track_id(), id, clip_type, name.clone(), at, at + len, 0, len));
+            commands.push(Box::new(add));
+        }
+        if clips.len() > 1 {
+            let link = Some(Uuid::new_v4());
+            clips.iter_mut().for_each(|c| c.properties.link = link);
+        }
+        let first = clips[0].id;
+        commands.extend(clips.into_iter().map(|c| Box::new(InsertClipCommand::new(c)) as Box<dyn Command>));
+        let done = state.execute(Box::new(CompositeCommand::new("Add tracks and place clip", commands)));
+        if done {
+            state.select(Some(first));
+        }
+        done
+    }
+
+    /// The temporary track lanes shown while a clip is dragged above the top video track.
+    fn draw_ghost_lanes(&self, s: &gtk::Snapshot, rows: &[Row], sound: bool, w: f32) {
+        let next = |kind: TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
+        let (v, a) = (next(TrackKind::Video), next(TrackKind::Audio));
+        let audio_y = rows.last().map_or(RULER_H, |r| r.y + r.h);
+        let accent = css_color(self, "tempo_accent");
+        let lane = |y: f32, h: f32, text: String| {
+            let area = graphene::Rect::new(0.0, y, w, h);
+            s.append_color(&gdk::RGBA::new(0.1, 0.1, 0.12, 0.92), &area);
+            s.append_border(&gsk::RoundedRect::from_rect(area, 0.0), &[1.0; 4], &[accent; 4]);
+            self.text(s, &text, 8.0, y + h / 2.0 - 8.0, &accent, true, 160.0);
+        };
+        lane(0.0, RULER_H, format!("V{v}  Video {v}"));
+        if sound {
+            lane(audio_y, AUDIO_H, format!("A{a}  Audio {a}"));
+        }
     }
 
     fn on_press(&self, x: f64, y: f64) {
@@ -1026,7 +1223,7 @@ impl TimelineCanvas {
         }
         let state = self.state();
         let tip = (y >= 0.0 && y < RULER_H as f64)
-            .then(|| state.with_timeline(|t| marker_near(&t.markers, x, MARKER_GRAB_PX, |us| self.x_of(us)).map(|m| marker_tip(&timecode(m.position_us, state.fps()), &m.name))).flatten())
+            .then(|| state.with_timeline(|t| marker_near(&t.markers, x, MARKER_GRAB_PX, |us| self.x_of(us)).map(|m| marker_tip(&state.position_tc(m.position_us), &m.name))).flatten())
             .flatten()
             .map(|text| (x, y, text));
         if *imp.tip.borrow() != tip {
@@ -1064,7 +1261,7 @@ impl TimelineCanvas {
                 let (at, hit) = self.snap_skipping((*from + delta_us).max(0), &[], Some(*id));
                 *to = if hit { at } else { state.frame_floor(at) };
                 let name = state.with_timeline(|t| t.markers.iter().find(|m| m.id == *id).map(|m| m.name.clone())).flatten().unwrap_or_default();
-                *imp.tip.borrow_mut() = Some((x, y, marker_tip(&timecode(*to, state.fps()), &name)));
+                *imp.tip.borrow_mut() = Some((x, y, marker_tip(&state.position_tc(*to), &name)));
             }
             Some(Drag::Fade { edge, from, to, .. }) => {
                 // Toward the middle of the clip lengthens the fade.
@@ -1149,6 +1346,7 @@ impl TimelineCanvas {
         imp.snap_line.set(None);
         imp.tip.take();
         let drag = imp.drag.borrow_mut().take();
+        imp.no_tween_until.set(glib::monotonic_time() + 100_000);
         let state = self.state();
         match drag {
             Some(Drag::Marker { id, from, to }) if to != from => {
@@ -1261,7 +1459,6 @@ impl TimelineCanvas {
         let project = state.project.borrow();
         let Some(project) = project.as_ref() else { return };
         let timeline = &project.timeline;
-        let fps = project.fps.to_f64();
         let line = color("tempo_line");
         let soft = color("tempo_line_soft");
         let dim = color("tempo_text_dim");
@@ -1274,16 +1471,17 @@ impl TimelineCanvas {
             .into_iter()
             .find(|s| s * pps >= 120.0)
             .unwrap_or(3600.0);
-        let first = ((imp.scroll.get() / pps) / step).floor() * step;
+        let scroll = self.shown_scroll();
+        let first = ((scroll / pps) / step).floor() * step;
         let mut t = first;
-        while (t * pps - imp.scroll.get()) < w as f64 {
-            let x = (t * pps - imp.scroll.get()) as f32;
+        while (t * pps - scroll) < w as f64 {
+            let x = (t * pps - scroll) as f32;
             s.append_color(&soft, &rect(x, RULER_H - 20.0, 1.0, 20.0));
             for i in 1..5 {
                 let mx = x + (step * pps) as f32 * i as f32 / 5.0;
                 s.append_color(&soft, &rect(mx, RULER_H - 7.0, 1.0, 7.0));
             }
-            self.text(s, &timecode((t * 1_000_000.0) as i64, fps), x + 6.0, 24.0, &dim, false, 110.0);
+            self.text(s, &state.position_tc((t * 1_000_000.0) as i64), x + 6.0, 24.0, &dim, false, 110.0);
             t += step;
         }
         s.append_color(&line, &rect(0.0, RULER_H - 1.0, w, 1.0));
@@ -1335,6 +1533,7 @@ impl TimelineCanvas {
             for clip in &track.clips {
                 // A clip being moved is drawn at its new place below.
                 let (mut tin, mut tout, mut y) = (clip.timeline_in, clip.timeline_out, row.y);
+                (tin, tout) = self.tweened(clip.id, tin, tout);
                 match &dragging {
                     Some(Drag::Move { clip: id, new_in, len, to_track, .. }) if *id == clip.id => {
                         tin = *new_in;
@@ -1473,6 +1672,9 @@ impl TimelineCanvas {
                 s.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.06), &rect(0.0, row.y, w, row.h));
             }
         }
+        if let Some(sound) = imp.ghost.get() {
+            self.draw_ghost_lanes(s, &rows, sound, w);
+        }
         // Divider between video and audio tracks.
         if let Some(first_audio) = rows.iter().find(|r| r.kind == TrackKind::Audio) {
             s.append_color(&soft, &rect(0.0, first_audio.y - DIVIDER_H, w, DIVIDER_H));
@@ -1604,7 +1806,7 @@ impl TimelineCanvas {
         let (w, h) = (self.width() as f32, self.height() as f32);
         let accent = css_color(self, "tempo_accent");
         let rect = |x, y, w, h| graphene::Rect::new(x, y, w, h);
-        let px = self.x_of(self.imp().playhead.get()) as f32;
+        let px = self.x_of(self.shown_playhead()) as f32;
         if px >= -8.0 && px <= w + 8.0 {
             s.append_color(&accent, &rect(px, 0.0, 1.0, h));
             s.append_color(&accent, &rect(px - 6.0, RULER_H - 16.0, 13.0, 10.0));
@@ -1695,7 +1897,7 @@ impl TimelineArea {
 
         // The big timecode is the timeline's, also while a source clip is in the viewer.
         let s = state.clone();
-        viewer.connect_position(move |_| timecode_label.set_text(&timecode(s.playhead_us(), s.fps())));
+        viewer.connect_position(move |_| timecode_label.set_text(&s.position_tc(s.playhead_us())));
 
         let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let stack = gtk::Overlay::builder().child(&canvas).build();
@@ -1763,6 +1965,10 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
             s.emit(Change::Options);
         });
         header.append(&name);
+        if row.kind == TrackKind::Audio {
+            let channels = state.with_timeline(|t| t.find_track(row.track_id).map(|tr| tr.audio_type.label())).flatten().unwrap_or("2.0");
+            header.append(&label(channels, &["tempo-dim"]));
+        }
 
         let lock = gtk::ToggleButton::builder()
             .icon_name(if row.locked { "changes-prevent-symbolic" } else { "changes-allow-symbolic" })
@@ -1871,6 +2077,22 @@ fn audio_meter(state: &Rc<AppState>) -> gtk::DrawingArea {
 mod tests {
     use super::*;
     use tempo_timeline::{Marker, MarkerColor};
+
+    #[test]
+    fn ghost_lanes_only_above_the_top_track() {
+        assert!(over_ghost_tracks(0.0) && over_ghost_tracks(RULER_H as f64 - 1.0));
+        assert!(!over_ghost_tracks(RULER_H as f64 + 1.0));
+    }
+
+    #[test]
+    fn tween_runs_from_old_to_new_and_eases_out() {
+        assert_eq!(lerp_i(100, 200, 0.0), 100);
+        assert_eq!(lerp_i(100, 200, 1.0), 200);
+        assert_eq!(lerp_i(200, 100, 0.5), 150);
+        assert_eq!((ease_out(0.0), ease_out(1.0), ease_out(2.0)), (0.0, 1.0, 1.0));
+        // Fast first, slow last.
+        assert!(ease_out(0.5) > 0.5);
+    }
 
     #[test]
     fn offset_label_shows_sign_and_frames() {
