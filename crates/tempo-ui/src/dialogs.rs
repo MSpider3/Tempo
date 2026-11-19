@@ -276,11 +276,12 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let start = gtk::Entry::builder().text(timecode(default_start_tc_us(fps), fps)).activates_default(true).build();
     let audio_type = gtk::DropDown::from_strings(&["Mono", "Stereo"]);
     audio_type.set_selected(1);
-    let switch = || gtk::Switch::builder().active(true).halign(gtk::Align::Start).valign(gtk::Align::Center).build();
+    // Resolve's options are checkboxes whose label toggles them.
+    let check_button = |text: &str| gtk::CheckButton::builder().label(text).active(true).halign(gtk::Align::Start).build();
     // On: an empty timeline. Off: it starts with the clip picked in the Media Pool.
-    let empty = switch();
+    let empty = check_button("Empty Timeline");
     empty.set_tooltip_text(Some("Turn off to start the timeline with the clip selected in the Media Pool"));
-    let use_project = switch();
+    let use_project = check_button("Use Project Settings");
     let (project_w, project_h, project_fps) = state.with_project(|p| (p.width, p.height, p.fps)).unwrap_or((1920, 1080, RationalFps::FPS_30));
     let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
     width.set_value(project_w as f64);
@@ -301,9 +302,10 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     form_row(&grid, 2, "No. of Video Tracks", &video);
     form_row(&grid, 3, "No. of Audio Tracks", &audio);
     form_row(&grid, 4, "Audio Track Type", &audio_type);
-    form_row(&grid, 5, "Empty Timeline", &empty);
-    form_row(&grid, 6, "Use Project Settings", &use_project);
-    grid.attach(&reveal, 0, 7, 2, 1);
+    grid.attach(&empty, 1, 5, 1, 1);
+    grid.attach(&reveal, 0, 6, 2, 1);
+    // Bottom left, just above the buttons, as in Resolve.
+    grid.attach(&use_project, 0, 7, 2, 1);
 
     let dialog = adw::AlertDialog::builder().heading("Create New Timeline").extra_child(&grid).build();
     dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
