@@ -628,6 +628,19 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_off_transition_plays_as_a_cut() {
+        let (mut tl, sources, _, b) = setup();
+        let mut t = dissolve(b, TransitionEdge::In, S, TransitionAlignment::Centered);
+        tl.tracks[0].transitions.push(t.clone());
+        assert!(!tl.tracks[0].transition_layers(&sources).mix.is_empty(), "the enabled transition must mix");
+        t.enabled = false;
+        tl.tracks[0].transitions = vec![t];
+        let layers = tl.tracks[0].transition_layers(&sources);
+        assert!(layers.mix.is_empty() && layers.color.is_empty());
+        assert_eq!(layers.clips, tl.tracks[0].clips);
+    }
+
+    #[test]
     fn spans_follow_the_alignment_around_a_cut() {
         let (tl, _, _, b) = setup();
         let track = &tl.tracks[0];

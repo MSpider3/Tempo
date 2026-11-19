@@ -1409,6 +1409,9 @@ mod tests {
         assert_eq!((t.start_ratio, t.end_ratio, t.curve.len()), (0.0, 1.0, 0));
         assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (0, None));
         assert!(loaded.timeline.tracks.iter().all(|t| t.audio_type == AudioTrackType::Stereo));
+        // Schema 6 defaults: the timeline follows the project's rate and transitions are on.
+        assert_eq!(loaded.timeline.fps, None);
+        assert!(loaded.timeline.tracks.iter().flat_map(|t| &t.transitions).all(|t| t.enabled));
     }
 
     #[test]

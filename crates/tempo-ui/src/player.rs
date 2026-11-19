@@ -883,6 +883,13 @@ mod tests {
     const FRAME: Duration = Duration::from_millis(33);
 
     #[test]
+    fn snapshot_steps_on_the_timelines_own_rate() {
+        let mut project = Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        project.timeline.fps = Some(RationalFps::FPS_25);
+        assert_eq!(Snapshot::from_project(&project, false).fps, RationalFps::FPS_25);
+    }
+
+    #[test]
     fn overload_enters_after_three_consecutive_slow_frames() {
         let mut o = Overload::default();
         let slow = FRAME * 2;

@@ -825,6 +825,28 @@ mod tests {
     }
 
     #[test]
+    fn frame_helpers_use_the_timelines_own_rate() {
+        let mut project = Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        project.timeline.fps = Some(RationalFps::FPS_25);
+        assert_eq!(to_frame(1_000_000, &project), 25);
+        assert_eq!(frame_time(25, &project), 1_000_000);
+        assert_eq!(whole_frames(520_000, &project), 520_000); // 13 frames at 25 fps, not 16 at 30
+    }
+
+    #[test]
+    fn a_25_fps_timeline_in_a_30_fps_project_exports_at_25() {
+        // build_args only checks that the media file exists, so an empty file will do.
+        let media = std::env::temp_dir().join(format!("tempo-fps-{}.mp4", std::process::id()));
+        std::fs::write(&media, b"").unwrap();
+        let mut project = project_with_clip(media.clone());
+        project.timeline.fps = Some(RationalFps::FPS_25);
+        let (args, _, _) = build_args(&project, &settings(media.with_extension("out.mp4")), None, None).unwrap();
+        let _ = std::fs::remove_file(&media);
+        let graph = args.join(" ");
+        assert!(graph.contains("r=25/1") && !graph.contains("r=30/1"), "{graph}");
+    }
+
+    #[test]
     fn bitrate_fits_the_size_with_headroom() {
         // 10 MB over 60 s: 1266 kb/s in all, less 96 for sound.
         assert_eq!(bitrate_for_size(10_000_000, 60_000_000, 96), Some(1170));

@@ -1169,7 +1169,7 @@ impl Project {
     /// clips are on the timeline. Odd rates snap to the nearest standard one, and frame
     /// sizes to even numbers. A portrait clip gives a vertical project.
     pub fn first_import_offer(&self, source: &MediaSource) -> Option<FormatOffer> {
-        if source.media_type != MediaType::Video || self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        if source.media_type != MediaType::Video || self.has_clips() || self.timeline.fps.is_some() {
             return None;
         }
         let (w, h, fps) = (source.video_width?, source.video_height?, source.video_fps?);
@@ -1191,10 +1191,15 @@ impl Project {
         (offer != FormatOffer { width: self.width, height: self.height, fps: self.fps }).then_some(offer)
     }
 
+    /// Whether any timeline, open or not, has clips placed on the project's frame grid.
+    fn has_clips(&self) -> bool {
+        std::iter::once(&self.timeline).chain(&self.timelines).any(|t| t.tracks.iter().any(|tr| !tr.clips.is_empty()))
+    }
+
     /// Change the project's frame size and rate. Only while the timeline is empty, since
     /// clips are placed on the frame grid.
     pub fn apply_format(&mut self, offer: &FormatOffer) -> crate::Result<()> {
-        if self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        if self.has_clips() {
             return Err(crate::TimelineError::CommandFailed("the frame rate can't change once clips are on the timeline".into()));
         }
         (self.width, self.height, self.fps) = (offer.width, offer.height, offer.fps);
@@ -1283,6 +1288,25 @@ mod tests {
         assert_eq!(p.first_import_offer(&clip), None);
         assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
         assert_eq!((p.width, p.fps), (1920, RationalFps::FPS_30));
+    }
+
+    #[test]
+    fn no_offer_when_another_timeline_has_clips() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let mut other = Timeline::new_default();
+        let track = other.tracks[0].id;
+        other.tracks[0].clips.push(Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 0, 1, 0, 1));
+        p.timelines.push(other);
+        assert_eq!(p.first_import_offer(&video(3840, 2160, RationalFps::FPS_24)), None);
+        assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
+        assert_eq!(p.fps, RationalFps::FPS_30);
+    }
+
+    #[test]
+    fn no_offer_when_the_open_timeline_has_its_own_frame_rate() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        p.timeline.fps = Some(RationalFps::FPS_25);
+        assert_eq!(p.first_import_offer(&video(3840, 2160, RationalFps::FPS_24)), None);
     }
 
     #[test]
