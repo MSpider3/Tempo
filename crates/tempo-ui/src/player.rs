@@ -25,7 +25,11 @@ pub struct Layer {
     pub title: Option<TitleData>,
     /// A full-frame solid colour (RGB 0-1) instead of a picture; opacity is in `props`.
     pub solid: Option<[f32; 3]>,
+    /// `props.opacity` is already multiplied by the fades; `props.blend` says how the layer
+    /// goes onto the ones under it.
     pub props: ClipProperties,
+    /// A Blur Dissolve's blur here, as a radius in pixels of a 1080-line picture.
+    pub blur: f32,
 }
 
 /// One layer of the picture, bottom first.
@@ -666,14 +670,15 @@ impl Worker {
                 Wanted::Clip(clip, offset) => (clip, offset),
                 Wanted::Color(color, opacity) => {
                     let props = ClipProperties { opacity, ..ClipProperties::default() };
-                    layers.push(Layer { frame: None, title: None, solid: Some(color), props });
+                    layers.push(Layer { frame: None, title: None, solid: Some(color), props, blur: 0.0 });
                     continue;
                 }
             };
             let mut props = clip.properties.clone();
             props.opacity *= clip.fade_factor(pos);
+            let blur = clip.transition_blur(pos);
             if clip.clip_type == ClipType::Title {
-                layers.push(Layer { frame: None, title: clip.title_data.clone(), solid: None, props });
+                layers.push(Layer { frame: None, title: clip.title_data.clone(), solid: None, props, blur });
                 continue;
             }
             let Some(path) = snap.sources.get(&clip.source_id) else { continue };
@@ -681,7 +686,7 @@ impl Worker {
             let Some(decoder) = self.decoder_for(clip.source_id, path) else { continue };
             let result = if exact { decoder.decode_video_frame(offset) } else { decoder.decode_keyframe(offset) };
             match result {
-                Ok(frame) => layers.push(Layer { frame: Some(frame), title: None, solid: None, props }),
+                Ok(frame) => layers.push(Layer { frame: Some(frame), title: None, solid: None, props, blur }),
                 Err(e) => tracing::debug!("decode failed for {}: {e}", path.display()),
             }
         }
