@@ -6,9 +6,13 @@ use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
-use tempo_timeline::{Clip, ClipType, Command, EditClipCommand, PropertyChange, SetClipPropertyCommand, TitleType};
+use tempo_timeline::{
+    frame_to_us, us_to_frame, Clip, ClipType, Command, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand, SetTransitionCommand,
+    TitleType, Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind,
+};
+use uuid::Uuid;
 
-use crate::state::{AppState, Change};
+use crate::state::{AppState, Change, EditSelection};
 use crate::util::{label, tool_button};
 
 /// Turns a new field value and the clip as it is now into the command that applies it.
@@ -70,6 +74,11 @@ impl Inspector {
         }
         while let Some(child) = self.body.first_child() {
             self.body.remove(&child);
+        }
+        if let Some(EditSelection::Transition { track_id, clip_id, edge }) = self.state.edit_selection.get() {
+            if self.transition_panel(track_id, clip_id, edge) {
+                return;
+            }
         }
         let Some(clip) = self.state.selected_clip() else {
             self.title.set_text("Inspector");
@@ -288,11 +297,101 @@ impl Inspector {
         let max = clip.duration_us() as f64 / 2e6;
         self.number_row(&grid, 0, "Fade In s", p.fade_in_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_in());
         self.number_row(&grid, 1, "Fade Out s", p.fade_out_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_out());
-        // Shown only once a dissolve exists; it is added from the Effects panel or with Ctrl+T.
-        if p.dissolve_in_us > 0 {
-            let dissolve = edit("Cross Dissolve", |v, c| c.properties.dissolve_in_us = ((v * 1e6) as i64).min(c.to_timeline_floor_us(c.source_in)));
-            self.number_row(&grid, 2, "Dissolve s", p.dissolve_in_us as f64 / 1e6, (0.0, clip.to_timeline_floor_us(clip.source_in) as f64 / 1e6, 0.1, 1), clip, dissolve);
+    }
+
+    /// Resolve's transition panel for the selected transition. Returns false when the
+    /// transition is gone, so the caller shows the clip instead. Every change is one
+    /// `SetTransitionCommand`; the panel is rebuilt from the timeline afterwards.
+    fn transition_panel(&self, track_id: Uuid, clip_id: Uuid, edge: TransitionEdge) -> bool {
+        let Some(view) = TransitionView::read(&self.state, (track_id, clip_id, edge)) else { return false };
+        let t = &view.transition;
+        self.title.set_text(&format!("Transition - {}", kind_name(&t.kind)));
+        let header = gtk::Box::builder().css_classes(["inspector-section"]).build();
+        header.append(&label("Transition", &["tempo-heading"]));
+        self.body.append(&header);
+        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(8).margin_top(10).margin_bottom(12).margin_start(12).margin_end(12).build();
+        self.body.append(&grid);
+        let sel = (track_id, clip_id, edge);
+        let state = &self.state;
+
+        Self::row_label(&grid, 0, "Type");
+        let kinds = gtk::DropDown::from_strings(&["Cross Dissolve", "Dip To Color Dissolve"]);
+        kinds.set_selected(u32::from(t.kind == TransitionKind::DipToColor));
+        let s = state.clone();
+        kinds.connect_selected_notify(move |d| {
+            let kind = if d.selected() == 1 { TransitionKind::DipToColor } else { TransitionKind::CrossDissolve };
+            edit_transition(&s, sel, |t| t.kind = kind);
+        });
+        grid.attach(&kinds, 1, 0, 1, 1);
+
+        Self::row_label(&grid, 1, "Duration");
+        let frames = us_to_frame(t.duration_us, view.fps);
+        let seconds = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(t.duration_us as f64 / 1e6, 0.0, 3600.0, 0.1, 1.0, 0.0)).digits(2).numeric(true).hexpand(true).build();
+        seconds.update_property(&[gtk::accessible::Property::Label("Duration in seconds")]);
+        let frame_spin = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(frames as f64, 1.0, 1_000_000.0, 1.0, 10.0, 0.0)).numeric(true).build();
+        frame_spin.update_property(&[gtk::accessible::Property::Label("Duration in frames")]);
+        let (s, fps) = (state.clone(), view.fps);
+        seconds.connect_value_changed(move |sp| {
+            let frames = seconds_to_frames(sp.value(), fps);
+            edit_transition(&s, sel, |t| t.duration_us = frame_to_us(frames, fps));
+        });
+        let (s, fps) = (state.clone(), view.fps);
+        frame_spin.connect_value_changed(move |sp| {
+            let frames = sp.value() as i64;
+            edit_transition(&s, sel, |t| t.duration_us = frame_to_us(frames, fps));
+        });
+        let durations = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        durations.append(&seconds);
+        durations.append(&label("s", &["tempo-dim"]));
+        durations.append(&frame_spin);
+        durations.append(&label("frames", &["tempo-dim"]));
+        grid.attach(&durations, 1, 1, 1, 1);
+        let longest = label(&format!("Longest {:.2} s ({} frames)", view.max_us as f64 / 1e6, us_to_frame(view.max_us, view.fps)), &["tempo-small", "tempo-dim"]);
+        longest.set_xalign(0.0);
+        grid.attach(&longest, 1, 2, 1, 1);
+
+        Self::row_label(&grid, 3, "Alignment");
+        let aligns = gtk::Box::builder().css_classes(["linked"]).build();
+        let mut group: Option<gtk::ToggleButton> = None;
+        for (name, alignment) in [("Start on Edit", TransitionAlignment::StartAtCut), ("Center on Edit", TransitionAlignment::Centered), ("End on Edit", TransitionAlignment::EndAtCut)] {
+            let button = gtk::ToggleButton::builder().label(name).hexpand(true).sensitive(alignment_enabled(view.edit_kind, alignment)).build();
+            button.set_group(group.as_ref());
+            button.set_active(t.alignment == alignment);
+            let s = state.clone();
+            button.connect_toggled(move |b| {
+                if b.is_active() {
+                    edit_transition(&s, sel, |t| t.alignment = alignment);
+                }
+            });
+            group.get_or_insert_with(|| button.clone());
+            aligns.append(&button);
         }
+        grid.attach(&aligns, 1, 3, 1, 1);
+
+        Self::row_label(&grid, 4, "Ease");
+        let eases = [TransitionEase::None, TransitionEase::In, TransitionEase::Out, TransitionEase::InOut];
+        let ease = gtk::DropDown::from_strings(&["None", "Ease In", "Ease Out", "Ease In & Out"]);
+        ease.set_selected(eases.iter().position(|e| *e == t.ease).unwrap_or(0) as u32);
+        let s = state.clone();
+        ease.connect_selected_notify(move |d| {
+            if let Some(&e) = eases.get(d.selected() as usize) {
+                edit_transition(&s, sel, |t| t.ease = e);
+            }
+        });
+        grid.attach(&ease, 1, 4, 1, 1);
+
+        if t.kind == TransitionKind::DipToColor {
+            Self::row_label(&grid, 5, "Color");
+            let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+            button.set_rgba(&gtk::gdk::RGBA::new(t.color[0], t.color[1], t.color[2], 1.0));
+            let s = state.clone();
+            button.connect_rgba_notify(move |b| {
+                let c = b.rgba();
+                edit_transition(&s, sel, |t| t.color = [c.red(), c.green(), c.blue()]);
+            });
+            grid.attach(&button, 1, 5, 1, 1);
+        }
+        true
     }
 
     fn title_section(&self, clip: &Clip) {
@@ -364,5 +463,102 @@ impl Inspector {
             });
         });
         grid.attach(&place, 1, 2, 1, 1);
+    }
+}
+
+/// The transition being edited and what limits it, read from the project.
+struct TransitionView {
+    transition: Transition,
+    max_us: i64,
+    edit_kind: EditKind,
+    fps: RationalFps,
+}
+
+type TransitionRef = (Uuid, Uuid, TransitionEdge);
+
+impl TransitionView {
+    fn read(state: &AppState, (track_id, clip_id, edge): TransitionRef) -> Option<Self> {
+        state
+            .with_project(|p| {
+                let track = p.timeline.find_track(track_id)?;
+                let transition = track.transition_at_edit(clip_id, edge)?.clone();
+                let clip = track.find_clip(clip_id)?;
+                let edit_kind = if edge == TransitionEdge::Out { EditKind::Tail } else { track.edit_at(clip.timeline_in)?.kind };
+                let max_us = track.max_transition_us(clip_id, edge, transition.alignment, &p.sources, p.fps);
+                Some(Self { transition, max_us, edit_kind, fps: p.fps })
+            })
+            .flatten()
+    }
+}
+
+/// Apply `change` to the transition as one undo step. The length stays whole frames,
+/// at least one, and within what the new alignment allows.
+fn edit_transition(state: &Rc<AppState>, (track_id, clip_id, edge): TransitionRef, change: impl FnOnce(&mut Transition)) {
+    let Some(view) = TransitionView::read(state, (track_id, clip_id, edge)) else { return };
+    let mut edited = view.transition.clone();
+    change(&mut edited);
+    let max_us = state
+        .with_project(|p| p.timeline.find_track(track_id).map_or(0, |t| t.max_transition_us(clip_id, edge, edited.alignment, &p.sources, p.fps)))
+        .unwrap_or(0);
+    if max_us <= 0 {
+        state.message("No room for a transition here");
+        return;
+    }
+    edited.duration_us = clamp_transition_us(edited.duration_us, max_us, view.fps);
+    if edited != view.transition {
+        state.execute(Box::new(SetTransitionCommand::set(track_id, edited)));
+    }
+}
+
+fn kind_name(kind: &TransitionKind) -> &'static str {
+    if *kind == TransitionKind::DipToColor { "Dip To Color Dissolve" } else { "Cross Dissolve" }
+}
+
+fn seconds_to_frames(seconds: f64, fps: RationalFps) -> i64 {
+    (seconds * fps.to_f64()).round() as i64
+}
+
+/// A length in whole frames, from 1 frame up to `max_us`.
+fn clamp_transition_us(duration_us: i64, max_us: i64, fps: RationalFps) -> i64 {
+    let frames = us_to_frame(duration_us, fps).max(1);
+    frame_to_us(frames, fps).min(max_us)
+}
+
+/// A head transition can only start on the edit, a tail one only end on it.
+fn alignment_enabled(kind: EditKind, alignment: TransitionAlignment) -> bool {
+    match kind {
+        EditKind::Cut => true,
+        EditKind::Head => alignment == TransitionAlignment::StartAtCut,
+        EditKind::Tail => alignment == TransitionAlignment::EndAtCut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FPS_30: RationalFps = RationalFps { num: 30, den: 1 };
+
+    #[test]
+    fn seconds_and_frames_are_linked_in_whole_frames() {
+        assert_eq!(seconds_to_frames(1.0, FPS_30), 30);
+        assert_eq!(seconds_to_frames(0.52, FPS_30), 16);
+        assert_eq!(us_to_frame(frame_to_us(16, FPS_30), FPS_30), 16);
+    }
+
+    #[test]
+    fn length_is_clamped_to_one_frame_and_the_maximum() {
+        let max = frame_to_us(45, FPS_30);
+        assert_eq!(clamp_transition_us(0, max, FPS_30), frame_to_us(1, FPS_30));
+        assert_eq!(clamp_transition_us(5_000_000, max, FPS_30), max);
+        assert_eq!(clamp_transition_us(frame_to_us(12, FPS_30), max, FPS_30), frame_to_us(12, FPS_30));
+    }
+
+    #[test]
+    fn head_and_tail_allow_only_their_alignment() {
+        use TransitionAlignment::*;
+        assert!([StartAtCut, Centered, EndAtCut].iter().all(|a| alignment_enabled(EditKind::Cut, *a)));
+        assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Head, a)), [true, false, false]);
+        assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Tail, a)), [false, false, true]);
     }
 }
