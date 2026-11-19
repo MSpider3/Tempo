@@ -256,7 +256,7 @@ impl ExportPage {
                 if b.is_active() {
                     p.format_index.set(i);
                     // Vertical video from a landscape edit: fill the frame, as Shorts and Reels expect.
-                    if f.height > f.width && p.state.with_project(|pr| pr.width > pr.height).unwrap_or(false) {
+                    if f.height > f.width && p.state.with_project(|pr| { let (w, h) = pr.output_size(); w > h }).unwrap_or(false) {
                         p.fit.set_selected(1);
                     }
                     p.refresh_settings();
@@ -381,7 +381,7 @@ impl ExportPage {
         }
         // Start from the shape of the project: a vertical project exports
         // vertical, a 4K one in 4K. Shapes are compared by cross-multiplying.
-        if let Some((w, h)) = self.state.with_project(|p| (p.width as u64, p.height as u64)) {
+        if let Some((w, h)) = self.state.with_project(|p| { let (w, h) = p.output_size(); (w as u64, h as u64) }) {
             let same_shape = |f: &Format| f.width as u64 * h == f.height as u64 * w;
             let best = FORMATS
                 .iter()
@@ -422,7 +422,7 @@ impl ExportPage {
         // Compare shapes by cross-multiplying; no rounding trouble.
         let same_shape = self
             .state
-            .with_project(|p| p.width as u64 * f.height as u64 == p.height as u64 * f.width as u64)
+            .with_project(|p| { let (w, h) = p.output_size(); w as u64 * f.height as u64 == h as u64 * f.width as u64 })
             .unwrap_or(true);
         self.fit_row.set_visible(!same_shape);
     }
@@ -471,7 +471,7 @@ impl ExportPage {
             };
             // Below about 1.5 Mb/s, 720p looks better than a starved 1080p. Portrait stays portrait.
             (width, height) = if kbps < 1500 { (1280, 720) } else { (1920, 1080) };
-            if project.height > project.width {
+            if project.output_size().1 > project.output_size().0 {
                 (width, height) = (height, width);
             }
             (audio_kbps, max_video_kbps) = (SIZE_LIMITED_AUDIO_KBPS, Some(kbps));

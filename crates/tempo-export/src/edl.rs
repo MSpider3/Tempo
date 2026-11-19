@@ -44,8 +44,8 @@ pub fn export_timeline_to_edl(timeline: &Timeline, title: &str, fps: RationalFps
 
         let src_in_tc = us_to_timecode(clip.source_in, fps);
         let src_out_tc = us_to_timecode(clip.source_out, fps);
-        let rec_in_tc = us_to_timecode(clip.timeline_in, fps);
-        let rec_out_tc = us_to_timecode(clip.timeline_out, fps);
+        let rec_in_tc = us_to_timecode(clip.timeline_in + timeline.start_tc_us, fps);
+        let rec_out_tc = us_to_timecode(clip.timeline_out + timeline.start_tc_us, fps);
 
         out.push_str(&format!(
             "{:03}  {:<8} {:<5} {:<8} {} {} {} {}\n",
@@ -142,5 +142,17 @@ mod tests {
         let edl = export_timeline_to_edl(&timeline, "T", RationalFps::FPS_25);
         // CMX 3600: the speed as frames per second (25 x 2), and the source In.
         assert!(edl.contains("M2   AX       050.0                00:00:01:00"), "{edl}");
+    }
+
+    #[test]
+    fn record_timecodes_start_at_the_timeline_start_timecode() {
+        let mut timeline = Timeline::new();
+        timeline.start_tc_us = 3_600_000_000;
+        let track = Track::new(TrackKind::Video, 1, "V1", 0);
+        let id = track.id;
+        timeline.tracks.push(track);
+        timeline.tracks[0].clips.push(Clip::new(id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 1_000_000, 3_000_000));
+        let edl = export_timeline_to_edl(&timeline, "t", RationalFps::FPS_30);
+        assert!(edl.contains("00:00:01:00 00:00:03:00 01:00:00:00 01:00:02:00"), "{edl}");
     }
 }

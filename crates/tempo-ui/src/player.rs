@@ -40,8 +40,9 @@ enum VideoStrip {
 pub struct Snapshot {
     /// Video tracks, bottom first. Each holds its clips sorted by time.
     tracks: Vec<VideoStrip>,
-    /// Audio tracks that are not muted, with their track volume.
-    audio: Vec<(Vec<Clip>, f32)>,
+    /// Audio tracks that are not muted, with their track volume and whether they are Mono
+    /// (played centred).
+    audio: Vec<(Vec<Clip>, f32, bool)>,
     /// Gain ramps of audio transitions, by clip id.
     ramps: HashMap<Uuid, Vec<tempo_export::audio_mix::Ramp>>,
     /// What the picture is decoded from: the proxy when there is one.
@@ -80,7 +81,8 @@ impl Snapshot {
         let mut ramps = HashMap::new();
         for t in audible_tracks(&project.timeline) {
             let built = tempo_export::audio_mix::audio_strips(t, &project.sources);
-            audio.extend(built.strips.into_iter().map(|strip| (strip, t.volume)));
+            let mono = t.audio_type == tempo_timeline::types::AudioTrackType::Mono;
+            audio.extend(built.strips.into_iter().map(|strip| (strip, t.volume, mono)));
             ramps.extend(built.ramps);
         }
         let audio_sources = project.sources.iter().filter(|(_, s)| !s.is_missing).map(|(id, s)| (*id, s.path.clone())).collect();
@@ -121,7 +123,7 @@ impl Snapshot {
         let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
         Self {
             tracks: if has_video { vec![VideoStrip::Clips(vec![clip(ClipType::Video)])] } else { Vec::new() },
-            audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0)] } else { Vec::new() },
+            audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0, false)] } else { Vec::new() },
             ramps: HashMap::new(),
             audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
@@ -793,7 +795,7 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         }
 
         mix.fill(0.0);
-        for (clips, track_volume) in &snapshot.audio {
+        for (clips, track_volume, mono) in &snapshot.audio {
             let Some(clip) = clips.iter().find(|c| c.contains_point(*pos_us)) else { continue };
             if clip.properties.muted || !clip.properties.enabled {
                 continue;
@@ -814,8 +816,9 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
             let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
             for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
-                m[0] += p[0] * left;
-                m[1] += p[1] * right;
+                let (l, r) = if *mono { let c = (p[0] + p[1]) * 0.5; (c, c) } else { (p[0], p[1]) };
+                m[0] += l * left;
+                m[1] += r * right;
             }
         }
         for sample in &mut mix {
