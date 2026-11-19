@@ -345,6 +345,13 @@ pub fn add_filter(state: &Rc<AppState>, filter: &ClipEffect) {
 /// Resolve's standard transition duration (Preferences, Editing): one second.
 pub const STANDARD_TRANSITION_S: f64 = 1.0;
 
+/// Resolve's Add Transition (Ctrl+T, or a click in the Effects panel): put a transition of
+/// `kind` on the selected edit point, or on the selected clips' edges.
+// shortcut: stands in for the transitions-ui worker's version, which replaces it this wave.
+pub fn add_transition(state: &Rc<AppState>, _kind: tempo_timeline::TransitionKind) {
+    cross_dissolve(state, STANDARD_TRANSITION_S);
+}
+
 /// Cross dissolve from the previous clip into each selected clip.
 pub fn cross_dissolve(state: &Rc<AppState>, seconds: f64) {
     let wanted = (seconds.max(0.0) * 1_000_000.0) as i64;
