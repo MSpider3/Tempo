@@ -41,6 +41,8 @@ pub struct MediaPool {
     /// The right-click menu while it is open.
     menu: RefCell<Option<gtk::PopoverMenu>>,
     stack: gtk::Stack,
+    /// The drop hint under the timeline items while the project has no media yet.
+    media_hint: gtk::Label,
     search: gtk::SearchEntry,
     window: glib::WeakRef<gtk::Window>,
 }
@@ -81,7 +83,14 @@ impl MediaPool {
 
         let stack = gtk::Stack::new();
         stack.add_named(&hint, Some("empty"));
-        stack.add_named(&scrolled, Some("grid"));
+        let media_hint = label("Drop video, audio or images here,\nor press Ctrl+I", &["drop-hint"]);
+        media_hint.set_justify(gtk::Justification::Center);
+        media_hint.set_vexpand(true);
+        media_hint.set_valign(gtk::Align::Start);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&scrolled);
+        page.append(&media_hint);
+        stack.add_named(&page, Some("grid"));
         stack.set_vexpand(true);
         root.append(&stack);
 
@@ -92,6 +101,7 @@ impl MediaPool {
             selection: selection.clone(),
             menu: RefCell::new(None),
             stack,
+            media_hint,
             search,
             window: glib::WeakRef::new(),
         });
@@ -496,6 +506,12 @@ impl MediaPool {
             None => self.state.media_selection.set(selected.filter(|id| self.state.with_project(|p| p.sources.contains_key(id)).unwrap_or(false))),
         }
         self.stack.set_visible_child_name(if has_any { "grid" } else { "empty" });
+        // With no media the hint sits right under the timeline items, not at the bottom.
+        let no_media = self.state.with_project(|p| p.sources.is_empty()).unwrap_or(false);
+        self.media_hint.set_visible(no_media);
+        if let Some(list) = self.media_hint.prev_sibling() {
+            list.set_vexpand(!no_media);
+        }
     }
 }
 
