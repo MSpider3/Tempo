@@ -309,6 +309,8 @@ impl AppState {
         }
         self.switched_timeline(from);
         self.set_dirty(true);
+        // The Media Pool lists timelines too.
+        self.emit(Change::Timelines);
     }
 
     /// Renames timeline `id`; false when the name is blank or taken.

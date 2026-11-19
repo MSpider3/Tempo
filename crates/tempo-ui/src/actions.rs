@@ -852,8 +852,9 @@ pub fn split_selected(state: &Rc<AppState>) {
 /// the clips after them move up to close the gap.
 pub fn trim_to_playhead(state: &Rc<AppState>, edge: TrimEdge, ripple: bool) {
     let pos = state.playhead_us();
+    let name = if ripple { "Ripple Trim" } else { "Trim" };
     // Only clips the playhead is inside can be trimmed to it.
-    let done = for_selected(state, if ripple { "Ripple Trim" } else { "Trim" }, |_, clip| {
+    let make = |_: Uuid, clip: &Clip| {
         let delta = match edge {
             TrimEdge::In => pos - clip.timeline_in,
             TrimEdge::Out => pos - clip.timeline_out,
@@ -865,10 +866,28 @@ pub fn trim_to_playhead(state: &Rc<AppState>, edge: TrimEdge, ripple: bool) {
                 Box::new(TrimClipCommand::new(clip.id, edge, delta))
             }
         })
-    });
+    };
+    // As Resolve: with nothing selected, the clips under the playhead are trimmed.
+    let done = if state.selected_ids().is_empty() {
+        let under = state.with_timeline(|t| clips_under(t, pos)).unwrap_or_default();
+        let commands: Vec<Box<dyn Command>> = under.iter().filter_map(|(track, clip)| make(*track, clip)).collect();
+        !commands.is_empty() && state.execute(Box::new(CompositeCommand::new(name, commands)))
+    } else {
+        for_selected(state, name, make)
+    };
     if !done {
-        state.message("Select a clip and put the playhead inside it first.");
+        state.message("Put the playhead inside a clip first.");
     }
+}
+
+/// The clips the playhead is strictly inside, on unlocked tracks, latest first.
+fn clips_under(timeline: &Timeline, pos: i64) -> Vec<(Uuid, Clip)> {
+    timeline
+        .tracks
+        .iter()
+        .filter(|t| !t.locked)
+        .flat_map(|t| t.clips.iter().filter(|c| pos > c.timeline_in && pos < c.timeline_out).map(|c| (t.id, c.clone())))
+        .collect()
 }
 
 /// Make the selected clips fade in up to the playhead, or fade out from it.
@@ -1326,6 +1345,21 @@ mod tests {
         // The kind, colour and ease come from the template; the clip edge from the edit.
         let t = fit_transition(&track, &track.edit_at(4 * S).unwrap(), &standard(S), &sources, FPS).unwrap();
         assert_eq!((t.kind, t.clip_id), (TransitionKind::DipToColor, track.clips[1].id));
+    }
+
+    #[test]
+    fn trim_without_a_selection_takes_the_clips_under_the_playhead_on_unlocked_tracks() {
+        let (track, _) = cut(2 * S);
+        let mut locked = track.clone();
+        locked.id = Uuid::new_v4();
+        locked.locked = true;
+        let mut timeline = Timeline::new();
+        timeline.tracks = vec![track, locked];
+        let under = clips_under(&timeline, 5 * S);
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].1.timeline_in, 4 * S);
+        // On a cut the playhead is inside neither clip.
+        assert!(clips_under(&timeline, 4 * S).is_empty());
     }
 
     #[test]
