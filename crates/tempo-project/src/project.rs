@@ -208,7 +208,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
             let (kind_int, plugin_id) = match &trans.kind {
                 TransitionKind::Cut => (0, None),
-                TransitionKind::CrossDissolve | TransitionKind::Crossfade => (1, None),
+                TransitionKind::CrossDissolve => (1, None),
+                TransitionKind::Crossfade => (10, None),
                 TransitionKind::DipToBlack => (2, None),
                 TransitionKind::DipToWhite => (3, None),
                 TransitionKind::FadeIn | TransitionKind::FadeFromBlack => (4, None),
@@ -540,6 +541,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             7 => TransitionKind::FadeFromWhite,
             8 => TransitionKind::FadeToWhite,
             9 => TransitionKind::DipToColor,
+            10 => TransitionKind::Crossfade,
             _ => TransitionKind::Plugin(plugin_id.clone().unwrap_or_default()),
         };
 
@@ -1309,5 +1311,16 @@ mod tests {
             "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, color) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 9, 500000, 2, 'nope' FROM clips;",
         );
         assert!(load_project(file.path()).is_err());
+    }
+
+    #[test]
+    fn audio_cross_fades_stay_cross_fades() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, _, b) = two_clips();
+        let fade = Transition::new(b, TransitionEdge::In, TransitionKind::Crossfade, 400_000, TransitionAlignment::Centered);
+        project.timeline.tracks[0].transitions = vec![fade];
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, TransitionKind::Crossfade);
     }
 }
