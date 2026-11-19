@@ -1497,6 +1497,12 @@ impl TimelineCanvas {
                 MarkerColor::Orange => "tempo_marker_orange",
                 MarkerColor::Purple => "tempo_marker_purple",
             });
+            // A marker with a length is a bar from its start to its end, as in Resolve.
+            if m.duration_us > 0 {
+                let end = self.x_of(at + m.duration_us) as f32;
+                let bar = gdk::RGBA::new(c.red(), c.green(), c.blue(), 0.45);
+                s.append_color(&bar, &rect(x, 0.0, (end - x).max(1.0), 12.0));
+            }
             // Markers live in the ruler only, so they are not mistaken for the playhead.
             s.append_color(&c, &rect(x - 4.0, 0.0, 9.0, 12.0));
             s.append_color(&c, &rect(x, 12.0, 1.0, RULER_H - 12.0));
