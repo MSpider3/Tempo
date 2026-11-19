@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tempo_timeline::{Clip, ClipProperties, ClipType, MediaType, Project, TitleData, TitleType, TrackKind};
+use tempo_timeline::{Clip, ColorLayer, ClipProperties, ClipType, MediaType, Project, TitleData, TitleType, TrackKind};
 
 use crate::chapters::{ffmetadata, Chapter};
 use crate::error::{ExportError, Result};
@@ -127,13 +127,74 @@ fn fade_filters(p: &Piece, r0: i64, audio: bool) -> String {
     let (name, alpha) = if audio { ("afade", "") } else { ("fade", ":alpha=1") };
     let mut out = String::new();
     if props.fade_in_us > 0 && p.start + r0 == p.clip.timeline_in {
-        out.push_str(&format!(",{name}=t=in:st=0:d={}{alpha}", secs(props.fade_in_us.min(len))));
+        // Longer than the piece is fine for video: a handle piece of a dissolve ends part-way up.
+        let d = if audio { props.fade_in_us.min(len) } else { props.fade_in_us };
+        out.push_str(&format!(",{name}=t=in:st=0:d={}{alpha}", secs(d)));
     }
     if props.fade_out_us > 0 && p.end + r0 == p.clip.timeline_out {
-        let d = props.fade_out_us.min(len);
-        out.push_str(&format!(",{name}=t=out:st={}:d={}{alpha}", secs(len - d), secs(d)));
+        if !audio && props.fade_out_us > len {
+            // A handle piece of a dissolve starts part-way down its ramp. `fade` cannot start
+            // before 0, so pad the front by the missing time, fade, and cut the padding off.
+            let pad = secs(props.fade_out_us - len);
+            out.push_str(&format!(",tpad=start_duration={pad}:start_mode=clone,fade=t=out:st=0:d={}{alpha},trim=start={pad},setpts=PTS-STARTPTS", secs(props.fade_out_us)));
+        } else {
+            let d = props.fade_out_us.min(len);
+            out.push_str(&format!(",{name}=t=out:st={}:d={}{alpha}", secs(len - d), secs(d)));
+        }
     }
     out
+}
+
+/// Gain ramps of audio transitions as `volume` filters evaluated per frame.
+fn ramp_filters(p: &Piece, r0: i64, ramps: &std::collections::HashMap<uuid::Uuid, Vec<crate::audio_mix::Ramp>>) -> String {
+    let mut out = String::new();
+    for r in ramps.get(&p.clip.id).into_iter().flatten() {
+        let (offset, span) = (secs(p.start + r0 - r.start_us), secs((r.end_us - r.start_us).max(1)));
+        let x = format!("clip((t+({offset}))/{span},0,1)");
+        let x = if r.rising { x } else { format!("(1-{x})") };
+        let gain = if r.equal_power { format!("sin(1.5707963*{x})") } else { x };
+        out.push_str(&format!(",volume='{gain}':eval=frame"));
+    }
+    out
+}
+
+/// A full-frame solid colour over `layer`'s span with its opacity ramps, as a strip as long
+/// as the output. Returns its label. (shortcut: ramps are not applied when the export range
+/// cuts into them.)
+fn color_strip(
+    graph: &mut Vec<String>,
+    ti: usize,
+    layer: &ColorLayer,
+    (r0, r1): (i64, i64),
+    (w, h): (u32, u32),
+    fps: &str,
+    project: &Project,
+) -> Option<String> {
+    let (first, end) = (to_frame(layer.start_us.max(r0) - r0, project), to_frame(layer.end_us.min(r1) - r0, project));
+    let frames = end - first;
+    if frames <= 0 {
+        return None;
+    }
+    let len = frame_time(frames, project);
+    let [r, g, b] = layer.color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mut fades = String::new();
+    if layer.fade_in_us > 0 && layer.start_us >= r0 {
+        fades.push_str(&format!(",fade=t=in:st=0:d={}:alpha=1", secs(layer.fade_in_us.min(len))));
+    }
+    if layer.fade_out_us > 0 && layer.end_us <= r1 {
+        let d = layer.fade_out_us.min(len);
+        fades.push_str(&format!(",fade=t=out:st={}:d={}:alpha=1", secs(len - d), secs(d)));
+    }
+    let solid = format!("color=c=0x{r:02x}{g:02x}{b:02x}:s={w}x{h}:r={fps},trim=end_frame={frames},format=rgba{fades}");
+    let out = format!("vt{ti}");
+    if first > 0 {
+        graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps},trim=end_frame={first},format=rgba[vg{ti}]"));
+        graph.push(format!("{solid}[vc{ti}]"));
+        graph.push(format!("[vg{ti}][vc{ti}]concat=n=2:v=1:a=0[{out}]"));
+    } else {
+        graph.push(format!("{solid}[{out}]"));
+    }
+    Some(out)
 }
 
 /// The `drawtext` filter for a title. The text itself goes in a file, which
@@ -243,18 +304,32 @@ fn build_args(
     // ---- Video: one concatenated strip per track, then stacked bottom to top.
     let mut video_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Video && t.enabled).collect();
     video_tracks.sort_by_key(|t| t.kind_index);
-    // A cross dissolve is one more strip right above its track, holding the
-    // lead-ins of the clips that dissolve in.
-    let mut video_strips: Vec<Vec<Clip>> = Vec::new();
+    // Per track: its clips, the handle footage of its dissolves as one more strip, then the
+    // solid colours of its dips (they decode nothing).
+    enum Strip {
+        Clips(Vec<Clip>),
+        Color(ColorLayer),
+    }
+    let mut video_strips: Vec<Strip> = Vec::new();
     for track in &video_tracks {
-        video_strips.push(track.clips.clone());
-        let leads = track.dissolve_leads();
-        if !leads.is_empty() {
-            video_strips.push(leads);
+        let layers = track.transition_layers(&project.sources);
+        video_strips.push(Strip::Clips(layers.clips));
+        if !layers.mix.is_empty() {
+            video_strips.push(Strip::Clips(layers.mix));
         }
+        video_strips.extend(layers.color.into_iter().map(Strip::Color));
     }
     let mut track_labels = Vec::new();
     for (ti, strip) in video_strips.iter().enumerate() {
+        let strip = match strip {
+            Strip::Clips(clips) => clips,
+            Strip::Color(layer) => {
+                if let Some(label) = color_strip(&mut graph, ti, layer, (r0, r1), (w, h), &fps, project) {
+                    track_labels.push(label);
+                }
+                continue;
+            }
+        };
         let parts = pieces(strip, r0, r1, &[ClipType::Video, ClipType::Image, ClipType::Title]);
         if parts.is_empty() {
             continue;
@@ -370,20 +445,13 @@ fn build_args(
     // ---- Audio: one strip per track, then mixed.
     let mut audio_tracks: Vec<_> = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.enabled).collect();
     audio_tracks.sort_by_key(|t| t.kind_index);
-    // For sound, the outgoing clip fades out while the incoming one fades in.
+    // Audio transitions are gain ramps on the clips (see `audio_mix`).
     let mut audio_strips: Vec<(Vec<Clip>, f32)> = Vec::new();
+    let mut ramps = std::collections::HashMap::new();
     for track in &audio_tracks {
-        let leads = track.dissolve_leads();
-        let mut clips = track.clips.clone();
-        for lead in &leads {
-            if let Some(out) = clips.iter_mut().find(|c| c.timeline_out == lead.timeline_out) {
-                out.properties.fade_out_us = out.properties.fade_out_us.max(lead.duration_us());
-            }
-        }
-        audio_strips.push((clips, track.volume));
-        if !leads.is_empty() {
-            audio_strips.push((leads, track.volume));
-        }
+        let built = crate::audio_mix::audio_strips(track, &project.sources);
+        audio_strips.extend(built.strips.into_iter().map(|s| (s, track.volume)));
+        ramps.extend(built.ramps);
     }
     let mut audio_labels = Vec::new();
     for (ti, (strip, track_volume)) in audio_strips.iter().enumerate() {
@@ -413,9 +481,10 @@ fn build_args(
             let label = format!("ac{ti}_{}", segs.len());
             graph.push(format!(
                 "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={},asetpts=PTS-STARTPTS,\
-                 volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}[{label}]",
+                 volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}{}[{label}]",
                 secs(len),
-                fade_filters(p, r0, true)
+                fade_filters(p, r0, true),
+                ramp_filters(p, r0, &ramps)
             ));
             segs.push(label);
             cursor = p.end;
@@ -498,9 +567,16 @@ fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
             [
                 (c.timeline_in, c.timeline_in + p.fade_in_us),
                 (c.timeline_out - p.fade_out_us, c.timeline_out),
-                (c.timeline_in - p.dissolve_in_us, c.timeline_in + p.dissolve_in_us),
             ]
         })
+        .chain(
+            project
+                .timeline
+                .tracks
+                .iter()
+                .filter(|t| t.enabled)
+                .flat_map(|t| t.transitions.iter().filter_map(|tr| t.transition_span(tr))),
+        )
         .filter(|(a, b)| b > a)
         .collect();
     let mut edges: Vec<i64> = clips
@@ -928,31 +1004,170 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    /// A 4 s clip of one colour with a sine tone, made with FFmpeg. `None` without FFmpeg.
+    fn solid_clip(dir: &std::path::Path, name: &str, color: &str, hz: u32) -> Option<PathBuf> {
+        let path = dir.join(name);
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("color=c={color}:s=320x180:r=30:d=4"), "-f", "lavfi", "-i", &format!("sine=frequency={hz}:duration=4")])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&path)
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(path)
+    }
+
+    /// Two touching 2 s clips (source 1-3 s of a red and a blue 4 s file, so each has a 1 s
+    /// handle each side) on the first track of `kind`, plus the transition built by `make`
+    /// on the second clip's In edge.
+    fn two_clip_project(dir: &std::path::Path, kind: TrackKind, make: impl FnOnce(uuid::Uuid) -> Option<tempo_timeline::Transition>) -> Option<Project> {
+        let mut project = Project::new("t", 320, 180, RationalFps::FPS_30);
+        let clip_type = if kind == TrackKind::Video { ClipType::Video } else { ClipType::Audio };
+        let track = project.timeline.tracks.iter().find(|t| t.kind == kind).map(|t| t.id)?;
+        let mut second = None;
+        for (i, (name, color, hz)) in [("a.mp4", "red", 440), ("b.mp4", "blue", 660)].into_iter().enumerate() {
+            let mut source = MediaSource::new(solid_clip(dir, name, color, hz)?, MediaType::Video, 4_000_000);
+            source.audio_channels = Some(2);
+            let clip = Clip::new(track, source.id, clip_type, name, i as i64 * 2_000_000, (i as i64 + 1) * 2_000_000, 1_000_000, 3_000_000);
+            second = Some(clip.id);
+            project.timeline.find_track_mut(track)?.clips.push(clip);
+            project.sources.insert(source.id, source);
+        }
+        project.timeline.find_track_mut(track)?.transitions.extend(make(second?));
+        Some(project)
+    }
+
+    fn export_to(project: &Project, dir: &std::path::Path) -> PathBuf {
+        let out = dir.join("out.mp4");
+        export_timeline(project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
+        out
+    }
+
+    /// The colour of the frame at `at` seconds.
+    fn pixel_at(file: &std::path::Path, at: f64) -> [u8; 3] {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", &at.to_string(), "-i"])
+            .arg(file)
+            .args(["-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .unwrap();
+        out.stdout[..3].try_into().unwrap()
+    }
+
+    fn transition(kind: tempo_timeline::TransitionKind, edge: tempo_timeline::TransitionEdge) -> impl FnOnce(uuid::Uuid) -> Option<tempo_timeline::Transition> {
+        move |clip| Some(tempo_timeline::Transition::new(clip, edge, kind, 1_000_000, tempo_timeline::TransitionAlignment::Centered))
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tempo-tr-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn has_ffmpeg() -> bool {
+        Command::new("ffmpeg").arg("-version").output().is_ok()
+    }
+
     #[test]
-    fn cross_dissolve_adds_a_lead_in_strip_and_crossfades_sound() {
-        let Some(path) = sample() else { return };
-        let mut project = project_with_clip(path);
-        // Make the two pieces touch at 1 s, then dissolve into the second.
-        for track in &mut project.timeline.tracks {
-            if let Some(second) = track.clips.get_mut(1) {
-                second.timeline_in = 1_000_000;
-                second.timeline_out = 2_000_000;
-                second.properties.dissolve_in_us = 400_000;
+    fn centred_cross_dissolve_mid_frame_mixes_both_clips() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::CrossDissolve};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("mix");
+        let Some(project) = two_clip_project(&dir, TrackKind::Video, transition(CrossDissolve, In)) else { return };
+        let out = export_to(&project, &dir);
+        let (before, mid, after) = (pixel_at(&out, 1.2), pixel_at(&out, 2.0), pixel_at(&out, 2.8));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(before[0] > 200 && before[2] < 50, "{before:?}");
+        assert!(after[2] > 200 && after[0] < 50, "{after:?}");
+        assert!((90..170).contains(&mid[0]) && (90..170).contains(&mid[2]) && mid[1] < 40, "{mid:?}");
+    }
+
+    #[test]
+    fn dip_to_color_midpoint_is_the_dip_colour() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::DipToColor};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("dip");
+        let Some(project) = two_clip_project(&dir, TrackKind::Video, |clip| {
+            let mut t = transition(DipToColor, In)(clip)?;
+            t.color = [0.0, 1.0, 0.0];
+            Some(t)
+        }) else {
+            return;
+        };
+        let out = export_to(&project, &dir);
+        let (before, mid) = (pixel_at(&out, 1.2), pixel_at(&out, 2.0));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(before[0] > 200, "{before:?}");
+        assert!(mid[1] > 215 && mid[0] < 45 && mid[2] < 45, "{mid:?}");
+    }
+
+    #[test]
+    fn head_transition_fades_in_from_black() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::CrossDissolve};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("head");
+        // The first clip has nothing before it, so its In transition is a head fade.
+        let Some(mut project) = two_clip_project(&dir, TrackKind::Video, |_| None) else { return };
+        let first = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().clips[0].id;
+        project.timeline.tracks.iter_mut().find(|t| t.kind == TrackKind::Video).unwrap().transitions.extend(transition(CrossDissolve, In)(first));
+        let out = export_to(&project, &dir);
+        let (start, half, full) = (pixel_at(&out, 0.0), pixel_at(&out, 0.5), pixel_at(&out, 1.5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(start[0] < 25, "{start:?}");
+        assert!((90..170).contains(&half[0]), "{half:?}");
+        assert!(full[0] > 200, "{full:?}");
+    }
+
+    #[test]
+    fn audio_crossfade_has_no_gap_in_level() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::Crossfade};
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("xfade");
+        let Some(project) = two_clip_project(&dir, TrackKind::Audio, transition(Crossfade, In)) else { return };
+        let out = export_to(&project, &dir);
+        let pcm = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&out).args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"]).output().unwrap().stdout;
+        let _ = std::fs::remove_dir_all(&dir);
+        let samples: Vec<f64> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f64).collect();
+        // RMS of each 50 ms window.
+        let rms: Vec<f64> = samples.chunks_exact(400).map(|w| (w.iter().map(|v| v * v).sum::<f64>() / 400.0).sqrt()).collect();
+        let nominal = rms[10..20].iter().sum::<f64>() / 10.0;
+        // The crossfade runs 1.5-2.5 s: windows 30..50. Two different tones add in power.
+        let worst = rms[32..48].iter().cloned().fold(f64::MAX, f64::min);
+        assert!(nominal > 1000.0 && worst > nominal * 0.75, "nominal {nominal}, worst {worst}");
+    }
+
+    #[test]
+    fn audio_ramps_reach_the_graph_and_video_transitions_do_not_touch_sound() {
+        use tempo_timeline::{TransitionEdge::In, TransitionKind::CrossDissolve};
+        let dir = std::env::temp_dir();
+        let mut project = Project::new("t", 320, 180, RationalFps::FPS_30);
+        let mut source = MediaSource::new(dir.join("x.mp4"), MediaType::Video, 4_000_000);
+        source.audio_channels = Some(2);
+        let (v, a) = (
+            project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).unwrap(),
+            project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap(),
+        );
+        for track in [v, a] {
+            let kind = if track == v { ClipType::Video } else { ClipType::Audio };
+            for i in 0..2 {
+                let clip = Clip::new(track, source.id, kind, "c", i * 2_000_000, (i + 1) * 2_000_000, 1_000_000, 3_000_000);
+                project.timeline.find_track_mut(track).unwrap().clips.push(clip);
             }
+            let second = project.timeline.find_track_mut(track).unwrap().clips[1].id;
+            project.timeline.find_track_mut(track).unwrap().transitions.extend(transition(CrossDissolve, In)(second));
         }
-        let out = std::env::temp_dir().join(format!("tempo-export-dissolve-{}.mp4", std::process::id()));
-        let (args, total, _) = build_ffmpeg_args(&project, &settings(out.clone()), None).unwrap();
-        assert_eq!(total, 2_000_000);
-        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
-        // Video: a second strip with the fading lead-in, overlaid on the first.
-        assert!(graph.contains("[vt1]") && graph.contains("fade=t=in:st=0:d=0.400000:alpha=1"), "{graph}");
-        // Sound: the outgoing clip fades out and the lead-in fades in, then both are mixed.
-        assert!(graph.contains("afade=t=out") && graph.contains("afade=t=in") && graph.contains("amix=inputs=2"), "{graph}");
-        if Command::new("ffmpeg").arg("-version").output().is_ok() {
-            export_timeline(&project, &settings(out.clone()), &AtomicBool::new(false), |_| {}).unwrap();
-            assert!(out.exists());
-            let _ = std::fs::remove_file(&out);
-        }
+        // Sound comes only from the audio track's own transition: its clips and two handles.
+        let audio = crate::audio_mix::audio_strips(project.timeline.find_track_mut(a).unwrap(), &project.sources);
+        assert_eq!(audio.strips.len(), 3, "clips, head handle, tail handle");
+        assert_eq!(audio.ramps.len(), 4);
     }
 
     #[test]
@@ -1023,8 +1238,10 @@ mod tests {
         // A join never lands inside a fade: fade every clip across its edges and
         // the only places left are the two sides of the gap.
         for track in &mut project.timeline.tracks {
-            for clip in &mut track.clips {
-                clip.properties.dissolve_in_us = 100_000;
+            let ids: Vec<_> = track.clips.iter().filter(|c| track.clips.iter().any(|p| p.timeline_out == c.timeline_in)).map(|c| c.id).collect();
+            for id in ids {
+                let t = tempo_timeline::Transition::new(id, tempo_timeline::TransitionEdge::In, tempo_timeline::TransitionKind::CrossDissolve, 200_000, tempo_timeline::TransitionAlignment::Centered);
+                track.transitions.push(t);
             }
         }
         let joins: Vec<i64> = plan_sections(&project, 0, end).iter().skip(1).map(|s| s.0).collect();
