@@ -195,6 +195,18 @@ impl Transition {
 /// any size.
 pub const BLUR_DISSOLVE_PEAK: f32 = 40.0;
 
+/// A blur radius given in pixels of a 1080-line picture, in pixels of a picture `height`
+/// high. The viewer's blur (GTK's) takes this radius; the export's takes `blur_sigma` of it.
+pub fn blur_radius_px(radius_1080: f32, height: f32) -> f32 {
+    radius_1080 * height / 1080.0
+}
+
+/// The Gaussian sigma of FFmpeg's `gblur` that matches GTK's blur of `radius_px`: GTK
+/// blurs with a sigma of half its radius.
+pub fn blur_sigma(radius_px: f32) -> f32 {
+    radius_px * 0.5
+}
+
 /// How a picture is drawn onto the picture under it, weighted by its opacity:
 /// `under + opacity * (mode(under, picture) - under)`, as GTK and FFmpeg both do it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -645,39 +657,70 @@ fn add_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, (bef
     layers.color.push(ColorLayer { start_us: start, end_us: end, color, fade_in_us, fade_out_us, shape });
 }
 
-/// An Additive or Non-Additive Dissolve on a cut. Each picture stays whole over its half
-/// and is blended on at `min(1, 2p)` (`p` the progress) over the other half: up to the
-/// middle A is whole under B coming in, from it B is whole under A going out, so the middle
-/// shows both whole, blended. The clips under the mix swap at the middle, not at the cut.
+/// An Additive or Non-Additive Dissolve on a cut. At progress `p` the outgoing picture shows
+/// at `min(1, 2 - 2p)` and the incoming at `min(1, 2p)`, blended: while `p` is under half the
+/// outgoing one is whole under the incoming one coming in, above half the other way round, so
+/// a mix that runs back down (Start Ratio over End Ratio) works too. The whole picture of each
+/// part is an extra clip in `clips`; the clips' own fades on the cut side are dropped, so
+/// nothing jumps where the parts meet.
 fn add_blend_cut(layers: &mut TransitionLayers, outgoing: &Clip, incoming: &Clip, (before, after): (i64, i64), t: &Transition, blend: PictureBlend) {
     let d = before + after;
     if d <= 0 {
         return;
     }
     let (start, end) = (incoming.timeline_in - before, incoming.timeline_in + after);
-    let mid = start + (t.half_point() as f64 * d as f64) as i64;
     for c in &mut layers.clips {
         if c.id == outgoing.id {
-            *c = retimed(c, c.timeline_in, mid);
+            *c = retimed(c, c.timeline_in, start);
+            c.properties.fade_out_us = 0;
         } else if c.id == incoming.id {
-            *c = retimed(c, mid, c.timeline_out);
+            *c = retimed(c, end, c.timeline_out);
+            c.properties.fade_in_us = 0;
         }
     }
-    // Ratios doubled give `min(1, 2p)`; doubled less one give `max(0, 2p - 1)`, the part of
-    // the fade out done. Both fades span the whole transition, so their ramps are `p`'s.
-    let scaled = |shift: f32| Some(Box::new(Transition { start_ratio: 2.0 * t.start_ratio - shift, end_ratio: 2.0 * t.end_ratio - shift, ..t.clone() }));
-    if mid > start {
-        let mut piece = set_fades(retimed(incoming, start, mid), d, 0);
-        piece.properties.fade_in_shape = scaled(0.0);
+    let at = |time: i64| (time - start) as f32 / d as f32;
+    let cross = start + (mix_crossing(t) as f64 * d as f64) as i64;
+    for (a, b) in [(start, cross), (cross, end)].into_iter().filter(|(a, b)| b > a) {
+        let incoming_whole = t.progress_at(at((a + b) / 2)) >= 0.5;
+        let (whole, over) = if incoming_whole { (incoming, outgoing) } else { (outgoing, incoming) };
+        let mut under = set_fades(retimed(whole, a, b), 0, 0);
+        under.id = Uuid::new_v4();
+        layers.clips.push(under);
+        // The picture on top shows at `q = alpha + beta * p`: 2p coming in, 2 - 2p going out.
+        let (alpha, beta) = if incoming_whole { (2.0, -2.0) } else { (0.0, 2.0) };
+        let ramp = |alpha: f32, beta: f32| Some(Box::new(Transition { start_ratio: alpha + beta * t.start_ratio, end_ratio: alpha + beta * t.end_ratio, ..t.clone() }));
+        // Fades spanning the whole transition make their ramps run with `p`: a fade in from
+        // its start gives `q`, a fade out to its end `1 - q`.
+        let mut piece = retimed(over, a, b);
+        if a == start {
+            piece = set_fades(piece, d, 0);
+            piece.properties.fade_in_shape = ramp(alpha, beta);
+        } else {
+            piece = set_fades(piece, 0, d);
+            piece.properties.fade_out_shape = ramp(1.0 - alpha, -beta);
+        }
         piece.properties.blend = blend;
         layers.mix.push(piece);
     }
-    if end > mid {
-        let mut piece = set_fades(retimed(outgoing, mid, end), 0, d);
-        piece.properties.fade_out_shape = scaled(1.0);
-        piece.properties.blend = blend;
-        layers.mix.push(piece);
+}
+
+/// Where through the transition (0.0-1.0) its progress first crosses half, either way; 1.0
+/// when it never does.
+fn mix_crossing(t: &Transition) -> f32 {
+    const STEPS: u32 = 1024;
+    let side = |u: f32| t.progress_at(u) >= 0.5;
+    let first = side(0.0);
+    let Some(i) = (1..=STEPS).find(|&i| side(i as f32 / STEPS as f32) != first) else { return 1.0 };
+    let (mut lo, mut hi) = ((i - 1) as f32 / STEPS as f32, i as f32 / STEPS as f32);
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        if side(mid) == first {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
+    hi
 }
 
 #[cfg(test)]
@@ -1293,8 +1336,9 @@ mod tests {
         let (start, mid, late, after) = (blended(&layers, 3 * S), blended(&layers, 3_500_000), blended(&layers, 3_750_000), blended(&layers, 4 * S));
         // Assert: from the middle on, B is whole under A fading out, so the end meets B.
         assert!(close(start, 0.4) && close(mid, 0.6) && close(late, 0.6) && close(after, 0.6), "{start} {mid} {late} {after}");
-        let a = layers.clips.iter().find(|c| c.name == "a").unwrap();
-        assert_eq!(a.timeline_out, 3_500_000, "the pictures swap under the mix at its middle");
+        let under = |name: &str| layers.clips.iter().filter(|c| c.name == name).map(|c| (c.timeline_in, c.timeline_out)).collect::<Vec<_>>();
+        assert_eq!(under("a"), vec![(0, 3 * S), (3 * S, 3_500_000)], "the pictures swap under the mix at its middle");
+        assert_eq!(under("b"), vec![(4 * S, 8 * S), (3_500_000, 4 * S)]);
         assert!(layers.mix.iter().all(|c| c.properties.blend == PictureBlend::Lighten));
     }
 
@@ -1341,5 +1385,41 @@ mod tests {
         assert!(close(a_clip.transition_blur(0), BLUR_DISSOLVE_PEAK) && close(a_clip.transition_blur(S / 2), BLUR_DISSOLVE_PEAK / 2.0));
         assert_eq!(a_clip.transition_blur(S), 0.0);
         assert!(close(a_clip.fade_factor(S / 2), 0.5), "a head still fades in");
+    }
+
+    #[test]
+    fn blend_dissolves_follow_a_falling_mix() {
+        // Arrange: Start Ratio 80 %, End Ratio 20 %: B mostly in at the start, A at the end.
+        let layers = layers_with(TransitionKind::AdditiveDissolve, TransitionAlignment::Centered, |t| {
+            t.start_ratio = 0.8;
+            t.end_ratio = 0.2;
+        });
+        // Act
+        let (start, mid, end) = (blended(&layers, 3_500_000), blended(&layers, 4 * S), blended(&layers, 4_500_000 - 1));
+        // Assert: B whole with A at 2 - 2 * 0.8, both whole at the middle, A whole with B at 2 * 0.2.
+        assert!(close(start, 0.6 + 0.4 * (0.76 - 0.6)), "{start}");
+        assert!(close(mid, 0.76), "{mid}");
+        assert!(close(end, 0.4 + 0.4 * (0.76 - 0.4)), "{end}");
+        assert!((blended(&layers, 4 * S - 40_000) - blended(&layers, 4 * S + 40_000)).abs() < 0.03);
+    }
+
+    #[test]
+    fn a_blend_dissolve_does_not_jump_where_the_outgoing_clip_fades_out() {
+        // Arrange: A has its own 1 s fade out up to the cut.
+        let (mut tl, sources, _, b) = setup();
+        tl.tracks[0].clips[0].properties.fade_out_us = S;
+        tl.tracks[0].transitions.push(Transition::new(b, TransitionEdge::In, TransitionKind::AdditiveDissolve, S, TransitionAlignment::Centered));
+        // Act
+        let layers = tl.tracks[0].transition_layers(&sources);
+        let samples: Vec<f32> = (3_400_000..4_600_000).step_by(20_000).map(|t| blended(&layers, t)).collect();
+        // Assert: no step bigger than a frame's worth of a ramp.
+        assert!(samples.windows(2).all(|w| (w[0] - w[1]).abs() < 0.03), "{samples:?}");
+    }
+
+    #[test]
+    fn blur_sizes_scale_with_the_picture_and_sigma_is_half_the_radius() {
+        // Arrange / Act / Assert: 40 px at 1080 lines is 20 px at 540; GTK's sigma is half that.
+        assert_eq!(blur_radius_px(40.0, 540.0), 20.0);
+        assert_eq!(blur_sigma(20.0), 10.0);
     }
 }
