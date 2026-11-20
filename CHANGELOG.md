@@ -6,6 +6,15 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
+Alpha. The Edit page works much more like DaVinci Resolve's:
+- transitions are their own objects, with Resolve's five dissolves and the full Inspector;
+- Resolve-style copy and paste of transitions, and `Up`/`Down` between edits;
+- timelines in the Media Pool, and a Create New Timeline dialog that matches Resolve;
+- marker colours, zoom presets and upload fields on the Export page;
+- end-to-end tests of the real app on a private Wayland session.
+
 ### Added
 
 - **Transitions work as in DaVinci Resolve.** A transition is its own object on the timeline.
