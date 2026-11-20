@@ -92,7 +92,7 @@ fn pieces<'a>(clips: &'a [Clip], r0: i64, r1: i64, kinds: &[ClipType]) -> Vec<Pi
 }
 
 /// FFmpeg filters for the clip's own filters (colour and blur), to follow `format=rgba`.
-fn effect_filters(props: &ClipProperties, sy: f32) -> String {
+fn effect_filters(props: &ClipProperties, height: f32) -> String {
     let fx = tempo_timeline::resolve_effects(&props.effects);
     let mut out = String::new();
     if !fx.color.is_identity() {
@@ -113,8 +113,8 @@ fn effect_filters(props: &ClipProperties, sy: f32) -> String {
         }
     }
     if fx.blur > 0.05 {
-        // The radius is given for a 1080-line project; `sy` scales it to the output.
-        out.push_str(&format!(",gblur=sigma={:.2}", (fx.blur * sy * 0.5).max(0.1)));
+        // The radius is given for a 1080-line project, scaled to the output as the viewer does.
+        out.push_str(&format!(",gblur=sigma={:.2}", tempo_timeline::blur_sigma(tempo_timeline::blur_radius_px(fx.blur, height)).max(0.1)));
     }
     out
 }
@@ -169,12 +169,12 @@ fn per_frame(filter: &str, param: &str, rest: f32, first: i64, frames: i64, r0: 
 }
 
 /// A Blur Dissolve's per-frame blur on a picture, a Gaussian as for the clip's own blur filter
-/// (`sy` scales its 1080-line radius to the output). Empty when the clip has none.
-fn transition_blur_filters(name: &str, clip: &Clip, first: i64, frames: i64, r0: i64, project: &Project, sy: f32) -> String {
+/// (its 1080-line radius scaled to `height`, as the viewer does). Empty when the clip has none.
+fn transition_blur_filters(name: &str, clip: &Clip, first: i64, frames: i64, r0: i64, project: &Project, height: f32) -> String {
     if clip.properties.blur_ramps.is_empty() {
         return String::new();
     }
-    per_frame(&format!("gblur@{name}"), "sigma", 0.0, first, frames, r0, project, |t| clip.transition_blur(t) * sy * 0.5)
+    per_frame(&format!("gblur@{name}"), "sigma", 0.0, first, frames, r0, project, |t| tempo_timeline::blur_sigma(tempo_timeline::blur_radius_px(clip.transition_blur(t), height)))
 }
 
 /// The FFmpeg `blend` mode for a picture blend; `None` for a plain overlay.
@@ -417,8 +417,8 @@ fn build_args(
             };
             let label = format!("vc{ti}_{}", segs.len());
             // Blur radii are in pixels of a 1080-line picture.
-            let effects = effect_filters(props, h as f32 / 1080.0);
-            let blur = transition_blur_filters(&format!("bl{ti}_{}", segs.len()), p.clip, first, frames, r0, project, h as f32 / 1080.0);
+            let effects = effect_filters(props, h as f32);
+            let blur = transition_blur_filters(&format!("bl{ti}_{}", segs.len()), p.clip, first, frames, r0, project, h as f32);
             // A retimed clip's pictures are spread out (or packed together) before the
             // frame rate is set, so slow motion repeats frames and fast motion skips them.
             let retime = if props.speed != 1.0 { format!("setpts=(PTS-STARTPTS)/{:.6},", props.speed) } else { String::new() };
@@ -1252,6 +1252,10 @@ mod tests {
         let _ = (std::fs::remove_dir_all(&dir_blur), std::fs::remove_dir_all(&dir_cross));
         // Assert: blurred hard at the middle, and the same picture outside the transition.
         assert!(graph.contains("gblur@bl") && !graph_of(&cross).contains("gblur@"), "{graph}");
+        // The peak at the cut, sized as the viewer sizes it: GTK's radius for a 360-line
+        // picture, as FFmpeg's sigma.
+        let peak = tempo_timeline::blur_sigma(tempo_timeline::blur_radius_px(tempo_timeline::BLUR_DISSOLVE_PEAK, 360.0));
+        assert!(graph.contains(&format!("0.000000 gblur@bl0_1 sigma {peak:.4};")), "{graph}");
         assert!(blurred < sharp * 0.6, "blur {blurred} vs cross {sharp}");
         assert!((blur_edge - cross_edge).abs() < cross_edge * 0.05, "{blur_edge} vs {cross_edge}");
     }
