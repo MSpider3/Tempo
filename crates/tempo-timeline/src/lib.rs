@@ -4,8 +4,10 @@ pub mod effects;
 pub mod error;
 pub mod types;
 pub mod command;
+pub mod transition;
 
 pub use effects::{resolve as resolve_effects, Amount, ClipEffect, ColorTransform, EffectOp, EffectParam, ResolvedEffects};
 pub use error::{Result, TimelineError};
 pub use types::*;
 pub use command::*;
+pub use transition::*;

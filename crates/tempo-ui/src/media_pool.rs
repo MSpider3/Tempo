@@ -26,6 +26,10 @@ struct Item {
     duration_us: i64,
     media_type: MediaType,
     missing: bool,
+    /// A timeline of the project rather than a media file.
+    timeline: bool,
+    /// The timeline that is open.
+    open: bool,
     thumbnail: Option<gdk::Texture>,
 }
 
@@ -37,6 +41,8 @@ pub struct MediaPool {
     /// The right-click menu while it is open.
     menu: RefCell<Option<gtk::PopoverMenu>>,
     stack: gtk::Stack,
+    /// The drop hint under the timeline items while the project has no media yet.
+    media_hint: gtk::Label,
     search: gtk::SearchEntry,
     window: glib::WeakRef<gtk::Window>,
 }
@@ -77,7 +83,14 @@ impl MediaPool {
 
         let stack = gtk::Stack::new();
         stack.add_named(&hint, Some("empty"));
-        stack.add_named(&scrolled, Some("grid"));
+        let media_hint = label("Drop video, audio or images here,\nor press Ctrl+I", &["drop-hint"]);
+        media_hint.set_justify(gtk::Justification::Center);
+        media_hint.set_vexpand(true);
+        media_hint.set_valign(gtk::Align::Start);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&scrolled);
+        page.append(&media_hint);
+        stack.add_named(&page, Some("grid"));
         stack.set_vexpand(true);
         root.append(&stack);
 
@@ -88,6 +101,7 @@ impl MediaPool {
             selection: selection.clone(),
             menu: RefCell::new(None),
             stack,
+            media_hint,
             search,
             window: glib::WeakRef::new(),
         });
@@ -96,7 +110,7 @@ impl MediaPool {
         *on_menu.borrow_mut() = Some(Box::new(move |position, widget, x, y| {
             // Right-clicking a clip selects it, as a left click would.
             p.selection.set_selected(position);
-            let id = p.store.item(position).and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id);
+            let id = p.store.item(position).and_downcast::<glib::BoxedAnyObject>().map(|o| (o.borrow::<Item>().id, o.borrow::<Item>().timeline));
             if let Some(point) = widget.compute_point(&p.root, &gtk::graphene::Point::new(x as f32, y as f32)) {
                 p.show_menu(id, point.x() as f64, point.y() as f64);
             }
@@ -116,14 +130,22 @@ impl MediaPool {
         let s = state.clone();
         selection.connect_selected_item_notify(move |sel| {
             let id = sel.selected_item().and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id);
-            s.media_selection.set(id);
+            // Timelines are not media: they never become the clip the pool "has selected".
+            let is_media = id.is_some_and(|id| s.with_project(|p| p.sources.contains_key(&id)).unwrap_or(false));
+            s.media_selection.set(id.filter(|_| is_media));
         });
 
         // Double-click (or Enter) opens the clip in the viewer.
         let store_for_open = pool.store.clone();
+        let state_for_open = state.clone();
         grid.connect_activate(move |_, pos| {
             if let Some(obj) = store_for_open.item(pos).and_downcast::<glib::BoxedAnyObject>() {
-                on_open(obj.borrow::<Item>().id);
+                let item = obj.borrow::<Item>();
+                if item.timeline {
+                    state_for_open.open_timeline(item.id);
+                } else {
+                    on_open(item.id);
+                }
             }
         });
 
@@ -139,7 +161,7 @@ impl MediaPool {
 
         let p = pool.clone();
         state.connect(move |change| {
-            if matches!(change, Change::Project | Change::Media) {
+            if matches!(change, Change::Project | Change::Media | Change::Timelines) {
                 p.reload();
             }
         });
@@ -160,11 +182,18 @@ impl MediaPool {
             });
             group.add_action(&action);
         };
-        add("insert", Box::new(|p, id| actions::place_source(&p.state, id, Place::Insert, None, None)));
-        add("overwrite", Box::new(|p, id| actions::place_source(&p.state, id, Place::Overwrite, None, None)));
-        add("append", Box::new(|p, id| actions::place_source(&p.state, id, Place::Append, None, None)));
+        add("insert", Box::new(|p, id| actions::place_source(&p.state, id, Place::Insert, None, None, true)));
+        add("overwrite", Box::new(|p, id| actions::place_source(&p.state, id, Place::Overwrite, None, None, true)));
+        add("append", Box::new(|p, id| actions::place_source(&p.state, id, Place::Append, None, None, true)));
         add("open", Box::new(|p, id| p.state.show_source(Some(id))));
         add("remove", Box::new(|p, id| actions::remove_source(&p.state, id)));
+        add("open-timeline", Box::new(|p, id| p.state.open_timeline(id)));
+        add("rename-timeline", Box::new(|p, id| p.rename_dialog(id)));
+        add("duplicate-timeline", Box::new(|p, id| {
+            p.state.duplicate_timeline(id);
+        }));
+        add("delete-timeline", Box::new(|p, id| p.delete_dialog(id)));
+        // Target of the greyed-out "Delete Timeline" item: no such action, so it stays disabled.
         add(
             "reveal",
             Box::new(|p, id| {
@@ -181,12 +210,26 @@ impl MediaPool {
     }
 
     /// The right-click menu, for a clip or (with `None`) for empty space.
-    fn show_menu(&self, clip: Option<Uuid>, x: f64, y: f64) {
+    fn show_menu(&self, clip: Option<(Uuid, bool)>, x: f64, y: f64) {
         if self.state.project.borrow().is_none() {
             return;
         }
         let menu = gio::Menu::new();
-        if let Some(id) = clip {
+        if let Some((id, true)) = clip {
+            let part = gio::Menu::new();
+            let is_open = self.state.with_timeline(|t| t.id) == Some(id);
+            for (label, action) in [("Open", "pool.open-timeline"), ("Rename…", "pool.rename-timeline"), ("Duplicate Timeline", "pool.duplicate-timeline"), ("Delete Timeline", "pool.delete-timeline")] {
+                // The open timeline cannot be deleted; a disabled item cannot be activated.
+                if is_open && action == "pool.delete-timeline" {
+                    part.append_item(&gio::MenuItem::new(Some(label), Some("pool.none")));
+                    continue;
+                }
+                let item = gio::MenuItem::new(Some(label), None);
+                item.set_action_and_target_value(Some(action), Some(&id.to_string().to_variant()));
+                part.append_item(&item);
+            }
+            menu.append_section(None, &part);
+        } else if let Some((id, false)) = clip {
             let section = |items: &[(&str, &str)]| {
                 let part = gio::Menu::new();
                 for (label, action) in items {
@@ -205,6 +248,9 @@ impl MediaPool {
         }
         let import = gio::Menu::new();
         import.append(Some("Import Media…"), Some("pool.import"));
+        let new_timeline = gio::MenuItem::new(Some("Create New Timeline…"), None);
+        new_timeline.set_action_and_target_value(Some("win.do"), Some(&"win.new-timeline".to_variant()));
+        import.append_item(&new_timeline);
         menu.append_section(None, &import);
 
         if let Some(old) = self.menu.take() {
@@ -238,7 +284,7 @@ impl MediaPool {
     /// Open the right-click menu of the nth item. For scripted checks.
     pub fn show_menu_for_index(&self, index: u32) {
         self.selection.set_selected(index);
-        let id = self.store.item(index).and_downcast::<glib::BoxedAnyObject>().map(|o| o.borrow::<Item>().id);
+        let id = self.store.item(index).and_downcast::<glib::BoxedAnyObject>().map(|o| (o.borrow::<Item>().id, o.borrow::<Item>().timeline));
         self.show_menu(id, 60.0, 90.0);
     }
 
@@ -340,6 +386,54 @@ impl MediaPool {
         dialog.present(self.window.upgrade().as_ref());
     }
 
+    fn rename_dialog(&self, id: Uuid) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        let Some(current) = self.state.with_project(|p| p.timeline_list().into_iter().find(|(i, _)| *i == id).map(|(_, n)| n)).flatten() else { return };
+        let taken = self.state.with_project(|p| p.timeline_list()).unwrap_or_default();
+        let entry = gtk::Entry::builder().text(&current).activates_default(true).build();
+        let dialog = adw::AlertDialog::builder().heading("Rename Timeline").extra_child(&entry).build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        let d = dialog.downgrade();
+        entry.connect_changed(move |e| {
+            if let Some(d) = d.upgrade() {
+                d.set_response_enabled("rename", name_available(&taken, id, &e.text()));
+            }
+        });
+        let state = self.state.clone();
+        let field = entry.clone();
+        dialog.connect_response(Some("rename"), move |_, _| {
+            if !state.rename_timeline(id, field.text().trim()) {
+                state.message("That name is empty or already used by another timeline.");
+            }
+        });
+        dialog.present(self.window.upgrade().as_ref());
+        entry.grab_focus();
+    }
+
+    fn delete_dialog(&self, id: Uuid) {
+        use libadwaita as adw;
+        use libadwaita::prelude::*;
+        let Some(name) = self.state.with_project(|p| p.timeline_list().into_iter().find(|(i, _)| *i == id).map(|(_, n)| n)).flatten() else { return };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Delete Timeline?")
+            .body(format!("\"{name}\" and its edits will be deleted. This cannot be undone."))
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        let state = self.state.clone();
+        dialog.connect_response(Some("delete"), move |_, _| {
+            if !state.remove_timeline(id) {
+                state.message("The open timeline cannot be deleted. Open another timeline first.");
+            }
+        });
+        dialog.present(self.window.upgrade().as_ref());
+    }
+
     fn reload(&self) {
         let query = self.search.text().to_lowercase();
         let mut items: Vec<(u32, Item)> = self
@@ -365,6 +459,8 @@ impl MediaPool {
                                 duration_us: s.duration_us,
                                 media_type: s.media_type,
                                 missing: s.is_missing,
+                                timeline: false,
+                                open: false,
                                 thumbnail,
                             },
                         )
@@ -374,8 +470,26 @@ impl MediaPool {
             })
             .unwrap_or_default();
         items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        // Timelines follow the media, as items of the pool.
+        let open = self.state.with_timeline(|t| t.id);
+        let timelines = self.state.with_project(|p| p.timeline_list()).unwrap_or_default();
+        items.extend(timelines.into_iter().filter(|(_, n)| query.is_empty() || n.to_lowercase().contains(&query)).map(|(id, name)| {
+            let item = Item {
+                id,
+                name,
+                detail: "Timeline".into(),
+                duration_us: 0,
+                media_type: MediaType::Video,
+                missing: false,
+                timeline: true,
+                open: open == Some(id),
+                thumbnail: None,
+            };
+            (u32::MAX, item)
+        }));
 
-        let has_any = self.state.with_project(|p| !p.sources.is_empty()).unwrap_or(false);
+        // A project always has a timeline, so the grid shows whenever one is open.
+        let has_any = self.state.project.borrow().is_some();
         // Rebuilding the list clears the selection; put it back, so a clip picked
         // while other files are still importing stays picked.
         let selected = self.state.media_selection.get();
@@ -392,7 +506,19 @@ impl MediaPool {
             None => self.state.media_selection.set(selected.filter(|id| self.state.with_project(|p| p.sources.contains_key(id)).unwrap_or(false))),
         }
         self.stack.set_visible_child_name(if has_any { "grid" } else { "empty" });
+        // With no media the hint sits right under the timeline items, not at the bottom.
+        let no_media = self.state.with_project(|p| p.sources.is_empty()).unwrap_or(false);
+        self.media_hint.set_visible(no_media);
+        if let Some(list) = self.media_hint.prev_sibling() {
+            list.set_vexpand(!no_media);
+        }
     }
+}
+
+/// Whether `typed` may name timeline `id`: not blank, not another timeline's name (any case).
+fn name_available(timelines: &[(Uuid, String)], id: Uuid, typed: &str) -> bool {
+    let typed = typed.trim().to_lowercase();
+    !typed.is_empty() && !timelines.iter().any(|(i, n)| *i != id && n.to_lowercase() == typed)
 }
 
 /// Probe thumbnails are raw RGBA; work out their size from the byte count.
@@ -437,6 +563,14 @@ fn item_factory(on_menu: MenuHandler) -> gtk::SignalListItemFactory {
             let id = obj.borrow::<Item>().id.to_string();
             Some(gdk::ContentProvider::for_value(&id.to_value()))
         });
+        // The picture under the pointer is the clip's thumbnail, as in Resolve.
+        let weak_item = list_item.downgrade();
+        drag.connect_drag_begin(move |source, _| {
+            let thumb = weak_item.upgrade().and_then(|i| i.item()).and_downcast::<glib::BoxedAnyObject>().and_then(|o| o.borrow::<Item>().thumbnail.clone());
+            if let Some(t) = thumb {
+                source.set_icon(Some(&t), 0, 0);
+            }
+        });
         cell.add_controller(drag);
 
         let click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
@@ -469,6 +603,7 @@ fn item_factory(on_menu: MenuHandler) -> gtk::SignalListItemFactory {
         }
         if let Some(i) = &icon {
             let name = match (item.missing, item.thumbnail.is_some(), item.media_type) {
+                _ if item.timeline => Some("view-list-symbolic"),
                 (true, _, _) => Some("dialog-warning-symbolic"),
                 (_, true, _) => None,
                 (_, _, MediaType::Audio) => Some("audio-x-generic-symbolic"),
@@ -480,11 +615,37 @@ fn item_factory(on_menu: MenuHandler) -> gtk::SignalListItemFactory {
         }
         if let Some(d) = &duration {
             d.set_text(&short_duration(item.duration_us));
-            d.set_visible(item.media_type != MediaType::Image);
+            d.set_visible(item.media_type != MediaType::Image && !item.timeline);
         }
         name.set_text(&item.name);
+        // The open timeline is marked.
+        if item.open {
+            thumb.add_css_class("pool-open-timeline");
+        } else {
+            thumb.remove_css_class("pool-open-timeline");
+        }
+        if item.timeline {
+            let tip = if item.open { format!("{}\nTimeline (open)", item.name) } else { format!("{}\nTimeline. Double-click to open.", item.name) };
+            cell.set_tooltip_text(Some(&tip));
+            return;
+        }
         let tip = if item.missing { format!("{} — file not found", item.name) } else { format!("{}\n{}", item.name, item.detail) };
         cell.set_tooltip_text(Some(&tip));
     });
     factory
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_available_refuses_blank_and_other_timelines_names() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let list = vec![(a, "Main".to_string()), (b, "Alt".to_string())];
+        assert!(!name_available(&list, a, "  "));
+        assert!(!name_available(&list, a, "alt"));
+        assert!(name_available(&list, a, "MAIN"));
+        assert!(name_available(&list, a, "Fresh"));
+    }
 }

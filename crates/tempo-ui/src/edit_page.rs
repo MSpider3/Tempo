@@ -11,9 +11,10 @@ use crate::actions::{self, Place};
 use crate::inspector::Inspector;
 use crate::media_pool::MediaPool;
 use crate::state::{AppState, Change, Tool};
-use crate::timeline::{TimelineArea, MAX_PPS, MIN_PPS};
-use crate::util::{divider, label, text_button, text_toggle, tool_button};
+use crate::timeline::{TimelineArea, TimelineCanvas, ZoomPreset, MAX_PPS, MIN_PPS, TRANSITION_PREFIX};
+use crate::util::{divider, label, text_button, text_toggle, tool_button, tool_toggle};
 use crate::viewer::Viewer;
+use tempo_timeline::TransitionKind;
 
 pub struct EditPage {
     pub root: gtk::Box,
@@ -154,7 +155,7 @@ impl EditPage {
     /// For a project taller than it is wide, give the viewer a full-height column
     /// at the right, as DaVinci Resolve does. Otherwise it sits above the timeline.
     fn layout_viewer(&self) {
-        let vertical = self.state.with_project(|p| p.height > p.width).unwrap_or(false);
+        let vertical = self.state.with_project(|p| p.output_size().1 > p.output_size().0).unwrap_or(false);
         if vertical == self.vertical.replace(vertical) {
             return;
         }
@@ -220,9 +221,11 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         sub.set_xalign(0.0);
         list.append(&sub);
     };
-    let item = |name: &str, tip: &str, icon: &str, run: Box<dyn Fn(&Rc<AppState>)>| {
+    // `drag`: a transition kind that can also be dragged onto the timeline.
+    let item = |name: &str, tip: &str, icon: &str, drag: Option<&str>, run: Box<dyn Fn(&Rc<AppState>)>| {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let cell = gtk::Box::builder().width_request(56).css_classes(["effect-icon"]).build();
+        // hexpand(false): the centred icon inside must not stretch the cell across the row.
+        let cell = gtk::Box::builder().width_request(56).hexpand(false).css_classes(["effect-icon"]).build();
         let image = gtk::Image::from_icon_name(icon);
         image.set_hexpand(true);
         image.set_halign(gtk::Align::Center);
@@ -235,30 +238,54 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         let button = gtk::Button::builder().child(&content).tooltip_text(tip).css_classes(["effect-row"]).build();
         let s = state.clone();
         button.connect_clicked(move |_| run(&s));
+        if let Some(kind) = drag {
+            let source = gtk::DragSource::builder().actions(gtk::gdk::DragAction::COPY).build();
+            let payload = format!("{TRANSITION_PREFIX}{kind}");
+            source.connect_prepare(move |_, _, _| Some(gtk::gdk::ContentProvider::for_value(&payload.to_value())));
+            // The icon follows the pointer.
+            let icon = cell.clone();
+            source.connect_drag_begin(move |source, _| source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&icon))), 28, 12));
+            button.add_controller(source);
+        }
         list.append(&button);
     };
 
-    heading("Transitions", "Click to apply to the selected clip");
-    item(
-        "Cross Dissolve",
-        "Dissolve from the previous clip into the selected clip (Ctrl+T)",
-        "media-seek-backward-symbolic",
-        Box::new(|s| actions::cross_dissolve(s, 0.5)),
-    );
-    item("Fade In", "Fade the selected clip in over half a second", "go-first-symbolic", Box::new(|s| actions::set_fade(s, true, 0.5)));
-    item("Fade Out", "Fade the selected clip out over half a second", "go-last-symbolic", Box::new(|s| actions::set_fade(s, false, 0.5)));
+    let standard = actions::STANDARD_TRANSITION_S;
+    heading("Video Transitions", "Drag onto a cut or the start or end of a clip, or click to add to the selected edit or clip (Ctrl+T)");
+    let group = |text: &str| {
+        let g = label(text, &["tempo-small", "tempo-dim"]);
+        g.set_xalign(0.0);
+        g.set_margin_top(4);
+        list.append(&g);
+    };
+    group("Dissolve");
+    for kind in TransitionKind::VIDEO_DISSOLVES {
+        let (tip, icon) = match kind {
+            TransitionKind::AdditiveDissolve => ("Dissolve by adding the two pictures together, so the middle is brighter. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            TransitionKind::BlurDissolve => ("Blur the outgoing clip while dissolving into the next, which sharpens. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            TransitionKind::DipToColor => ("Dissolve to a colour and then from it into the next clip (pick the colour in the Inspector; black or white for a fade to black or white). Drag onto a cut or the start or end of a clip", "media-record-symbolic"),
+            TransitionKind::NonAdditiveDissolve => ("Dissolve keeping the brighter of the two pictures at each point. Drag onto a cut or the start or end of a clip", "view-dual-symbolic"),
+            _ => ("Dissolve from the previous clip into the next. Drag onto a cut or the start or end of a clip; on a clip edge with no clip next to it, fades from or to transparent", "view-dual-symbolic"),
+        };
+        let (name, id) = (kind.resolve_name(), kind.effect_id());
+        item(&name, tip, icon, id, Box::new(move |s| actions::add_transition(s, kind.clone())));
+    }
+    group("Clip Fades");
+    item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some("fade-in"), Box::new(move |s| actions::set_fade(s, true, standard)));
+    item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some("fade-out"), Box::new(move |s| actions::set_fade(s, false, standard)));
     item(
         "Fade In and Out",
-        "Fade the selected clip in and out",
+        "Fade the selected clip in and out over one second each",
         "media-playback-start-symbolic",
-        Box::new(|s| {
-            actions::set_fade(s, true, 0.5);
-            actions::set_fade(s, false, 0.5);
+        Some("fade-in-out"),
+        Box::new(move |s| {
+            actions::set_fade(s, true, standard);
+            actions::set_fade(s, false, standard);
         }),
     );
     heading("Titles", "Click to add at the playhead");
-    item("Text", "A title in the middle of the picture", "document-edit-symbolic", Box::new(|s| actions::add_title(s, false)));
-    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", Box::new(|s| actions::add_title(s, true)));
+    item("Text", "A title in the middle of the picture", "document-edit-symbolic", None, Box::new(|s| actions::add_title(s, false)));
+    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", None, Box::new(|s| actions::add_title(s, true)));
 
     heading("Filters", "Click to apply to the selected clip");
     // Filters come from plugins, so this part is rebuilt when plugins change.
@@ -345,14 +372,26 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
     let marker = text_button("Marker", "Add a marker at the playhead (M)");
     let s = state.clone();
     marker.connect_clicked(move |_| {
-        actions::add_marker(&s);
+        actions::add_marker(&s, false);
     });
 
-    // Zoom: fit, minus, slider (logarithmic), plus.
+    // Zoom: the three presets, minus, slider (logarithmic), plus.
     let canvas = timeline.canvas.clone();
-    let fit = tool_button("zoom-fit-best-symbolic", "Zoom to fit (Shift+Z)");
-    let c = canvas.clone();
-    fit.connect_clicked(move |_| c.zoom_fit());
+    let fit = tool_toggle("zoom-fit-best-symbolic", "Full Extent Zoom (Shift+Z)");
+    let detail = tool_toggle("zoom-original-symbolic", "Detail Zoom");
+    let custom = tool_toggle("document-edit-symbolic", "Custom Zoom");
+    detail.set_group(Some(&fit));
+    custom.set_group(Some(&fit));
+    fit.set_active(true);
+    for (button, run) in [
+        (&fit, TimelineCanvas::zoom_fit as fn(&TimelineCanvas)),
+        (&detail, TimelineCanvas::zoom_detail),
+        (&custom, TimelineCanvas::zoom_custom),
+    ] {
+        // Clicked, not toggled: clicking the pressed preset again applies it again.
+        let c = canvas.clone();
+        button.connect_clicked(move |_| run(&c));
+    }
     let minus = tool_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
     let c = canvas.clone();
     minus.connect_clicked(move |_| c.set_pps(c.pps() / 1.4, None));
@@ -373,7 +412,17 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         glib::Propagation::Proceed
     });
     let z = zoom.clone();
-    canvas.connect_zoom(move |pps| z.set_value(to_slider(pps)));
+    let presets = [fit.clone(), detail.clone(), custom.clone()];
+    let c = canvas.clone();
+    canvas.connect_zoom(move |pps| {
+        z.set_value(to_slider(pps));
+        let pressed = match c.preset() {
+            ZoomPreset::Full => &presets[0],
+            ZoomPreset::Detail => &presets[1],
+            ZoomPreset::Custom => &presets[2],
+        };
+        pressed.set_active(true);
+    });
 
     let centre = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     for w in [
@@ -390,6 +439,8 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
         marker.upcast_ref(),
         divider().upcast_ref(),
         fit.upcast_ref(),
+        detail.upcast_ref(),
+        custom.upcast_ref(),
         minus.upcast_ref(),
         zoom.upcast_ref(),
         plus.upcast_ref(),

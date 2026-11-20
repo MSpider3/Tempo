@@ -23,15 +23,32 @@ pub struct Layer {
     pub frame: Option<VideoFrame>,
     /// The text to draw, for title clips.
     pub title: Option<TitleData>,
+    /// A full-frame solid colour (RGB 0-1) instead of a picture; opacity is in `props`.
+    pub solid: Option<[f32; 3]>,
+    /// `props.opacity` is already multiplied by the fades; `props.blend` says how the layer
+    /// goes onto the ones under it.
     pub props: ClipProperties,
+    /// A Blur Dissolve's blur here, as a radius in pixels of a 1080-line picture.
+    pub blur: f32,
+}
+
+/// One layer of the picture, bottom first.
+enum VideoStrip {
+    /// Clips sorted by time, at most one under the playhead.
+    Clips(Vec<Clip>),
+    /// A solid colour over a span (a dip transition).
+    Color(tempo_timeline::ColorLayer),
 }
 
 /// An immutable copy of what the worker needs from the project.
 pub struct Snapshot {
     /// Video tracks, bottom first. Each holds its clips sorted by time.
-    tracks: Vec<Vec<Clip>>,
-    /// Audio tracks that are not muted, with their track volume.
-    audio: Vec<(Vec<Clip>, f32)>,
+    tracks: Vec<VideoStrip>,
+    /// Audio tracks that are not muted, with their track volume and whether they are Mono
+    /// (played centred).
+    audio: Vec<(Vec<Clip>, f32, bool)>,
+    /// Gain ramps of audio transitions, by clip id.
+    ramps: HashMap<Uuid, Vec<tempo_export::audio_mix::Ramp>>,
     /// What the picture is decoded from: the proxy when there is one.
     sources: HashMap<Uuid, PathBuf>,
     /// The original files. Sound is read from the proxy in `sources` when it has a sound
@@ -64,37 +81,30 @@ impl Snapshot {
                 (*id, path)
             })
             .collect();
-        let audio = audible_tracks(&project.timeline)
-            .flat_map(|t| {
-                // For sound, the outgoing clip fades out while the incoming one fades in.
-                let leads = t.dissolve_leads();
-                let mut clips = t.clips.clone();
-                for lead in &leads {
-                    if let Some(out) = clips.iter_mut().find(|c| c.timeline_out == lead.timeline_out) {
-                        out.properties.fade_out_us = out.properties.fade_out_us.max(lead.duration_us());
-                    }
-                }
-                let mut strips = vec![(clips, t.volume)];
-                if !leads.is_empty() {
-                    strips.push((leads, t.volume));
-                }
-                strips
-            })
-            .collect();
+        let mut audio = Vec::new();
+        let mut ramps = HashMap::new();
+        for t in audible_tracks(&project.timeline) {
+            let built = tempo_export::audio_mix::audio_strips(t, &project.sources);
+            let mono = t.audio_type == tempo_timeline::types::AudioTrackType::Mono;
+            audio.extend(built.strips.into_iter().map(|strip| (strip, t.volume, mono)));
+            ramps.extend(built.ramps);
+        }
         let audio_sources = project.sources.iter().filter(|(_, s)| !s.is_missing).map(|(id, s)| (*id, s.path.clone())).collect();
-        // A cross dissolve is drawn as one more layer right above its track,
-        // holding the lead-ins of the clips that dissolve in.
+        // Per track: its clips, the handle footage of its dissolves as one more layer above
+        // it, then the solid colours of its dips. A colour decodes nothing.
         let mut tracks = Vec::new();
         for t in &video {
-            tracks.push(t.clips.clone());
-            let leads = t.dissolve_leads();
-            if !leads.is_empty() {
-                tracks.push(leads);
+            let layers = t.transition_layers(&project.sources);
+            tracks.push(VideoStrip::Clips(layers.clips));
+            if !layers.mix.is_empty() {
+                tracks.push(VideoStrip::Clips(layers.mix));
             }
+            tracks.extend(layers.color.into_iter().map(VideoStrip::Color));
         }
         Self {
             tracks,
             audio,
+            ramps,
             audio_sources,
             sources,
             duration_us: project
@@ -104,20 +114,21 @@ impl Snapshot {
                 .map(|t| t.duration_us())
                 .max()
                 .unwrap_or(0),
-            fps: project.fps,
+            fps: project.timeline_fps(),
         }
     }
 
     pub fn empty() -> Self {
-        Self { tracks: Vec::new(), audio: Vec::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, fps: RationalFps::default() }
+        Self { tracks: Vec::new(), audio: Vec::new(), ramps: HashMap::new(), sources: HashMap::new(), audio_sources: HashMap::new(), duration_us: 0, fps: RationalFps::default() }
     }
 
     /// A one-clip snapshot used to preview a Media Pool item.
     pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, fps: RationalFps, has_video: bool, has_audio: bool) -> Self {
         let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
         Self {
-            tracks: if has_video { vec![vec![clip(ClipType::Video)]] } else { Vec::new() },
-            audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0)] } else { Vec::new() },
+            tracks: if has_video { vec![VideoStrip::Clips(vec![clip(ClipType::Video)])] } else { Vec::new() },
+            audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0, false)] } else { Vec::new() },
+            ramps: HashMap::new(),
             audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
             duration_us,
@@ -332,10 +343,17 @@ impl Overload {
 
 impl Worker {
     fn new(rx: Receiver<Cmd>, shared: Arc<Shared>) -> Self {
-        let audio = AudioOutput::start().map(Arc::new);
-        if audio.is_none() {
-            tracing::warn!("no sound server found: playback will be silent");
-        }
+        // `TEMPO_NO_AUDIO=1` (automated tests) never opens a sound output.
+        let audio = if std::env::var("TEMPO_NO_AUDIO").as_deref() == Ok("1") {
+            tracing::info!("TEMPO_NO_AUDIO=1: no sound output");
+            None
+        } else {
+            let out = AudioOutput::start().map(Arc::new);
+            if out.is_none() {
+                tracing::warn!("no sound server found: playback will be silent");
+            }
+            out
+        };
         let (feeder, feed_rx) = unbounded();
         if let Some(out) = audio.clone() {
             let spawned = std::thread::Builder::new().name("tempo-audio-feed".into()).spawn(move || feed_audio(feed_rx, out));
@@ -614,33 +632,53 @@ impl Worker {
         let pos = self.pos_us;
         // What is under the playhead on each track, bottom first. Title clips need
         // no decoding; the viewer draws their text.
-        let wanted: Vec<(&Clip, i64)> = snap
+        enum Wanted<'a> {
+            Clip(&'a Clip, i64),
+            Color([f32; 3], f32),
+        }
+        let wanted: Vec<Wanted> = snap
             .tracks
             .iter()
-            .filter_map(|clips| clips.iter().find(|c| c.contains_point(pos)))
-            .filter(|c| c.properties.enabled)
-            .map(|c| (c, source_request_us(c, pos, snap.fps)))
+            .filter_map(|strip| match strip {
+                VideoStrip::Clips(clips) => clips
+                    .iter()
+                    .find(|c| c.contains_point(pos))
+                    .filter(|c| c.properties.enabled)
+                    .map(|c| Wanted::Clip(c, source_request_us(c, pos, snap.fps))),
+                VideoStrip::Color(layer) => Some(layer.opacity_at(pos)).filter(|o| *o > 0.0).map(|o| Wanted::Color(layer.color, o)),
+            })
             .collect();
 
         // Skip the work if this exact picture is already on screen. A title's key
-        // is its clip and how far through a fade it is.
+        // is its clip and how far through a fade it is; a colour's is its opacity.
         let key: Vec<(Uuid, i64)> = wanted
             .iter()
-            .map(|(c, offset)| match c.clip_type {
-                ClipType::Title => (c.id, (c.fade_factor(pos) * 1000.0) as i64),
-                _ => (c.source_id, *offset),
+            .map(|w| match w {
+                Wanted::Clip(c, _) if c.clip_type == ClipType::Title => (c.id, (c.fade_factor(pos) * 1000.0) as i64),
+                Wanted::Clip(c, offset) => (c.source_id, *offset),
+                Wanted::Color(color, opacity) => (Uuid::from_u128(color.iter().fold(0u128, |a, c| a << 8 | (c * 255.0) as u128) | 1 << 100), (opacity * 1000.0) as i64),
             })
             .collect();
-        if key == self.last_shown && self.exact {
+        // An empty picture is always published: after a timeline switch it must replace the old frame.
+        if !key.is_empty() && key == self.last_shown && self.exact {
             return;
         }
 
         let mut layers = Vec::with_capacity(wanted.len());
-        for (clip, offset) in wanted {
+        for w in wanted {
+            let (clip, offset) = match w {
+                Wanted::Clip(clip, offset) => (clip, offset),
+                Wanted::Color(color, opacity) => {
+                    let props = ClipProperties { opacity, ..ClipProperties::default() };
+                    layers.push(Layer { frame: None, title: None, solid: Some(color), props, blur: 0.0 });
+                    continue;
+                }
+            };
             let mut props = clip.properties.clone();
             props.opacity *= clip.fade_factor(pos);
+            let blur = clip.transition_blur(pos);
             if clip.clip_type == ClipType::Title {
-                layers.push(Layer { frame: None, title: clip.title_data.clone(), props });
+                layers.push(Layer { frame: None, title: clip.title_data.clone(), solid: None, props, blur });
                 continue;
             }
             let Some(path) = snap.sources.get(&clip.source_id) else { continue };
@@ -648,7 +686,7 @@ impl Worker {
             let Some(decoder) = self.decoder_for(clip.source_id, path) else { continue };
             let result = if exact { decoder.decode_video_frame(offset) } else { decoder.decode_keyframe(offset) };
             match result {
-                Ok(frame) => layers.push(Layer { frame: Some(frame), title: None, props }),
+                Ok(frame) => layers.push(Layer { frame: Some(frame), title: None, solid: None, props, blur }),
                 Err(e) => tracing::debug!("decode failed for {}: {e}", path.display()),
             }
         }
@@ -770,7 +808,7 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
         }
 
         mix.fill(0.0);
-        for (clips, track_volume) in &snapshot.audio {
+        for (clips, track_volume, mono) in &snapshot.audio {
             let Some(clip) = clips.iter().find(|c| c.contains_point(*pos_us)) else { continue };
             if clip.properties.muted || !clip.properties.enabled {
                 continue;
@@ -787,12 +825,13 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
                 reader.read(clip.source_offset_at(*pos_us), block);
                 stretch(block, &mut part);
             }
-            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us);
+            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us) * tempo_export::audio_mix::AudioStrips::gain(&snapshot.ramps, clip, *pos_us);
             let pan = clip.properties.pan.clamp(-1.0, 1.0);
             let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
             for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
-                m[0] += p[0] * left;
-                m[1] += p[1] * right;
+                let (l, r) = if *mono { let c = (p[0] + p[1]) * 0.5; (c, c) } else { (p[0], p[1]) };
+                m[0] += l * left;
+                m[1] += r * right;
             }
         }
         for sample in &mut mix {
@@ -853,6 +892,13 @@ mod tests {
     }
 
     const FRAME: Duration = Duration::from_millis(33);
+
+    #[test]
+    fn snapshot_steps_on_the_timelines_own_rate() {
+        let mut project = Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        project.timeline.fps = Some(RationalFps::FPS_25);
+        assert_eq!(Snapshot::from_project(&project, false).fps, RationalFps::FPS_25);
+    }
 
     #[test]
     fn overload_enters_after_three_consecutive_slow_frames() {

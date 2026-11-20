@@ -20,6 +20,21 @@
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
 >
+> **Updated 2026-11-19.** The schema is now **version 6**. Migration 6 adds `fps_num` and
+> `fps_den` to `timelines` (own frame rate when "Use Project Settings" was off, NULL = the
+> project's) and `enabled` to `transitions` (the Inspector's Video/Audio switch; 0 plays as
+> a cut). Marker colours 6-16 are Resolve's other colours (the column was already an integer).
+>
+> **Earlier on 2026-11-19.** The schema became **version 5**. Migration 5 adds `start_tc_us`,
+> `width` and `height` to `timelines` (Start Timecode; own size when "Use Project Settings"
+> was off, NULL = the project's), `audio_type` to `tracks` (0 mono, 1 stereo), `keyword` to
+> `markers`, and `start_ratio`, `end_ratio` and `curve` (JSON `[[place, value], ...]`) to
+> `transitions`.
+>
+> **Earlier on 2026-11-19.** The schema became **version 4**. Migration 4 adds `color` and
+> `ease` to `transitions` and kind 9 (Dip To Color); old cross dissolves load as
+> transitions (§9).
+>
 > **Updated 2026-10-21 (0.2.0 alpha).** The schema is now **version 2**. Migration 2 rebuilds
 > `clips` without the rule that source and timeline lengths are equal, because a retimed clip
 > (speed ≠ 1.0) covers `speed ×` its timeline length of source (§8, §15). New in this release:
@@ -89,7 +104,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **2**
+Current schema version: **6**
 
 ---
 
@@ -202,6 +217,20 @@ VALUES ('00000000-0000-0000-0000-000000000000', 'Master', NULL, 0);
 ---
 
 ## 7. Tracks
+
+A project holds one or more timelines (schema 3). Tracks and markers name their timeline;
+clips follow their track and transitions follow their clip. A file from before schema 3 has
+no `timelines` rows and NULL `timeline_id`s, and loads as one timeline named "Timeline 1".
+
+```sql
+CREATE TABLE timelines (
+    id      TEXT PRIMARY KEY,           -- UUID
+    name    TEXT NOT NULL,
+    is_open INTEGER NOT NULL DEFAULT 0  -- 1 for the timeline open when saved
+);
+ALTER TABLE tracks  ADD COLUMN timeline_id TEXT;   -- migration 3
+ALTER TABLE markers ADD COLUMN timeline_id TEXT;   -- migration 3
+```
 
 ```sql
 CREATE TABLE tracks (
@@ -350,20 +379,35 @@ The interface then points the user to the project's backups (§18).
 
 ## 9. Transitions
 
+A transition sits on one clip edge (at most one per edge) and loads into the track of its
+clip; a row whose clip is gone is dropped on load. On a cut between two clips it is stored on
+the incoming clip's In edge; at a clip head or tail with nothing touching, on that edge. The
+rules for where it lies and how it is drawn are in `crates/tempo-timeline/src/transition.rs`.
+
 ```sql
 CREATE TABLE transitions (
     id              TEXT PRIMARY KEY,    -- UUID
     clip_id         TEXT NOT NULL,       -- FK → clips(id)
     edge            INTEGER NOT NULL,    -- 0=in 1=out
-    kind            INTEGER NOT NULL,    -- 0=cut 1=cross_dissolve 2=dip_black 3=dip_white 4=fade_in 5=fade_out 6=plugin
-    duration_us     INTEGER NOT NULL,
+    kind            INTEGER NOT NULL,    -- 0=cut 1=cross_dissolve 2=dip_black 3=dip_white 4=fade_in
+                                         -- 5=fade_out 6=plugin 7=fade_from_white 8=fade_to_white
+                                         -- 9=dip_to_color 10=crossfade (audio) 11=additive_dissolve
+                                         -- 12=non_additive_dissolve 13=blur_dissolve
+    duration_us     INTEGER NOT NULL,    -- whole frames
     alignment       INTEGER NOT NULL,    -- 0=centered 1=start_at_cut 2=end_at_cut
     plugin_id       TEXT,                -- NULL unless kind=6
     plugin_params   TEXT DEFAULT '{}',  -- JSON, plugin-specific parameters
+    color           TEXT,                -- migration 4: '#rrggbb' for dip_to_color, NULL = black
+    ease            INTEGER NOT NULL DEFAULT 0,  -- migration 4: 0=none 1=in 2=out 3=in_out
 
     UNIQUE (clip_id, edge)
 );
 ```
+
+Files from before schema 4 kept a cross dissolve in the incoming clip's `properties` as
+`dissolve_in_us`. On load, each one whose clip has another clip ending at its start becomes a
+cross dissolve transition (a crossfade, kind 10, on audio tracks; edge In, end at cut, same
+length, limited to the footage before the clip's In point) and `dissolve_in_us` is set to 0; the next save stores the transition.
 
 ---
 
@@ -375,6 +419,8 @@ CREATE TABLE markers (
     position_us INTEGER NOT NULL,
     name        TEXT NOT NULL DEFAULT '',
     color       INTEGER NOT NULL DEFAULT 0,   -- 0=red 1=green 2=blue 3=yellow 4=orange 5=purple
+                                              -- 6=cyan 7=pink 8=fuchsia 9=rose 10=lavender 11=sky
+                                              -- 12=mint 13=lemon 14=sand 15=cocoa 16=cream
     duration_us INTEGER NOT NULL DEFAULT 0,   -- 0=point marker
     note        TEXT NOT NULL DEFAULT ''
 );
@@ -510,6 +556,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "Clip speed: source and timeline lengths may differ",
         sql: include_str!("migrations/002_clip_speed.sql"),
+    },
+    Migration {
+        version: 3,
+        description: "Several timelines per project",
+        sql: include_str!("migrations/003_timelines.sql"),
     },
 ];
 ```

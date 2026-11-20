@@ -21,6 +21,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run --bin tempo
 cargo run --bin tempo -- --smoke-test        # start, then quit
 # Scripted checks: see TEMPO_ACTIONS in crates/tempo-ui/src/app.rs
+scripts/e2e.sh                               # real app on a private headless Wayland (mutter); see docs/TESTING_E2E.md
 ```
 
 ## Code Conventions

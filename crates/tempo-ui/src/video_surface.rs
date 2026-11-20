@@ -7,8 +7,8 @@ use glib::subclass::prelude::*;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
-use gtk4::{gdk, graphene, pango};
-use tempo_timeline::{ClipProperties, TitleData, TitleType};
+use gtk4::{gdk, graphene, gsk, pango};
+use tempo_timeline::{ClipProperties, PictureBlend, TitleData, TitleType};
 
 use crate::player::Layer;
 
@@ -16,7 +16,158 @@ use crate::player::Layer;
 struct Drawn {
     texture: Option<gdk::Texture>,
     title: Option<TitleData>,
+    solid: Option<[f32; 3]>,
     props: ClipProperties,
+    /// A Blur Dissolve's blur, in pixels of a 1080-line picture.
+    blur: f32,
+}
+
+/// Where the picture goes on the widget.
+struct Frame<'a> {
+    widget: &'a VideoSurface,
+    x0: f32,
+    y0: f32,
+    fw: f32,
+    fh: f32,
+    /// Screen pixels per project pixel.
+    scale: f32,
+    rect: graphene::Rect,
+}
+
+/// Draws `layers` over black, bottom first. A layer with a blend mode is blended onto
+/// everything under it, as FFmpeg's `blend` does in the export.
+fn draw_stack(snapshot: &gtk::Snapshot, layers: &[Drawn], frame: &Frame) {
+    let Some((top, under)) = layers.split_last() else {
+        snapshot.append_color(&gdk::RGBA::BLACK, &frame.rect);
+        return;
+    };
+    match gsk_blend(top.props.blend) {
+        Some(mode) => {
+            // The first child is the bottom picture, the second the one blended onto it.
+            snapshot.push_blend(mode);
+            draw_stack(snapshot, under, frame);
+            snapshot.pop();
+            draw_layer(snapshot, top, frame);
+            snapshot.pop();
+        }
+        None => {
+            draw_stack(snapshot, under, frame);
+            draw_layer(snapshot, top, frame);
+        }
+    }
+}
+
+/// The GTK blend mode for a picture blend, the same as the export's FFmpeg `blend` mode;
+/// `None` draws the picture over the ones under it.
+fn gsk_blend(blend: PictureBlend) -> Option<gsk::BlendMode> {
+    match blend {
+        PictureBlend::Normal => None,
+        PictureBlend::Screen => Some(gsk::BlendMode::Screen),
+        PictureBlend::Lighten => Some(gsk::BlendMode::Lighten),
+    }
+}
+
+/// Draws `texture` over `rect` with its edge pixels repeated `margin` past every side, which
+/// is how FFmpeg's gblur sees past a picture's edges: blurred, the edges keep their colour
+/// instead of fading to transparent. Each border is the texture stretched so that only its
+/// edge row or column lands there; the GPU draws it from the same texture, with no copy.
+fn append_edge_extended(snapshot: &gtk::Snapshot, texture: &gdk::Texture, rect: &graphene::Rect, margin: f32) {
+    let (tw, th) = (texture.width() as f32, texture.height() as f32);
+    // Per axis, the three bands: (band start, band length, texture start, texture length).
+    let bands = |pos: f32, len: f32, texels: f32| {
+        [
+            (pos - margin, margin, pos - margin, margin * texels),
+            (pos, len, pos, len),
+            (pos + len, margin, pos + len + margin - margin * texels, margin * texels),
+        ]
+    };
+    for (bx, bw, px, pw) in bands(rect.x(), rect.width(), tw) {
+        for (by, bh, py, ph) in bands(rect.y(), rect.height(), th) {
+            snapshot.push_clip(&graphene::Rect::new(bx, by, bw, bh));
+            snapshot.append_texture(texture, &graphene::Rect::new(px, py, pw, ph));
+            snapshot.pop();
+        }
+    }
+}
+
+fn draw_layer(snapshot: &gtk::Snapshot, layer: &Drawn, frame: &Frame) {
+    let Frame { widget, x0, y0, fw, fh, scale, .. } = *frame;
+    let props = &layer.props;
+    snapshot.save();
+    // Everything is placed relative to the centre of the frame.
+    snapshot.translate(&graphene::Point::new(x0 + fw / 2.0 + props.position_x * scale, y0 + fh / 2.0 + props.position_y * scale));
+    snapshot.rotate(props.rotation);
+    snapshot.scale(props.scale_x, props.scale_y);
+    let opaque = props.opacity >= 0.999;
+    if !opaque {
+        snapshot.push_opacity(props.opacity.clamp(0.0, 1.0) as f64);
+    }
+    if let Some(texture) = &layer.texture {
+        let (tw, th) = (texture.width() as f32, texture.height() as f32);
+        if tw > 0.0 && th > 0.0 {
+            let fit = (fw / tw).min(fh / th);
+            let (dw, dh) = (tw * fit, th * fit);
+            let picture = graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh);
+            // A Blur Dissolve's blur, then the clip's filters (a blur and a colour transform),
+            // done by the GPU in the same order and sizes as the export.
+            let dissolve_blur = tempo_timeline::blur_radius_px(layer.blur, fh);
+            let fx = tempo_timeline::resolve_effects(&props.effects);
+            let blur = tempo_timeline::blur_radius_px(fx.blur, fh);
+            let blurred = dissolve_blur > 0.05 || blur > 0.05;
+            if blurred {
+                // As FFmpeg's gblur: the blur stays inside the picture.
+                snapshot.push_clip(&picture);
+            }
+            if dissolve_blur > 0.05 {
+                snapshot.push_blur(dissolve_blur as f64);
+            }
+            if blur > 0.05 {
+                snapshot.push_blur(blur as f64);
+            }
+            let tinted = !fx.color.is_identity();
+            if tinted {
+                // graphene multiplies a row vector by the matrix, so the rows
+                // of our transform become its columns.
+                let m = &fx.color.matrix;
+                let mut flat = [0.0f32; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        flat[c * 4 + r] = m[r][c];
+                    }
+                }
+                let o = &fx.color.offset;
+                snapshot.push_color_matrix(&graphene::Matrix::from_float(flat), &graphene::Vec4::new(o[0], o[1], o[2], o[3]));
+            }
+            if blurred {
+                // GTK's blur reaches about 1.5 radii (sigma is half the radius).
+                append_edge_extended(snapshot, texture, &picture, 1.5 * (dissolve_blur + blur) + 1.0);
+            } else {
+                snapshot.append_texture(texture, &picture);
+            }
+            if tinted {
+                snapshot.pop();
+            }
+            if blur > 0.05 {
+                snapshot.pop();
+            }
+            if dissolve_blur > 0.05 {
+                snapshot.pop();
+            }
+            if blurred {
+                snapshot.pop();
+            }
+        }
+    }
+    if let Some([r, g, b]) = layer.solid {
+        snapshot.append_color(&gdk::RGBA::new(r, g, b, 1.0), &graphene::Rect::new(-fw / 2.0, -fh / 2.0, fw, fh));
+    }
+    if let Some(title) = &layer.title {
+        draw_title(widget, snapshot, title, scale, fh);
+    }
+    if !opaque {
+        snapshot.pop();
+    }
+    snapshot.restore();
 }
 
 mod imp {
@@ -51,64 +202,9 @@ mod imp {
             let (x0, y0) = ((w - fw) / 2.0, (h - fh) / 2.0);
             let frame_rect = graphene::Rect::new(x0, y0, fw, fh);
 
-            snapshot.append_color(&gdk::RGBA::BLACK, &frame_rect);
+            let frame = Frame { widget: &widget, x0, y0, fw, fh, scale, rect: frame_rect };
             snapshot.push_clip(&frame_rect);
-            for layer in self.layers.borrow().iter() {
-                let props = &layer.props;
-                snapshot.save();
-                // Everything is placed relative to the centre of the frame.
-                snapshot.translate(&graphene::Point::new(
-                    x0 + fw / 2.0 + props.position_x * scale,
-                    y0 + fh / 2.0 + props.position_y * scale,
-                ));
-                snapshot.rotate(props.rotation);
-                snapshot.scale(props.scale_x, props.scale_y);
-                let opaque = props.opacity >= 0.999;
-                if !opaque {
-                    snapshot.push_opacity(props.opacity.clamp(0.0, 1.0) as f64);
-                }
-                if let Some(texture) = &layer.texture {
-                    let (tw, th) = (texture.width() as f32, texture.height() as f32);
-                    if tw > 0.0 && th > 0.0 {
-                        let fit = (fw / tw).min(fh / th);
-                        let (dw, dh) = (tw * fit, th * fit);
-                        // The clip's filters: a blur and a colour transform, done by the GPU.
-                        let fx = tempo_timeline::resolve_effects(&props.effects);
-                        let blur = fx.blur * fh / 1080.0;
-                        if blur > 0.05 {
-                            snapshot.push_blur(blur as f64);
-                        }
-                        let tinted = !fx.color.is_identity();
-                        if tinted {
-                            // graphene multiplies a row vector by the matrix, so the rows
-                            // of our transform become its columns.
-                            let m = &fx.color.matrix;
-                            let mut flat = [0.0f32; 16];
-                            for r in 0..4 {
-                                for c in 0..4 {
-                                    flat[c * 4 + r] = m[r][c];
-                                }
-                            }
-                            let o = &fx.color.offset;
-                            snapshot.push_color_matrix(&graphene::Matrix::from_float(flat), &graphene::Vec4::new(o[0], o[1], o[2], o[3]));
-                        }
-                        snapshot.append_texture(texture, &graphene::Rect::new(-dw / 2.0, -dh / 2.0, dw, dh));
-                        if tinted {
-                            snapshot.pop();
-                        }
-                        if blur > 0.05 {
-                            snapshot.pop();
-                        }
-                    }
-                }
-                if let Some(title) = &layer.title {
-                    super::draw_title(&widget, snapshot, title, scale, fh);
-                }
-                if !opaque {
-                    snapshot.pop();
-                }
-                snapshot.restore();
-            }
+            draw_stack(snapshot, &self.layers.borrow(), &frame);
             snapshot.pop();
         }
     }
@@ -181,7 +277,7 @@ impl VideoSurface {
                     let bytes = glib::Bytes::from_owned(SharedPixels(frame.data));
                     gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::R8g8b8a8, &bytes, stride).upcast::<gdk::Texture>()
                 });
-                Drawn { texture, title: l.title, props: l.props }
+                Drawn { texture, title: l.title, solid: l.solid, props: l.props, blur: l.blur }
             })
             .collect();
         *self.imp().layers.borrow_mut() = drawn;
@@ -195,5 +291,21 @@ struct SharedPixels(std::sync::Arc<Vec<u8>>);
 impl AsRef<[u8]> for SharedPixels {
     fn as_ref(&self) -> &[u8] {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn additive_screens_and_non_additive_lightens_as_in_the_export() {
+        use tempo_timeline::{Transition, TransitionAlignment, TransitionEdge, TransitionKind};
+        // Arrange
+        let mode = |kind| gsk_blend(Transition::new(uuid::Uuid::nil(), TransitionEdge::In, kind, 1, TransitionAlignment::Centered).blend());
+        // Act / Assert: the modes of the export's `blend` filter (screen, lighten).
+        assert_eq!(mode(TransitionKind::AdditiveDissolve), Some(gsk::BlendMode::Screen));
+        assert_eq!(mode(TransitionKind::NonAdditiveDissolve), Some(gsk::BlendMode::Lighten));
+        assert_eq!(mode(TransitionKind::CrossDissolve), None);
     }
 }

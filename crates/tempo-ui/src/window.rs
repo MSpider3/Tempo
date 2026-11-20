@@ -30,7 +30,7 @@ const AUTOSAVE_CHECK_SECONDS: u32 = 30;
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
-    state: Rc<AppState>,
+    pub(crate) state: Rc<AppState>,
     root: gtk::Stack,
     toasts: adw::ToastOverlay,
     project_view: adw::ToolbarView,
@@ -38,7 +38,7 @@ pub struct MainWindow {
     viewer: Rc<Viewer>,
     /// The second viewer of dual-viewer mode, made the first time it is switched on.
     source_viewer: std::cell::RefCell<Option<Rc<Viewer>>>,
-    edit: Rc<EditPage>,
+    pub(crate) edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
     plugins: Rc<Plugins>,
@@ -354,12 +354,16 @@ impl MainWindow {
         let w = self.clone();
         self.window.connect_close_request(move |_| w.on_close_request());
 
-        // Escape leaves the full-screen viewer.
+        // Escape leaves the full-screen viewer, else lets go of a selected transition or edit point.
         let keys = gtk::EventControllerKey::new();
         let w = self.clone();
         keys.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape && w.cinema.get() {
                 w.set_cinema(false);
+                return glib::Propagation::Stop;
+            }
+            if key == gtk::gdk::Key::Escape && w.state.edit_selection.get().is_some() {
+                w.state.select_edit(None);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -811,11 +815,14 @@ impl MainWindow {
     /// `click:SECONDS,TRACK[,ctrl]` · `drag:SECONDS,TRACK,TO_SECONDS[,TO_TRACK]` ·
     /// `trim:EDGE_SECONDS,TRACK,DELTA_SECONDS[,shift]` · `title:center|lower` ·
     /// `fade:in|out,SECONDS` · `panel:effects|inspector` · `menu:SECONDS,TRACK` ·
-    /// `poolmenu:INDEX` · `pick:inspector|quick|effects` · `dump`
+    /// `poolmenu:INDEX` · `pick:inspector|quick|effects` · `edit:SECONDS,TRACK` (click a
+    /// clip edge below the transition boxes) · `droptransition:KIND,SECONDS,TRACK` · `dump`.
+    /// A `click` or `drag` in the middle of a row hits a transition box there.
     pub fn run_script_step(self: &Rc<Self>, step: &str) {
         use gtk::gdk::ModifierType;
         let canvas = &self.edit.timeline.canvas;
         if step == "dump" {
+            let selected_transition = actions::selected_transition(&self.state);
             let text = self
                 .state
                 .with_timeline(|t| {
@@ -836,9 +843,27 @@ impl MainWindow {
                                 format!("{sel}{}{off}{fades}[{:.2}-{:.2}]", c.name, c.timeline_in as f64 / 1e6, c.timeline_out as f64 / 1e6)
                             })
                             .collect();
+                        // Transitions: kind, alignment and span, `*` when selected.
+                        let transitions: Vec<String> = track
+                            .transitions
+                            .iter()
+                            .filter_map(|tr| {
+                                let (a, b) = track.transition_span(tr)?;
+                                let sel = selected_transition.as_ref().is_some_and(|(id, s)| *id == track.id && s.id == tr.id);
+                                Some(format!("{}{:?}/{:?}[{:.2}-{:.2}]", if sel { "*" } else { "" }, tr.kind, tr.alignment, a as f64 / 1e6, b as f64 / 1e6))
+                            })
+                            .collect();
                         let kind = if row.kind == tempo_timeline::TrackKind::Video { "V" } else { "A" };
-                        lines.push(format!("{kind}{}: {}", row.index, clips.join(" ")));
+                        let transitions = if transitions.is_empty() { String::new() } else { format!(" transitions: {}", transitions.join(" ")) };
+                        lines.push(format!("{kind}{}: {}{transitions}", row.index, clips.join(" ")));
+                        if let Some(crate::state::EditSelection::Edit { track_id, position_us }) = self.state.edit_selection.get() {
+                            if track_id == track.id {
+                                lines.push(format!("edit: {kind}{} {:.2}", row.index, position_us as f64 / 1e6));
+                            }
+                        }
                     }
+                    let copied = self.state.transition_clipboard.borrow().as_ref().map(|t| format!("{:?} {:.2}", t.kind, t.duration_us as f64 / 1e6));
+                    lines.push(format!("copied: {}", copied.unwrap_or_default()));
                     lines.push(format!("markers: {}", t.markers.iter().map(|m| format!("{:.2}", m.position_us as f64 / 1e6)).collect::<Vec<_>>().join(" ")));
                     lines.join(" | ")
                 })
@@ -865,6 +890,12 @@ impl MainWindow {
                 Some("blade") => Tool::Blade,
                 _ => Tool::Select,
             }),
+            // Click a clip edge low in the row, outside any transition box: selects the edit point.
+            "edit" => {
+                if let Some(p) = num(0).and_then(|s| canvas.bottom_point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
+                    canvas.simulate_drag(p, p, ModifierType::empty());
+                }
+            }
             "click" => {
                 if let Some(p) = num(0).and_then(|s| canvas.point_for(s, parts.get(1).copied().unwrap_or("V1"))) {
                     let mods = if parts.get(2) == Some(&"ctrl") { ModifierType::CONTROL_MASK } else { ModifierType::empty() };
@@ -945,7 +976,7 @@ impl MainWindow {
                     .flatten()
                 });
                 if let (Some(source), Some(at)) = (source, num(1)) {
-                    actions::place_source(&self.state, source, Place::Overwrite, Some((at * 1e6) as i64), track);
+                    actions::place_source(&self.state, source, Place::Overwrite, Some((at * 1e6) as i64), track, true);
                 }
             }
             // Open the nth Media Pool clip in the viewer, as a double click would.
@@ -963,7 +994,13 @@ impl MainWindow {
                 }
             }
             "title" => actions::add_title(&self.state, parts.first() == Some(&"lower")),
-            "dissolve" => actions::cross_dissolve(&self.state, num(0).unwrap_or(0.5)),
+            // Drop a transition from the Effects panel at a time on a track, as the mouse would.
+            "droptransition" => {
+                if let Some((x, y)) = num(1).and_then(|s| canvas.point_for(s, parts.get(2).copied().unwrap_or("V1"))) {
+                    let placed = canvas.drop_transition(parts.first().copied().unwrap_or("cross-dissolve"), x, y);
+                    tracing::info!("droptransition {args}: placed={placed}");
+                }
+            }
             "fade" => actions::set_fade(&self.state, parts.first() == Some(&"in"), num(1).unwrap_or(0.5)),
             "panel" => match parts.first().copied() {
                 Some("effects") => self.panel_buttons[1].set_active(true),
@@ -1113,12 +1150,14 @@ impl MainWindow {
                 }
             }
 
+            "win.new-timeline" => dialogs::new_timeline(&self.window, state),
+
             // Markers
             "win.marker-add" => {
-                actions::add_marker(state);
+                actions::add_marker(state, false);
             }
             "win.marker-add-modify" => {
-                if let Some(m) = actions::add_marker(state) {
+                if let Some(m) = actions::add_marker(state, true) {
                     dialogs::edit_marker(&self.window, state, m);
                 }
             }
@@ -1185,9 +1224,25 @@ impl MainWindow {
             "win.edit-place-on-top" => actions::place_current(state, Place::OnTop),
             "win.edit-append" => actions::place_current(state, Place::Append),
             "win.clip-enable-toggle" => actions::toggle_enabled(state),
-            "win.copy" => actions::copy_selected(state, false),
-            "win.cut" => actions::copy_selected(state, true),
-            "win.paste" => actions::paste(state),
+            // With a transition selected, Ctrl+C / Ctrl+X take only the transition, and
+            // with an edit point selected Ctrl+V puts the copied transition there (Resolve).
+            "win.copy" => {
+                if !actions::copy_transition(state) {
+                    actions::copy_selected(state, false);
+                }
+            }
+            "win.cut" => {
+                if actions::copy_transition(state) {
+                    actions::delete_transition(state);
+                } else {
+                    actions::copy_selected(state, true);
+                }
+            }
+            "win.paste" => {
+                if !actions::paste_transition(state) {
+                    actions::paste(state);
+                }
+            }
             "win.edit-replace" => actions::replace_selected(state),
             "win.select-all" => state.select_all(),
             "win.deselect-all" => state.select(None),
@@ -1196,12 +1251,17 @@ impl MainWindow {
                 state.linked_selection.set(!state.linked_selection.get());
                 state.emit(Change::Options);
             }
-            "win.transition-add" => actions::cross_dissolve(state, 0.5),
+            "win.transition-add" => actions::add_standard_transitions(state, true, true),
+            "win.transition-add-video" => actions::add_standard_transitions(state, true, false),
+            "win.transition-add-audio" => actions::add_standard_transitions(state, false, true),
+            "win.transition-duration" => self.change_transition_duration(),
             "win.clip-speed" => dialogs::change_clip_speed(&self.window, state),
-            "win.fade-in" => actions::set_fade(state, true, 0.5),
-            "win.fade-out" => actions::set_fade(state, false, 0.5),
+            "win.fade-in" => actions::set_fade(state, true, actions::STANDARD_TRANSITION_S),
+            "win.fade-out" => actions::set_fade(state, false, actions::STANDARD_TRANSITION_S),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
+            // A selected transition is deleted alone, whichever delete key was pressed.
+            "win.delete" | "win.ripple-delete" if actions::delete_transition(state) => {}
             "win.delete" => actions::delete_selected(state, false),
             "win.ripple-delete" => actions::delete_selected(state, true),
             "win.trim-start" => actions::trim_to_playhead(state, TrimEdge::In, false),
@@ -1252,6 +1312,38 @@ impl MainWindow {
             }
             other => tracing::debug!("no handler for action {other}"),
         }
+    }
+
+    /// The transition right-click menu's "Change Transition Duration…": its length in frames.
+    fn change_transition_duration(&self) {
+        let state = &self.state;
+        let Some((track, t)) = actions::selected_transition(state) else { return };
+        let Some(fps) = state.with_project(|p| p.timeline_fps()) else { return };
+        let frames = gtk::SpinButton::with_range(1.0, 100_000.0, 1.0);
+        frames.set_value(tempo_timeline::us_to_frame(t.duration_us, fps) as f64);
+        frames.set_activates_default(true);
+        let seconds = label("", &["tempo-dim"]);
+        seconds.set_xalign(0.0);
+        let show_seconds = {
+            let seconds = seconds.clone();
+            move |f: f64| seconds.set_text(&format!("{:.2} seconds", tempo_timeline::frame_to_us(f as i64, fps) as f64 / 1e6))
+        };
+        show_seconds(frames.value());
+        frames.connect_value_changed(move |b| show_seconds(b.value()));
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        column.append(&frames);
+        column.append(&seconds);
+        let dialog = adw::AlertDialog::builder().heading("Change Transition Duration").body("Length in frames").extra_child(&column).build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("change", "Change")]);
+        dialog.set_response_appearance("change", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("change"));
+        dialog.set_close_response("cancel");
+        let state = state.clone();
+        dialog.connect_response(Some("change"), move |_, _| {
+            let length = tempo_timeline::frame_to_us(frames.value() as i64, fps);
+            actions::set_transition_length(&state, track, t.clip_id, t.edge, length);
+        });
+        dialog.present(Some(&self.window));
     }
 
     fn set_tool(&self, tool: Tool) {

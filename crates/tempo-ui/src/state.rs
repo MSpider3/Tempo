@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use tempo_timeline::{Clip, Command, CommandLog, Project, Timeline, TrackKind};
+use tempo_timeline::{Clip, Command, CommandLog, Project, Timeline, TrackKind, Transition, TransitionEdge};
 use uuid::Uuid;
 
 use crate::player::{Player, Snapshot};
@@ -18,6 +18,8 @@ pub enum Change {
     Timeline,
     /// The Media Pool changed.
     Media,
+    /// Timelines were renamed, duplicated or removed (Media Pool, viewer menu).
+    Timelines,
     /// A different clip (or nothing) is selected.
     Selection,
     /// Tool, snapping, destination tracks, In/Out marks.
@@ -48,10 +50,32 @@ pub struct Gap {
     pub end: i64,
 }
 
+/// What `AppState::edit_selection` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditSelection {
+    /// The transition stored on `clip_id`'s `edge` (see `Track::transition_at_edit`).
+    Transition { track_id: Uuid, clip_id: Uuid, edge: TransitionEdge },
+    /// The edit point at `position_us` on a track: a cut, or a clip's head or tail
+    /// (see `Track::edit_at`). Up/Down move it along with the playhead.
+    Edit { track_id: Uuid, position_us: i64 },
+}
+
+impl EditSelection {
+    /// Whether the transition or edit point is still on the timeline.
+    pub fn exists_in(&self, t: &Timeline) -> bool {
+        match *self {
+            Self::Transition { track_id, clip_id, edge } => t.find_track(track_id).is_some_and(|tr| tr.transition_at_edit(clip_id, edge).is_some()),
+            Self::Edit { track_id, position_us } => t.find_track(track_id).is_some_and(|tr| tr.edit_at(position_us).is_some()),
+        }
+    }
+}
+
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
     pub path: RefCell<Option<PathBuf>>,
     log: RefCell<CommandLog>,
+    /// The undo history of each timeline that is not open, so each keeps its own.
+    parked_logs: RefCell<std::collections::HashMap<Uuid, CommandLog>>,
     /// The clip the Inspector shows: the one clicked last.
     pub selection: Cell<Option<Uuid>>,
     /// Other clips selected with it (Ctrl+click, linked partners, Select All).
@@ -82,6 +106,12 @@ pub struct AppState {
     pub clipboard: RefCell<Vec<Clip>>,
     /// The selected gap, if a gap rather than a clip is selected.
     pub gap: Cell<Option<Gap>>,
+    /// A transition (Resolve's red outline) or an edit point (green bracket) selected
+    /// instead of clips. Selecting clips or a gap clears it, and selecting it clears them.
+    pub edit_selection: Cell<Option<EditSelection>>,
+    /// The transition last copied (Ctrl+C with a transition selected); Ctrl+V puts it on
+    /// the selected edit point. Kept apart from the clip clipboard, as in Resolve.
+    pub transition_clipboard: RefCell<Option<Transition>>,
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
@@ -105,6 +135,7 @@ impl AppState {
             project: RefCell::new(None),
             path: RefCell::new(None),
             log: RefCell::new(CommandLog::new()),
+            parked_logs: RefCell::new(Default::default()),
             selection: Cell::new(None),
             extra_selection: RefCell::new(Vec::new()),
             tool: Cell::new(Tool::Select),
@@ -123,6 +154,8 @@ impl AppState {
             media_selection: Cell::new(None),
             clipboard: RefCell::new(Vec::new()),
             gap: Cell::new(None),
+            edit_selection: Cell::new(None),
+            transition_clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
             filters: RefCell::new(Vec::new()),
@@ -183,12 +216,12 @@ impl AppState {
     /// of the next frame counts as that frame, so positions stored to the
     /// microsecond never read one frame low.
     fn frame_index(&self, us: i64) -> i128 {
-        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        let (num, den) = self.with_project(|p| (p.timeline_fps().num.max(1) as i128, p.timeline_fps().den.max(1) as i128)).unwrap_or((30, 1));
         (us.max(0) as i128 * num * 10 + den * 1_000_000) / (den * 10_000_000)
     }
 
     fn frame_start(&self, frame: i128) -> i64 {
-        let (num, den) = self.with_project(|p| (p.fps.num.max(1) as i128, p.fps.den.max(1) as i128)).unwrap_or((30, 1));
+        let (num, den) = self.with_project(|p| (p.timeline_fps().num.max(1) as i128, p.timeline_fps().den.max(1) as i128)).unwrap_or((30, 1));
         ((frame.max(0) * den * 1_000_000 + num / 2) / num) as i64
     }
 
@@ -204,11 +237,31 @@ impl AppState {
     }
 
     pub fn frame_us(&self) -> i64 {
-        self.with_project(|p| p.fps.frame_duration_us()).unwrap_or(33_333).max(1)
+        self.with_project(|p| p.timeline_fps().frame_duration_us()).unwrap_or(33_333).max(1)
     }
 
     pub fn fps(&self) -> f64 {
-        self.with_project(|p| p.fps.to_f64()).unwrap_or(30.0)
+        self.with_project(|p| p.timeline_fps().to_f64()).unwrap_or(30.0)
+    }
+
+    /// The timecode a timeline position reads as: moved by the timeline's Start Timecode.
+    /// Use `timecode` for lengths, which the Start Timecode does not move.
+    pub fn position_tc(&self, us: i64) -> String {
+        timecode(us + self.start_tc_us(), self.fps())
+    }
+
+    /// The open timeline's Start Timecode, 0 with no project. Subtract it from a typed timecode.
+    pub fn start_tc_us(&self) -> i64 {
+        self.with_project(|p| p.timeline.start_tc_us).unwrap_or(0)
+    }
+
+    /// Length of a new transition: the user's "Set as Default Duration", 1 s until set.
+    pub fn standard_transition_us(&self) -> i64 {
+        // A hand-edited settings file can hold anything; outside a frame..an hour means unset.
+        match self.settings.borrow().transition_us {
+            us if (1..=3_600_000_000).contains(&us) => us,
+            _ => tempo_timeline::STANDARD_TRANSITION_US,
+        }
     }
 
     pub fn set_project(&self, project: Option<Project>, path: Option<PathBuf>) {
@@ -217,9 +270,11 @@ impl AppState {
         *self.project.borrow_mut() = project;
         *self.path.borrow_mut() = path;
         self.log.borrow_mut().clear();
+        self.parked_logs.borrow_mut().clear();
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
         self.gap.set(None);
+        self.edit_selection.set(None);
         self.clipboard.borrow_mut().clear();
         self.source_clip.set(None);
         self.waveforms.borrow_mut().clear();
@@ -234,6 +289,82 @@ impl AppState {
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Project);
+    }
+
+    /// Opens timeline `id`, as Resolve's timeline menu above the viewer does.
+    pub fn open_timeline(&self, id: Uuid) {
+        let from = self.with_timeline(|t| t.id);
+        if from != Some(id) && self.project.borrow_mut().as_mut().is_some_and(|p| p.open_timeline(id)) {
+            self.switched_timeline(from);
+            // The file records which timeline is open, as Resolve reopens the last one.
+            self.set_dirty(true);
+        }
+    }
+
+    /// Adds `timeline` to the project and opens it (Create New Timeline).
+    pub fn add_timeline(&self, timeline: Timeline) {
+        let from = self.with_timeline(|t| t.id);
+        if self.project.borrow_mut().as_mut().map(|p| p.add_timeline(timeline)).is_none() {
+            return;
+        }
+        self.switched_timeline(from);
+        self.set_dirty(true);
+        // The Media Pool lists timelines too.
+        self.emit(Change::Timelines);
+    }
+
+    /// Renames timeline `id`; false when the name is blank or taken.
+    pub fn rename_timeline(&self, id: Uuid, name: &str) -> bool {
+        let done = self.project.borrow_mut().as_mut().is_some_and(|p| p.rename_timeline(id, name));
+        if done {
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        done
+    }
+
+    /// Copies timeline `id` as "<name> Copy" without opening it.
+    pub fn duplicate_timeline(&self, id: Uuid) -> Option<Uuid> {
+        let copy = self.project.borrow_mut().as_mut().and_then(|p| p.duplicate_timeline(id));
+        if copy.is_some() {
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        copy
+    }
+
+    /// Deletes timeline `id` (never the open one) and its parked undo history.
+    pub fn remove_timeline(&self, id: Uuid) -> bool {
+        let done = self.project.borrow_mut().as_mut().is_some_and(|p| p.remove_timeline(id));
+        if done {
+            self.parked_logs.borrow_mut().remove(&id);
+            self.set_dirty(true);
+            self.emit(Change::Timelines);
+        }
+        done
+    }
+
+    /// After another timeline was opened: swap undo histories and start it from the top.
+    fn switched_timeline(&self, from: Option<Uuid>) {
+        self.player.pause();
+        let to = self.with_timeline(|t| t.id);
+        let log = to.and_then(|id| self.parked_logs.borrow_mut().remove(&id)).unwrap_or_default();
+        let old = self.log.replace(log);
+        if let Some(from) = from {
+            self.parked_logs.borrow_mut().insert(from, old);
+        }
+        self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
+        self.gap.set(None);
+        self.edit_selection.set(None);
+        self.mark_in.set(None);
+        self.mark_out.set(None);
+        self.dest_video.set(1);
+        self.dest_audio.set(1);
+        self.sync_player();
+        self.player.seek(0, true);
+        self.emit(Change::Timeline);
+        self.emit(Change::Selection);
     }
 
     /// Hand the playback worker a fresh copy of the timeline.
@@ -252,6 +383,12 @@ impl AppState {
         let before = self.selected_ids();
         // An edit may have filled or moved the gap, so it is not kept.
         let had_gap = self.gap.take().is_some();
+        // Nor a transition or edit point that is gone.
+        let edit_gone = self.edit_selection.get().is_some_and(|sel| !self.with_timeline(|t| sel.exists_in(t)).unwrap_or(false));
+        if edit_gone {
+            self.edit_selection.set(None);
+        }
+        let had_gap = had_gap || edit_gone;
         self.extra_selection.borrow_mut().retain(|id| !gone(id));
         if self.selection.get().is_some_and(|id| gone(&id)) {
             let next = self.extra_selection.borrow_mut().pop();
@@ -373,7 +510,7 @@ impl AppState {
     /// Select one clip (and what is linked to it), or nothing.
     pub fn select(&self, clip: Option<Uuid>) {
         let before = self.selected_ids();
-        let had_gap = self.gap.take().is_some();
+        let had_gap = self.gap.take().is_some() | self.edit_selection.take().is_some();
         self.selection.set(clip);
         *self.extra_selection.borrow_mut() = clip.map(|id| self.linked_to(id)).unwrap_or_default();
         if had_gap || before != self.selected_ids() {
@@ -385,7 +522,17 @@ impl AppState {
     pub fn select_gap(&self, gap: Gap) {
         self.selection.set(None);
         self.extra_selection.borrow_mut().clear();
+        self.edit_selection.set(None);
         self.gap.set(Some(gap));
+        self.emit(Change::Selection);
+    }
+
+    /// Select a transition or an edit point (or nothing) in place of clips and gaps.
+    pub fn select_edit(&self, edit: Option<EditSelection>) {
+        self.selection.set(None);
+        self.extra_selection.borrow_mut().clear();
+        self.gap.set(None);
+        self.edit_selection.set(edit);
         self.emit(Change::Selection);
     }
 
@@ -480,7 +627,19 @@ pub fn timecode(us: i64, fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::timecode;
+    use super::*;
+
+    #[test]
+    fn frame_helpers_follow_the_timelines_own_rate() {
+        let state = AppState::new();
+        let mut project = Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30);
+        project.timeline.fps = Some(tempo_timeline::RationalFps::FPS_25);
+        *state.project.borrow_mut() = Some(project);
+        assert_eq!(state.frame_us(), 40_000);
+        assert_eq!(state.fps(), 25.0);
+        assert_eq!(state.frame_step(0, 25), 1_000_000);
+        assert_eq!(state.frame_floor(1_030_000), 1_000_000);
+    }
 
     #[test]
     fn timecode_uses_project_rate() {

@@ -49,7 +49,7 @@ The file was exported on a system where it notes `Ctrl` may mean Command (macOS)
 | `Alt+L` | Play again | `win.play-again` | `controlPlayAgain` |
 | `→` / `←` | One frame forward / back | `win.step-forward` / `win.step-reverse` | `controlStepForward` / `controlStepReverse` |
 | `Shift+→` / `Shift+←` | One second forward / back | `win.large-step-forward` / `win.large-step-reverse` | `controlLargeStepForward` / `…Reverse` |
-| `↓` / `↑` | Next / previous clip (edit point) | `win.clip-next` / `win.clip-prev` | `controlClipNext` / `controlClipPrev` |
+| `↓` / `↑` | Next / previous edit point. With an edit point or transition selected, the selection moves with the playhead to that edit on its track (the timeline start and end count as edits) | `win.clip-next` / `win.clip-prev` | `controlClipNext` / `controlClipPrev` |
 | `Home` / `End` | Timeline start / end | `win.timeline-start` / `win.timeline-end` | `controlTimelineStart` / `controlTimelineEnd` |
 | `;` / `'` | First / last frame of the clip under the playhead | `win.first-frame` / `win.last-frame` | `controlFirstFrame` / `controlLastFrame` |
 | `Ctrl+/` | Loop on / off | `win.loop-toggle` | `controlLoop` |
@@ -120,12 +120,12 @@ Markers with a name become chapter timestamps on export (`UI_SPEC.md §7.4`).
 | `Ctrl+B` | Razor: cut at the playhead | `win.razor` | `editBladeRazor` |
 | `Ctrl+\` | Split clip | `win.split-clip` | `editM2SplitClip` |
 | `Alt+\` | Join clip | `win.join-clip` | `editM2JoinClip` |
-| `Backspace` | Delete selected, leave a gap | `win.delete` | `editBackspace` |
+| `Backspace` | Delete selected, leave a gap; a selected transition is deleted alone | `win.delete` | `editBackspace` |
 | `Shift+Backspace` or `Delete` | Ripple delete | `win.ripple-delete` | `editDelete` |
 | `Ctrl+X` | Cut | `win.cut` | `editCut` |
 | `Ctrl+Shift+X` | Ripple cut | `win.ripple-cut` | `editRippleCut` |
-| `Ctrl+C` | Copy | `win.copy` | `editCopy` |
-| `Ctrl+V` | Paste | `win.paste` | `editPaste` |
+| `Ctrl+C` | Copy; with a transition selected, copy only the transition | `win.copy` | `editCopy` |
+| `Ctrl+V` | Paste; with an edit point selected, put the copied transition on it | `win.paste` | `editPaste` |
 | `Ctrl+Shift+V` | Paste insert | `win.paste-insert` | `editPasteInsert` |
 | `Ctrl+Z` | Undo | `win.undo` | `editUndo` |
 | `Ctrl+Shift+Z` | Redo | `win.redo` | `editRedo` |
@@ -138,11 +138,18 @@ Markers with a name become chapter timestamps on export (`UI_SPEC.md §7.4`).
 | `Ctrl+Alt+Y` | Select clips backward on all tracks | `win.select-all-before` | `editSelectClipsSelectAllBefore` |
 | `D` | Enable / disable clip | `win.clip-enable-toggle` | `editClipEnabled` |
 | `Ctrl+Alt+L` | Link / unlink clips | `win.link-toggle` | `editLink` |
-| `Ctrl+T` | Add transition (video and audio) | `win.transition-add` | `editAddTransition` |
+| `Ctrl+T` | Add transition (video and audio) on the selected edit point, or both ends of the selected clips | `win.transition-add` | `editAddTransition` |
 | `Alt+T` | Add video-only transition | `win.transition-add-video` | `editAddVideoTransition` |
 | `Shift+T` | Add audio-only transition | `win.transition-add-audio` | `editAddAudioTransition` |
 
 Note that **`Ctrl+Y` is a selection command in Resolve, not redo.**
+
+**Transitions, as in Resolve.** Click a clip edge to select the edit point (green bracket;
+dragging the edge still trims), or click a transition to select it (red outline). Drag a
+transition's free edge to change its length. Copy a transition with `Ctrl+C`, then
+`↑`, `Ctrl+V`, `↑`, `Ctrl+V` … puts it on every edit going back, with no clicks. The
+standard transition is a 1 s Cross Dissolve (a Cross Fade on sound). `Escape` lets go of
+a selected edit point or transition.
 
 **Roll trim.** In Trim mode, hold `Shift` while dragging a cut to roll it (move the cut
 without changing the total length). Resolve does this by clicking exactly on the cut; Tempo
@@ -199,7 +206,7 @@ The three mouse gestures are not in the key file. Confirm them once in Resolve b
 | `Alt+Shift+Z` | Actual size | `win.viewer-actual-size` | `viewZoomActualSize` |
 | `P` or `Ctrl+F` | Cinema viewer (full screen) | `win.viewer-cinema` | `workspaceViewerModeCinemaViewer` |
 | `Shift+F` | Full-page viewer (hides the timeline) | `win.viewer-full-page` | `workspaceViewerModeFullViewer` |
-| `Escape` | Leave full-screen viewer | — | — |
+| `Escape` | Leave full-screen viewer; else let go of a selected edit point or transition | — | — |
 
 ---
 
@@ -237,6 +244,7 @@ If the panel is closed, the key opens it first and then focuses it.
 
 | Key | Action | Tempo action | Resolve command |
 |---|---|---|---|
+| `Ctrl+N` | New timeline | `win.new-timeline` | `fileNewTimeline` |
 | `Ctrl+S` | Save project | `app.save` | `fileSaveProject` |
 | `Ctrl+Shift+S` | Save project as | `app.save-as` | `fileSaveProjectAs` |
 | `Ctrl+I` | Import media | `win.import-media` | `fileImportMedia` |
@@ -283,7 +291,6 @@ so that the key is available, with the right meaning, when the feature arrives.
 | `G` | Add flag | Not planned |
 | `Shift+C`, `Ctrl+Shift+C` | Curve editor, keyframe editor | With the keyframes plugin point |
 | `[`, `]` | Previous / next keyframe | With the keyframes plugin point |
-| `Ctrl+N` | New timeline | Tempo has one timeline per project |
 | `Ctrl+E`, `Ctrl+Shift+O`, `Ctrl+Shift+I` | Export project, export / import XML | With the interchange plugin |
 | `Shift+2`, `3`, `5`, `6`, `7` | Media, Cut, Fusion, Color, Fairlight pages | Never |
 | `Alt+1`…`9`, `Ctrl+Alt+1`…`9` | Track destination | Not planned |

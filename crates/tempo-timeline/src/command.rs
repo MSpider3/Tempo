@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use uuid::Uuid;
 use crate::error::{Result, TimelineError};
-use crate::types::{frame_to_us, us_to_frame, Clip, ClipType, Marker, RationalFps, Timeline};
+use crate::types::{frame_to_us, us_to_frame, Clip, ClipType, Marker, RationalFps, Timeline, Track, Transition, TransitionEdge};
 
 /// `execute` and `undo` either succeed or leave the timeline as it was.
 pub trait Command: Send + Sync + Debug {
@@ -108,6 +108,7 @@ pub struct InsertClipCommand {
     /// undo and redo always give that part the same id.
     right_id: Uuid,
     previous_clips: Option<Vec<Clip>>,
+    previous_transitions: Vec<Transition>,
     description: String,
 }
 
@@ -119,6 +120,7 @@ impl InsertClipCommand {
             ripple: false,
             right_id: Uuid::new_v4(),
             previous_clips: None,
+            previous_transitions: Vec::new(),
             description: desc,
         }
     }
@@ -130,6 +132,7 @@ impl InsertClipCommand {
             ripple: true,
             right_id: Uuid::new_v4(),
             previous_clips: None,
+            previous_transitions: Vec::new(),
             description: desc,
         }
     }
@@ -163,9 +166,11 @@ impl Command for InsertClipCommand {
             Ok(())
         } else {
             self.previous_clips = Some(track.clips.clone());
+            self.previous_transitions = track.transitions.clone();
             let insert_in = self.clip.timeline_in;
             let insert_dur = self.clip.duration_us();
             let mut new_clips = Vec::new();
+            let mut cut_in_two = None;
 
             for old in &track.clips {
                 if old.timeline_out <= insert_in {
@@ -193,10 +198,14 @@ impl Command for InsertClipCommand {
                     right.timeline_out = old.timeline_out + insert_dur;
                     right.source_in = old.source_in + old.to_source_us(left_dur);
                     new_clips.push(right);
+                    cut_in_two = Some(old.id);
                 }
             }
             new_clips.push(self.clip.clone());
             track.clips = new_clips;
+            if let Some(old_id) = cut_in_two {
+                track.hand_over_transition(old_id, self.right_id, TransitionEdge::Out);
+            }
             track.sort_clips();
             Ok(())
         }
@@ -213,6 +222,7 @@ impl Command for InsertClipCommand {
 
         if let Some(prev) = self.previous_clips.take() {
             track.clips = prev;
+            track.transitions = std::mem::take(&mut self.previous_transitions);
             Ok(())
         } else if let Some(pos) = track.clips.iter().position(|c| c.id == self.clip.id) {
             track.clips.remove(pos);
@@ -236,6 +246,7 @@ pub struct DeleteClipCommand {
     clip_id: Uuid,
     track_id: Uuid,
     deleted_clip: Option<Clip>,
+    deleted_transitions: Vec<Transition>,
     description: String,
 }
 
@@ -245,6 +256,7 @@ impl DeleteClipCommand {
             clip_id,
             track_id,
             deleted_clip: None,
+            deleted_transitions: Vec::new(),
             description: "Delete clip".to_string(),
         }
     }
@@ -264,6 +276,7 @@ impl Command for DeleteClipCommand {
             let clip = track.clips.remove(pos);
             self.description = format!("Delete clip '{}'", clip.name);
             self.deleted_clip = Some(clip);
+            self.deleted_transitions = track.take_transitions(self.clip_id, None);
             Ok(())
         } else {
             Err(TimelineError::ClipNotFound(self.clip_id))
@@ -281,6 +294,7 @@ impl Command for DeleteClipCommand {
 
         if let Some(ref clip) = self.deleted_clip {
             track.clips.push(clip.clone());
+            track.transitions.append(&mut self.deleted_transitions);
             track.sort_clips();
             Ok(())
         } else {
@@ -360,7 +374,7 @@ impl Command for MoveClipCommand {
 
         // If moving between tracks, remove from source and add to dest
         if self.old_track_id != self.new_track_id {
-            let mut clip = {
+            let (mut clip, transitions) = {
                 let old_track = timeline
                     .find_track_mut(self.old_track_id)
                     .ok_or(TimelineError::TrackNotFound(self.old_track_id))?;
@@ -369,7 +383,7 @@ impl Command for MoveClipCommand {
                     .iter()
                     .position(|c| c.id == self.clip_id)
                     .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
-                old_track.clips.remove(idx)
+                (old_track.clips.remove(idx), old_track.take_transitions(self.clip_id, None))
             };
 
             clip.track_id = self.new_track_id;
@@ -380,6 +394,7 @@ impl Command for MoveClipCommand {
                 .find_track_mut(self.new_track_id)
                 .ok_or(TimelineError::TrackNotFound(self.new_track_id))?;
             dest_track.clips.push(clip);
+            dest_track.transitions.extend(transitions);
             dest_track.sort_clips();
         } else {
             let track = timeline
@@ -406,7 +421,7 @@ impl Command for MoveClipCommand {
         let old_timeline_out = self.old_timeline_in + duration_us;
 
         if self.old_track_id != self.new_track_id {
-            let mut clip = {
+            let (mut clip, transitions) = {
                 let curr_track = timeline
                     .find_track_mut(self.new_track_id)
                     .ok_or(TimelineError::TrackNotFound(self.new_track_id))?;
@@ -415,7 +430,7 @@ impl Command for MoveClipCommand {
                     .iter()
                     .position(|c| c.id == self.clip_id)
                     .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
-                curr_track.clips.remove(idx)
+                (curr_track.clips.remove(idx), curr_track.take_transitions(self.clip_id, None))
             };
 
             clip.track_id = self.old_track_id;
@@ -426,6 +441,7 @@ impl Command for MoveClipCommand {
                 .find_track_mut(self.old_track_id)
                 .ok_or(TimelineError::TrackNotFound(self.old_track_id))?;
             old_track.clips.push(clip);
+            old_track.transitions.extend(transitions);
             old_track.sort_clips();
         } else {
             let track = timeline
@@ -679,6 +695,8 @@ impl Command for SplitClipCommand {
         clip.source_out = split_source;
 
         track.clips.push(second_clip);
+        // The In transition stays on the first part; the Out one goes with the second.
+        track.hand_over_transition(self.clip_id, self.second_clip_id, TransitionEdge::Out);
         track.sort_clips();
 
         self.description = format!("Split clip at {}us", self.split_time_us);
@@ -698,6 +716,7 @@ impl Command for SplitClipCommand {
         if let Some(pos) = track.clips.iter().position(|c| c.id == self.second_clip_id) {
             track.clips.remove(pos);
         }
+        track.hand_over_transition(self.second_clip_id, self.clip_id, TransitionEdge::Out);
 
         // Restore first clip range
         let first = track
@@ -939,6 +958,7 @@ pub struct RippleDeleteCommand {
     clip_id: Uuid,
     deleted_clip: Option<Clip>,
     previous_clips: Option<Vec<Clip>>,
+    previous_transitions: Vec<Transition>,
     description: String,
 }
 
@@ -949,6 +969,7 @@ impl RippleDeleteCommand {
             clip_id,
             deleted_clip: None,
             previous_clips: None,
+            previous_transitions: Vec::new(),
             description: "Ripple delete clip".to_string(),
         }
     }
@@ -977,6 +998,8 @@ impl Command for RippleDeleteCommand {
             .ok_or(TimelineError::ClipNotFound(self.clip_id))?;
 
         let deleted = track.clips.remove(pos);
+        self.previous_transitions = track.transitions.clone();
+        track.take_transitions(self.clip_id, None);
         let shift_amount = deleted.duration_us();
         let deleted_out = deleted.timeline_out;
         self.description = format!("Ripple delete clip '{}'", deleted.name);
@@ -1005,6 +1028,7 @@ impl Command for RippleDeleteCommand {
 
         if let Some(prev) = self.previous_clips.take() {
             track.clips = prev;
+            track.transitions = std::mem::take(&mut self.previous_transitions);
             Ok(())
         } else {
             Err(TimelineError::ClipNotFound(self.clip_id))
@@ -1027,6 +1051,7 @@ pub struct OverwriteClipCommand {
     /// Chosen once, so undo and redo always give that part the same id.
     right_id: Uuid,
     previous_clips: Option<Vec<Clip>>,
+    previous_transitions: Vec<Transition>,
     description: String,
 }
 
@@ -1037,6 +1062,7 @@ impl OverwriteClipCommand {
             clip,
             right_id: Uuid::new_v4(),
             previous_clips: None,
+            previous_transitions: Vec::new(),
             description: desc,
         }
     }
@@ -1057,10 +1083,15 @@ impl Command for OverwriteClipCommand {
         }
 
         self.previous_clips = Some(track.clips.clone());
+        self.previous_transitions = track.transitions.clone();
 
         let new_in = self.clip.timeline_in;
         let new_out = self.clip.timeline_out;
         let mut new_track_clips = Vec::new();
+        // Transitions on edges the new clip covers go; the one at the end of a clip it
+        // cuts in two moves to the second part.
+        let mut covered_edges: Vec<(Uuid, Option<TransitionEdge>)> = Vec::new();
+        let mut cut_in_two = None;
 
         for old in &track.clips {
             if old.timeline_out <= new_in || old.timeline_in >= new_out {
@@ -1068,6 +1099,7 @@ impl Command for OverwriteClipCommand {
                 new_track_clips.push(old.clone());
             } else if old.timeline_in >= new_in && old.timeline_out <= new_out {
                 // Completely covered by new clip -> overwritten/removed
+                covered_edges.push((old.id, None));
                 continue;
             } else if old.timeline_in < new_in && old.timeline_out > new_out {
                 // Encloses new clip -> split into left and right parts
@@ -1086,6 +1118,7 @@ impl Command for OverwriteClipCommand {
                 right.timeline_in = new_out;
                 right.source_in = old.source_in + old.to_source_us(cut_offset);
                 new_track_clips.push(right);
+                cut_in_two = Some(old.id);
             } else if old.timeline_in < new_in && old.timeline_out > new_in {
                 // Overlaps start -> trim end
                 let mut left = old.clone();
@@ -1093,6 +1126,7 @@ impl Command for OverwriteClipCommand {
                 left.timeline_out = new_in;
                 left.source_out = left.source_in + old.to_source_us(left_dur);
                 new_track_clips.push(left);
+                covered_edges.push((old.id, Some(TransitionEdge::Out)));
             } else if old.timeline_in < new_out && old.timeline_out > new_out {
                 // Overlaps end -> trim start
                 let mut right = old.clone();
@@ -1100,9 +1134,16 @@ impl Command for OverwriteClipCommand {
                 right.timeline_in = new_out;
                 right.source_in = old.source_in + old.to_source_us(cut_offset);
                 new_track_clips.push(right);
+                covered_edges.push((old.id, Some(TransitionEdge::In)));
             }
         }
 
+        for (clip_id, edge) in covered_edges {
+            track.take_transitions(clip_id, edge);
+        }
+        if let Some(old_id) = cut_in_two {
+            track.hand_over_transition(old_id, self.right_id, TransitionEdge::Out);
+        }
         new_track_clips.push(self.clip.clone());
         track.clips = new_track_clips;
         track.sort_clips();
@@ -1120,6 +1161,7 @@ impl Command for OverwriteClipCommand {
 
         if let Some(prev) = self.previous_clips.take() {
             track.clips = prev;
+            track.transitions = std::mem::take(&mut self.previous_transitions);
             Ok(())
         } else {
             Err(TimelineError::ClipNotFound(self.clip.id))
@@ -1707,6 +1749,85 @@ impl Command for SetClipSpeedCommand {
 
     fn description(&self) -> &str {
         "Change Clip Speed"
+    }
+}
+
+// ----------------------------------------------------------------------------
+// SetTransitionCommand — add, change or remove the transition on a clip edge
+// ----------------------------------------------------------------------------
+
+/// Add, change or remove the transition on one clip edge, as one undo step. To change
+/// one, clone it from `Track::transition_at_edit`, edit the fields and `set` it. The
+/// caller limits the length first (`Track::max_transition_us`, whole frames); this
+/// only refuses a length under 1 µs.
+#[derive(Debug)]
+pub struct SetTransitionCommand {
+    track_id: Uuid,
+    clip_id: Uuid,
+    edge: TransitionEdge,
+    after: Option<Transition>,
+    before: Option<Transition>,
+}
+
+impl SetTransitionCommand {
+    /// Put `transition` on its clip edge on `track_id`, replacing the one there.
+    pub fn set(track_id: Uuid, transition: Transition) -> Self {
+        Self { track_id, clip_id: transition.clip_id, edge: transition.edge, after: Some(transition), before: None }
+    }
+
+    /// Take the transition off a clip edge.
+    pub fn remove(track_id: Uuid, clip_id: Uuid, edge: TransitionEdge) -> Self {
+        Self { track_id, clip_id, edge, after: None, before: None }
+    }
+
+    fn track<'a>(&self, timeline: &'a mut Timeline) -> Result<&'a mut Track> {
+        let track = timeline.find_track_mut(self.track_id).ok_or(TimelineError::TrackNotFound(self.track_id))?;
+        if track.locked {
+            return Err(TimelineError::TrackLocked(track.id));
+        }
+        Ok(track)
+    }
+
+    /// Puts `transition` (or nothing) on the edge and returns what was there.
+    fn put(&self, track: &mut Track, transition: Option<Transition>) -> Option<Transition> {
+        let old = track.take_transitions(self.clip_id, Some(self.edge)).pop();
+        track.transitions.extend(transition);
+        old
+    }
+}
+
+impl Command for SetTransitionCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let track = self.track(timeline)?;
+        if track.find_clip(self.clip_id).is_none() {
+            return Err(TimelineError::ClipNotFound(self.clip_id));
+        }
+        match &self.after {
+            Some(t) if t.duration_us <= 0 => return Err(TimelineError::CommandFailed("A transition needs a length of at least one frame.".into())),
+            None if track.transition_at_edit(self.clip_id, self.edge).is_none() => {
+                return Err(TimelineError::CommandFailed("There is no transition there.".into()))
+            }
+            _ => {}
+        }
+        let after = self.after.clone();
+        let track = self.track(timeline)?;
+        self.before = self.put(track, after);
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let before = self.before.clone();
+        let track = self.track(timeline)?;
+        self.put(track, before);
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        match (&self.before, &self.after) {
+            (_, None) => "Remove Transition",
+            (Some(_), Some(_)) => "Change Transition",
+            (None, Some(_)) => "Add Transition",
+        }
     }
 }
 
@@ -2816,5 +2937,83 @@ mod tests {
         assert!(log.undo(&mut timeline).is_err());
         assert_eq!(timeline, after);
         assert_eq!(log.cursor(), 1);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// AddTrackCommand — a new track after the last one of its kind
+// ----------------------------------------------------------------------------
+
+/// Adds a track: a video track goes after the last video track, an audio track last,
+/// so videos stay before audios. Tracks after it move up one in sort order.
+#[derive(Debug)]
+pub struct AddTrackCommand {
+    track: Track,
+    description: String,
+}
+
+impl AddTrackCommand {
+    pub fn new(track: Track) -> Self {
+        let description = format!("Add {}", track.name);
+        Self { track, description }
+    }
+
+    /// The id the new track will have, so clips can be put on it in the same step.
+    pub fn track_id(&self) -> Uuid {
+        self.track.id
+    }
+}
+
+impl Command for AddTrackCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let index = match self.track.kind {
+            crate::types::TrackKind::Video => timeline.tracks.iter().rposition(|t| t.kind == crate::types::TrackKind::Video).map_or(0, |i| i + 1),
+            crate::types::TrackKind::Audio => timeline.tracks.len(),
+        };
+        let sort_order = if index == 0 { 0 } else { timeline.tracks[index - 1].sort_order + 1 };
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order >= sort_order) {
+            t.sort_order += 1;
+        }
+        self.track.sort_order = sort_order;
+        timeline.tracks.insert(index, self.track.clone());
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let index = timeline.tracks.iter().position(|t| t.id == self.track.id).ok_or(TimelineError::TrackNotFound(self.track.id))?;
+        let removed = timeline.tracks.remove(index);
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order > removed.sort_order) {
+            t.sort_order -= 1;
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(test)]
+mod add_track_tests {
+    use super::*;
+    use crate::types::TrackKind;
+
+    fn orders(t: &Timeline) -> Vec<(TrackKind, u32, u32)> {
+        t.tracks.iter().map(|t| (t.kind, t.kind_index, t.sort_order)).collect()
+    }
+
+    #[test]
+    fn add_track_keeps_videos_before_audios_and_undo_restores() {
+        let mut timeline = Timeline::with_tracks("T", 2, 2);
+        let before = timeline.clone();
+        let mut video = AddTrackCommand::new(Track::new(TrackKind::Video, 3, "Video 3", 0));
+        let mut audio = AddTrackCommand::new(Track::new(TrackKind::Audio, 3, "Audio 3", 0));
+        video.execute(&mut timeline).unwrap();
+        audio.execute(&mut timeline).unwrap();
+        use TrackKind::{Audio as A, Video as V};
+        assert_eq!(orders(&timeline), vec![(V, 1, 0), (V, 2, 1), (V, 3, 2), (A, 1, 3), (A, 2, 4), (A, 3, 5)]);
+        audio.undo(&mut timeline).unwrap();
+        video.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
     }
 }

@@ -5,10 +5,10 @@ use rusqlite::params;
 use uuid::Uuid;
 use tempfile::NamedTempFile;
 
-use tempo_timeline::types::{
+use tempo_timeline::types::{AudioTrackType, 
     Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource, MediaType,
-    Project, RationalFps, TitleData, Track, TrackKind, Transition, TransitionAlignment,
-    TransitionEdge, TransitionKind, UiState,
+    Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition, TransitionAlignment,
+    TransitionEase, TransitionEdge, TransitionKind, UiState,
 };
 
 use crate::db::open_connection;
@@ -79,6 +79,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
     tx.execute("DELETE FROM clips", [])?;
     tx.execute("DELETE FROM transitions", [])?;
     tx.execute("DELETE FROM markers", [])?;
+    tx.execute("DELETE FROM timelines", [])?;
 
     // 3. Save media sources
     for source in project.sources.values() {
@@ -127,8 +128,23 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         )?;
     }
 
-    // 4. Save tracks, clips, transitions
-    for track in &project.timeline.tracks {
+    // 4. Save every timeline: its tracks, clips, transitions and markers
+    for (timeline, open) in std::iter::once((&project.timeline, true)).chain(project.timelines.iter().map(|t| (t, false))) {
+    let timeline_id = timeline.id.to_string();
+    tx.execute(
+        "INSERT INTO timelines (id, name, is_open, start_tc_us, width, height, fps_num, fps_den) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            timeline_id,
+            timeline.name,
+            open as i32,
+            timeline.start_tc_us,
+            timeline.resolution.map(|r| r.0),
+            timeline.resolution.map(|r| r.1),
+            timeline.fps.map(|f| f.num),
+            timeline.fps.map(|f| f.den),
+        ],
+    )?;
+    for track in &timeline.tracks {
         let kind_int = match track.kind {
             TrackKind::Video => 0,
             TrackKind::Audio => 1,
@@ -136,8 +152,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
         tx.execute(
             "INSERT INTO tracks (
-                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id, audio_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 track.id.to_string(),
                 kind_int,
@@ -150,6 +166,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 track.height_px,
                 track.color,
                 track.sort_order,
+                timeline_id,
+                matches!(track.audio_type, AudioTrackType::Stereo) as i32,
             ],
         )?;
 
@@ -200,7 +218,8 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
 
             let (kind_int, plugin_id) = match &trans.kind {
                 TransitionKind::Cut => (0, None),
-                TransitionKind::CrossDissolve | TransitionKind::Crossfade => (1, None),
+                TransitionKind::CrossDissolve => (1, None),
+                TransitionKind::Crossfade => (10, None),
                 TransitionKind::DipToBlack => (2, None),
                 TransitionKind::DipToWhite => (3, None),
                 TransitionKind::FadeIn | TransitionKind::FadeFromBlack => (4, None),
@@ -208,6 +227,10 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 TransitionKind::FadeFromWhite => (7, None),
                 TransitionKind::FadeToWhite => (8, None),
                 TransitionKind::Plugin(pid) => (6, Some(pid.clone())),
+                TransitionKind::DipToColor => (9, None),
+                TransitionKind::AdditiveDissolve => (11, None),
+                TransitionKind::NonAdditiveDissolve => (12, None),
+                TransitionKind::BlurDissolve => (13, None),
             };
 
             let align_int = match trans.alignment {
@@ -216,10 +239,18 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 TransitionAlignment::EndAtCut => 2,
             };
 
+            let ease_int = match trans.ease {
+                TransitionEase::None => 0,
+                TransitionEase::In => 1,
+                TransitionEase::Out => 2,
+                TransitionEase::InOut => 3,
+            };
+
             tx.execute(
                 "INSERT INTO transitions (
-                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease,
+                    start_ratio, end_ratio, curve, enabled
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     trans.id.to_string(),
                     trans.clip_id.to_string(),
@@ -229,13 +260,19 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                     align_int,
                     plugin_id.or_else(|| trans.plugin_id.clone()),
                     trans.plugin_params.as_deref().unwrap_or("{}"),
+                    color_to_hex(trans.color),
+                    ease_int,
+                    trans.start_ratio,
+                    trans.end_ratio,
+                    (!trans.curve.is_empty()).then(|| serde_json::to_string(&trans.curve)).transpose()?,
+                    trans.enabled as i32,
                 ],
             )?;
         }
     }
 
-    // 5. Save markers
-    for marker in &project.timeline.markers {
+    // Markers
+    for marker in &timeline.markers {
         let color_int = match marker.color {
             MarkerColor::Red => 0,
             MarkerColor::Green => 1,
@@ -243,12 +280,23 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
             MarkerColor::Yellow => 3,
             MarkerColor::Orange => 4,
             MarkerColor::Purple => 5,
+            MarkerColor::Cyan => 6,
+            MarkerColor::Pink => 7,
+            MarkerColor::Fuchsia => 8,
+            MarkerColor::Rose => 9,
+            MarkerColor::Lavender => 10,
+            MarkerColor::Sky => 11,
+            MarkerColor::Mint => 12,
+            MarkerColor::Lemon => 13,
+            MarkerColor::Sand => 14,
+            MarkerColor::Cocoa => 15,
+            MarkerColor::Cream => 16,
         };
 
         tx.execute(
             "INSERT INTO markers (
-                id, position_us, name, color, duration_us, note
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                id, position_us, name, color, duration_us, note, timeline_id, keyword
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 marker.id.to_string(),
                 marker.position_us,
@@ -256,8 +304,11 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 color_int,
                 marker.duration_us,
                 marker.note,
+                timeline_id,
+                marker.keyword,
             ],
         )?;
+    }
     }
 
     tx.commit()?;
@@ -381,7 +432,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     // 3. Load tracks
     let mut tracks = Vec::new();
     let mut track_stmt = conn.prepare(
-        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order
+        "SELECT id, kind, kind_index, name, enabled, locked, solo, volume, height_px, color, sort_order, timeline_id, audio_type
          FROM tracks ORDER BY sort_order ASC",
     )?;
 
@@ -403,7 +454,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
             _ => TrackKind::Audio,
         };
 
-        Ok(Track {
+        Ok((Track {
             id: Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
             kind,
             kind_index,
@@ -417,11 +468,15 @@ pub fn load_project(path: &Path) -> Result<Project> {
             sort_order,
             clips: Vec::new(),
             transitions: Vec::new(),
-        })
+            audio_type: if row.get::<_, i32>(12)? == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo },
+        }, row.get::<_, Option<String>>(11)?))
     })?;
 
+    let mut track_owner = Vec::new();
     for trk in track_rows {
-        tracks.push(trk?);
+        let (track, owner) = trk?;
+        tracks.push(track);
+        track_owner.push(owner);
     }
 
     // 4. Load clips
@@ -485,7 +540,8 @@ pub fn load_project(path: &Path) -> Result<Project> {
 
     // 5. Load transitions
     let mut trans_stmt = conn.prepare(
-        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params
+        "SELECT id, clip_id, edge, kind, duration_us, alignment, plugin_id, plugin_params, color, ease,
+                start_ratio, end_ratio, curve, enabled
          FROM transitions",
     )?;
 
@@ -498,6 +554,20 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let align_int: i32 = row.get(5)?;
         let plugin_id: Option<String> = row.get(6)?;
         let plugin_params: Option<String> = row.get(7)?;
+        let color: Option<String> = row.get(8)?;
+        let ease_int: i32 = row.get(9)?;
+        let curve: Option<String> = row.get(12)?;
+        // A damaged curve costs only the curve, not the project; keys are kept in range and in order.
+        let mut curve: Vec<[f32; 2]> = curve
+            .and_then(|c| {
+                serde_json::from_str(&c).map_err(|e| tracing::warn!(transition = %id_str, error = %e, "unreadable transition curve dropped")).ok()
+            })
+            .unwrap_or_default();
+        curve.retain(|k| k.iter().all(|v| v.is_finite()));
+        for k in &mut curve {
+            *k = [k[0].clamp(0.0, 1.0), k[1].clamp(0.0, 1.0)];
+        }
+        curve.sort_by(|a, b| a[0].total_cmp(&b[0]));
 
         let edge = if edge_int == 0 {
             TransitionEdge::In
@@ -514,7 +584,19 @@ pub fn load_project(path: &Path) -> Result<Project> {
             5 => TransitionKind::FadeOut,
             7 => TransitionKind::FadeFromWhite,
             8 => TransitionKind::FadeToWhite,
+            9 => TransitionKind::DipToColor,
+            10 => TransitionKind::Crossfade,
+            11 => TransitionKind::AdditiveDissolve,
+            12 => TransitionKind::NonAdditiveDissolve,
+            13 => TransitionKind::BlurDissolve,
             _ => TransitionKind::Plugin(plugin_id.clone().unwrap_or_default()),
+        };
+
+        let ease = match ease_int {
+            1 => TransitionEase::In,
+            2 => TransitionEase::Out,
+            3 => TransitionEase::InOut,
+            _ => TransitionEase::None,
         };
 
         let alignment = match align_int {
@@ -532,6 +614,12 @@ pub fn load_project(path: &Path) -> Result<Project> {
             alignment,
             plugin_id,
             plugin_params,
+            color: color.map(|c| hex_to_color(&c)).transpose().map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into()))?.unwrap_or_default(),
+            ease,
+            start_ratio: row.get(10)?,
+            end_ratio: row.get(11)?,
+            curve,
+            enabled: row.get::<_, i32>(13)? != 0,
         })
     })?;
 
@@ -545,11 +633,15 @@ pub fn load_project(path: &Path) -> Result<Project> {
             }
         }
     }
+    // Cross dissolves from before schema 4 become transitions.
+    for track in &mut tracks {
+        track.convert_legacy_dissolves();
+    }
 
     // 6. Load markers
     let mut markers = Vec::new();
     let mut marker_stmt = conn.prepare(
-        "SELECT id, position_us, name, color, duration_us, note
+        "SELECT id, position_us, name, color, duration_us, note, timeline_id, keyword
          FROM markers ORDER BY position_us ASC",
     )?;
 
@@ -567,24 +659,38 @@ pub fn load_project(path: &Path) -> Result<Project> {
             2 => MarkerColor::Blue,
             3 => MarkerColor::Yellow,
             4 => MarkerColor::Orange,
+            6 => MarkerColor::Cyan,
+            7 => MarkerColor::Pink,
+            8 => MarkerColor::Fuchsia,
+            9 => MarkerColor::Rose,
+            10 => MarkerColor::Lavender,
+            11 => MarkerColor::Sky,
+            12 => MarkerColor::Mint,
+            13 => MarkerColor::Lemon,
+            14 => MarkerColor::Sand,
+            15 => MarkerColor::Cocoa,
+            16 => MarkerColor::Cream,
             _ => MarkerColor::Purple,
         };
 
-        Ok(Marker {
+        Ok((Marker {
             id: Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
             position_us,
             name,
             color,
             duration_us,
             note,
-        })
+            keyword: row.get(7)?,
+        }, row.get::<_, Option<String>>(6)?))
     })?;
 
+    let mut marker_owner = Vec::new();
     for m in marker_rows {
-        markers.push(m?);
+        let (marker, owner) = m?;
+        markers.push(marker);
+        marker_owner.push(owner);
     }
-
-    let timeline = tempo_timeline::types::Timeline { tracks, markers };
+    let (timeline, timelines) = group_timelines(&conn, tracks.into_iter().zip(track_owner), markers.into_iter().zip(marker_owner))?;
 
     Ok(Project {
         id,
@@ -598,9 +704,74 @@ pub fn load_project(path: &Path) -> Result<Project> {
         channels,
         proxy_dir,
         timeline,
+        timelines,
         sources,
         ui_state,
     })
+}
+
+/// `[r, g, b]` (0.0-1.0) as `#rrggbb`.
+fn color_to_hex(color: [f32; 3]) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", byte(color[0]), byte(color[1]), byte(color[2]))
+}
+
+fn hex_to_color(hex: &str) -> std::result::Result<[f32; 3], String> {
+    let digits = hex.strip_prefix('#').filter(|d| d.len() == 6 && d.is_ascii()).ok_or_else(|| format!("bad colour {hex:?}"))?;
+    let mut color = [0.0f32; 3];
+    for (i, c) in color.iter_mut().enumerate() {
+        let byte = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).map_err(|e| format!("bad colour {hex:?}: {e}"))?;
+        *c = byte as f32 / 255.0;
+    }
+    Ok(color)
+}
+
+/// Splits loaded tracks and markers into the open timeline and the others, by the
+/// timeline each row names. Rows naming none (files from before 0.3.0) go to the open one.
+fn group_timelines(
+    conn: &rusqlite::Connection,
+    tracks: impl Iterator<Item = (Track, Option<String>)>,
+    markers: impl Iterator<Item = (Marker, Option<String>)>,
+) -> Result<(Timeline, Vec<Timeline>)> {
+    let mut stmt = conn.prepare("SELECT id, name, is_open, start_tc_us, width, height, fps_num, fps_den FROM timelines ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| {
+        let size = (row.get::<_, Option<u32>>(4)?, row.get::<_, Option<u32>>(5)?);
+        let resolution = match size {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        };
+        let fps = match (row.get::<_, Option<u32>>(6)?, row.get::<_, Option<u32>>(7)?) {
+            (Some(num), Some(den)) if num > 0 && den > 0 => Some(RationalFps { num, den }),
+            _ => None,
+        };
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(3)?, resolution, fps))
+    })?;
+    let mut all: Vec<(String, Timeline)> = Vec::new();
+    let mut open = 0;
+    for row in rows {
+        let (id, name, is_open, start_tc_us, resolution, fps) = row?;
+        let uuid = Uuid::parse_str(&id).map_err(|e| ProjectError::InvalidProject(format!("timeline id {id}: {e}")))?;
+        if is_open {
+            open = all.len();
+        }
+        all.push((id, Timeline { id: uuid, name, start_tc_us, resolution, fps, ..Timeline::new() }));
+    }
+    if all.is_empty() {
+        let t = Timeline::new();
+        all.push((t.id.to_string(), t));
+    }
+    let slot = |owner: &Option<String>| owner.as_ref().and_then(|o| all.iter().position(|(id, _)| id == o)).unwrap_or(open);
+    let tracks: Vec<_> = tracks.map(|(t, o)| (slot(&o), t)).collect();
+    let markers: Vec<_> = markers.map(|(m, o)| (slot(&o), m)).collect();
+    for (i, t) in tracks {
+        all[i].1.tracks.push(t);
+    }
+    for (i, m) in markers {
+        all[i].1.markers.push(m);
+    }
+    let mut all: Vec<Timeline> = all.into_iter().map(|(_, t)| t).collect();
+    let timeline = all.remove(open);
+    Ok((timeline, all))
 }
 
 /// Computes the auto-save file path for a project file.
@@ -740,11 +911,27 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
+            enabled: true,
         };
         project.timeline.tracks[0].transitions.push(trans.clone());
 
+        // Resolve's settings: ratios, curve keys, start timecode, own size, mono track, keyword.
+        let trans = Transition { start_ratio: 0.25, end_ratio: 0.75, curve: vec![[0.5, 0.9]], ..trans };
+        project.timeline.tracks[0].transitions[0] = trans.clone();
+        project.timeline.start_tc_us = tempo_timeline::RESOLVE_START_TC_US;
+        project.timeline.resolution = Some((1080, 1920));
+        project.timeline.tracks[2].audio_type = AudioTrackType::Mono;
+        project.timeline.fps = Some(RationalFps::FPS_29_97);
+        project.timeline.tracks[0].transitions[0].enabled = false;
+
         // Add markers
-        let m1 = Marker::new(10_000_000, "Scene 1", MarkerColor::Red);
+        let mut m1 = Marker::new(10_000_000, "Scene 1", MarkerColor::Cocoa);
+        m1.keyword = "battle".into();
         let m2 = Marker::new(20_000_000, "Scene 2", MarkerColor::Green);
         project.timeline.add_marker(m1);
         project.timeline.add_marker(m2);
@@ -780,6 +967,14 @@ mod tests {
         assert_eq!(loaded_trans.id, trans.id);
         assert_eq!(loaded_trans.clip_id, clip_0_id);
         assert_eq!(loaded_trans.kind, TransitionKind::CrossDissolve);
+        assert_eq!((loaded_trans.start_ratio, loaded_trans.end_ratio, &loaded_trans.curve), (0.25, 0.75, &vec![[0.5, 0.9]]));
+        assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (tempo_timeline::RESOLVE_START_TC_US, Some((1080, 1920))));
+        assert_eq!(loaded.timeline.tracks.iter().map(|t| t.audio_type).collect::<Vec<_>>()[1..3], [AudioTrackType::Stereo, AudioTrackType::Mono]);
+        assert_eq!(loaded.timeline.markers[0].keyword, "battle");
+        assert_eq!(loaded.timeline.markers[0].color, MarkerColor::Cocoa);
+        assert_eq!(loaded.timeline_fps(), RationalFps::FPS_29_97);
+        assert!(!loaded.timeline.tracks[0].transitions[0].enabled);
+        assert_eq!(loaded.output_size(), (1080, 1920));
     }
 
     #[test]
@@ -843,6 +1038,12 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
+            enabled: true,
         };
         let t2 = Transition {
             id: Uuid::new_v4(),
@@ -853,6 +1054,12 @@ mod tests {
             alignment: TransitionAlignment::Centered,
             plugin_id: None,
             plugin_params: None,
+            color: [0.0; 3],
+            ease: TransitionEase::None,
+            start_ratio: 0.0,
+            end_ratio: 1.0,
+            curve: Vec::new(),
+            enabled: true,
         };
         project.timeline.tracks[0].transitions.push(t1);
         project.timeline.tracks[0].transitions.push(t2);
@@ -1003,6 +1210,40 @@ mod tests {
     }
 
     /// A saved one-clip project, then `sql` run on its file without foreign key checks.
+    #[test]
+    fn several_timelines_keep_their_own_clips_and_markers_and_which_is_open() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Two", 1920, 1080, RationalFps::FPS_30);
+        let first = project.timeline.id;
+        let track_id = project.timeline.tracks[0].id;
+        project.timeline.tracks[0].clips.push(Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000));
+        project.timeline.add_marker(Marker::new(0, "Section 15", MarkerColor::Blue));
+        project.add_timeline(Timeline::with_tracks("Section 15.5 Interlude", 1, 1));
+        project.timeline.add_marker(Marker::new(5, "Interlude", MarkerColor::Blue));
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.name, "Section 15.5 Interlude");
+        assert_eq!(loaded.timeline.tracks.len(), 2);
+        assert_eq!(loaded.timeline.markers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Interlude"]);
+        assert!(loaded.timeline.tracks.iter().all(|t| t.clips.is_empty()));
+        assert_eq!(loaded.timelines.len(), 1);
+        let other = &loaded.timelines[0];
+        assert_eq!((other.id, other.name.as_str()), (first, "Timeline 1"));
+        assert_eq!(other.tracks[0].clips.len(), 1);
+        assert_eq!(other.markers[0].name, "Section 15");
+    }
+
+    #[test]
+    fn files_from_before_timelines_load_as_one_timeline() {
+        let (file, clip_id) = tampered("DELETE FROM timelines; UPDATE tracks SET timeline_id = NULL; UPDATE markers SET timeline_id = NULL;");
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.name, "Timeline 1");
+        assert!(loaded.timelines.is_empty());
+        assert_eq!(loaded.timeline.tracks.len(), 4);
+        assert_eq!(loaded.timeline.tracks[0].clips[0].id, clip_id);
+    }
+
     fn tampered(sql: &str) -> (NamedTempFile, Uuid) {
         let file = NamedTempFile::new().unwrap();
         let mut project = Project::new("Tamper", 1920, 1080, RationalFps::FPS_30);
@@ -1103,5 +1344,125 @@ mod tests {
     fn load_rejects_clip_on_unknown_track() {
         let (file, _) = tampered(&format!("UPDATE clips SET track_id = '{}';", Uuid::new_v4()));
         assert!(matches!(load_project(file.path()), Err(ProjectError::CorruptClip { field: "track", .. })));
+    }
+
+    /// A project with clip A [0, 2 s] and clip B [2, 4 s] (footage from 1 s) on V1.
+    fn two_clips() -> (Project, Uuid, Uuid) {
+        let mut project = Project::new("Cuts", 1920, 1080, RationalFps::FPS_25);
+        let track_id = project.timeline.tracks[0].id;
+        let a = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "a", 0, 2_000_000, 0, 2_000_000);
+        let b = Clip::new(track_id, Uuid::new_v4(), ClipType::Video, "b", 2_000_000, 4_000_000, 1_000_000, 3_000_000);
+        let ids = (a.id, b.id);
+        project.timeline.tracks[0].clips = vec![a, b];
+        (project, ids.0, ids.1)
+    }
+
+    #[test]
+    fn every_video_dissolve_kind_survives_save_and_load() {
+        for kind in TransitionKind::VIDEO_DISSOLVES {
+            let file = NamedTempFile::new().unwrap();
+            let (mut project, _, b) = two_clips();
+            project.timeline.tracks[0].transitions = vec![Transition::new(b, TransitionEdge::In, kind.clone(), 520_000, TransitionAlignment::Centered)];
+            save_project(&project, file.path()).unwrap();
+            let loaded = load_project(file.path()).unwrap();
+            assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, kind);
+        }
+    }
+
+    #[test]
+    fn transitions_keep_kind_colour_and_ease() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, a, b) = two_clips();
+        let mut dip = Transition::new(b, TransitionEdge::In, TransitionKind::DipToColor, 520_000, TransitionAlignment::Centered);
+        dip.color = [1.0, 0.2, 0.0];
+        dip.ease = TransitionEase::InOut;
+        let mut fade = Transition::new(a, TransitionEdge::In, TransitionKind::CrossDissolve, 1_000_000, TransitionAlignment::StartAtCut);
+        fade.ease = TransitionEase::Out;
+        project.timeline.tracks[0].transitions = vec![dip.clone(), fade.clone()];
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        let track = &loaded.timeline.tracks[0];
+        let got = track.transition_at_edit(b, TransitionEdge::In).unwrap();
+        assert_eq!((got.id, &got.kind, got.duration_us, got.alignment, got.ease), (dip.id, &TransitionKind::DipToColor, 520_000, TransitionAlignment::Centered, TransitionEase::InOut));
+        assert!(got.color.iter().zip(dip.color).all(|(x, y)| (x - y).abs() < 0.003), "{:?}", got.color);
+        let got = track.transition_at_edit(a, TransitionEdge::In).unwrap();
+        assert_eq!((got.id, &got.kind, got.alignment, got.ease, got.color), (fade.id, &fade.kind, fade.alignment, fade.ease, [0.0; 3]));
+    }
+
+    #[test]
+    fn old_cross_dissolves_load_as_transitions() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, _, b) = two_clips();
+        project.timeline.tracks[0].clips[1].properties.dissolve_in_us = 400_000;
+        save_project(&project, file.path()).unwrap();
+
+        let loaded = load_project(file.path()).unwrap();
+        let track = &loaded.timeline.tracks[0];
+        assert_eq!(track.find_clip(b).unwrap().properties.dissolve_in_us, 0);
+        let t = track.transition_at_edit(b, TransitionEdge::In).unwrap().clone();
+        assert_eq!((t.kind.clone(), t.duration_us, t.alignment), (TransitionKind::CrossDissolve, 400_000, TransitionAlignment::EndAtCut));
+
+        // Saving again keeps the one transition.
+        save_project(&loaded, file.path()).unwrap();
+        let again = load_project(file.path()).unwrap();
+        let ids: Vec<_> = again.timeline.tracks[0].transitions.iter().map(|x| (x.id, x.duration_us)).collect();
+        assert_eq!(ids, vec![(t.id, 400_000)]);
+    }
+
+    #[test]
+    fn schema_3_files_gain_transition_colour_and_ease() {
+        let (file, _) = tampered(
+            "ALTER TABLE transitions DROP COLUMN color; ALTER TABLE transitions DROP COLUMN ease; DELETE FROM schema_version WHERE version >= 4;
+             ALTER TABLE timelines DROP COLUMN start_tc_us; ALTER TABLE timelines DROP COLUMN width; ALTER TABLE timelines DROP COLUMN height;
+             ALTER TABLE tracks DROP COLUMN audio_type; ALTER TABLE markers DROP COLUMN keyword;
+             ALTER TABLE transitions DROP COLUMN start_ratio; ALTER TABLE transitions DROP COLUMN end_ratio; ALTER TABLE transitions DROP COLUMN curve;
+             ALTER TABLE timelines DROP COLUMN fps_num; ALTER TABLE timelines DROP COLUMN fps_den; ALTER TABLE transitions DROP COLUMN enabled;
+             INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2 FROM clips;",
+        );
+        let loaded = load_project(file.path()).unwrap();
+        let t = &loaded.timeline.tracks[0].transitions[0];
+        assert_eq!((t.color, t.ease, t.edge), ([0.0; 3], TransitionEase::None, TransitionEdge::Out));
+        // Schema 5 defaults: a plain transition, a stereo track, Start Timecode 0, project size.
+        assert_eq!((t.start_ratio, t.end_ratio, t.curve.len()), (0.0, 1.0, 0));
+        assert_eq!((loaded.timeline.start_tc_us, loaded.timeline.resolution), (0, None));
+        assert!(loaded.timeline.tracks.iter().all(|t| t.audio_type == AudioTrackType::Stereo));
+        // Schema 6 defaults: the timeline follows the project's rate and transitions are on.
+        assert_eq!(loaded.timeline.fps, None);
+        assert!(loaded.timeline.tracks.iter().flat_map(|t| &t.transitions).all(|t| t.enabled));
+    }
+
+    #[test]
+    fn loaded_curve_keys_are_ordered_and_in_range_and_a_damaged_curve_is_dropped() {
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, curve) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2, '[[0.9, 0.1], [0.2, 2.0]]' FROM clips;",
+        );
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].transitions[0].curve, vec![[0.2, 1.0], [0.9, 0.1]]);
+
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, curve) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2, 'nope' FROM clips;",
+        );
+        let loaded = load_project(file.path()).expect("a bad curve must not stop the project opening");
+        assert!(loaded.timeline.tracks[0].transitions[0].curve.is_empty());
+    }
+
+    #[test]
+    fn load_rejects_an_unreadable_transition_colour() {
+        let (file, _) = tampered(
+            "INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment, color) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 9, 500000, 2, 'nope' FROM clips;",
+        );
+        assert!(load_project(file.path()).is_err());
+    }
+
+    #[test]
+    fn audio_cross_fades_stay_cross_fades() {
+        let file = NamedTempFile::new().unwrap();
+        let (mut project, _, b) = two_clips();
+        let fade = Transition::new(b, TransitionEdge::In, TransitionKind::Crossfade, 400_000, TransitionAlignment::Centered);
+        project.timeline.tracks[0].transitions = vec![fade];
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, TransitionKind::Crossfade);
     }
 }

@@ -170,6 +170,7 @@ impl Plugins {
         });
         let Some((plugin, function, name)) = found else { return };
         let Some(timeline) = self.state.with_timeline(|t| t.clone()) else { return };
+        let (ran_on, ran_on_name) = (timeline.id, timeline.name.clone());
         let loudness: HashMap<_, _> = self.state.waveforms.borrow().iter().map(|(id, peaks)| (*id, Arc::new(peaks.as_ref().clone()))).collect();
         let input = RunInput { timeline, playhead_us: self.state.playhead_us(), selection: self.state.selected_ids(), loudness };
 
@@ -178,8 +179,15 @@ impl Plugins {
             let result = gio::spawn_blocking(move || tempo_plugin::run_command(&plugin, &function, input)).await;
             let state = &plugins.state;
             match result {
-                Ok(Ok(output)) => {
+                Ok(Ok(mut output)) => {
+                    if output.changed && state.with_timeline(|t| t.id) != Some(ran_on) {
+                        // Another timeline is open now; replacing it would merge two timelines into one.
+                        state.message(format!("{name} finished after you left {ran_on_name}, so its changes were not applied."));
+                        return;
+                    }
                     if output.changed {
+                        // A plugin cannot rename the timeline or change which one it is.
+                        (output.timeline.id, output.timeline.name) = (ran_on, ran_on_name);
                         state.execute(Box::new(ReplaceTimelineCommand::new(name, output.timeline)));
                     }
                     for message in output.messages.into_iter().take(3) {

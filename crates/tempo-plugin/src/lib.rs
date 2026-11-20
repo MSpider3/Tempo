@@ -22,7 +22,7 @@ use tempo_timeline::{
 use uuid::Uuid;
 
 mod upload;
-pub use upload::{run_upload, UploadInput, UploadOutput};
+pub use upload::{description_with_chapters, run_upload, UploadInput, UploadOutput, CATEGORIES, PRIVACY};
 
 /// A script may use this much memory and run for this long.
 pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -642,7 +642,7 @@ mod tests {
         "#;
         let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
         assert_eq!((plugin.uploaders.len(), plugin.network.as_slice()), (1, &["127.0.0.1".to_string()][..]));
-        let input = UploadInput { file: file.clone(), title: port.to_string(), description: String::new(), token: "secret".into() };
+        let input = UploadInput { file: file.clone(), title: port.to_string(), token: "secret".into(), ..Default::default() };
         let out = run_upload(&plugin, "send", input).unwrap();
         let request = server.join().unwrap();
         let _ = std::fs::remove_file(&file);
@@ -659,7 +659,7 @@ mod tests {
         let run = |body: &str| {
             let script = format!("function send(video) {body} end");
             let plugin = Plugin::from_sources(UPLOADER, &script, false).unwrap();
-            let input = UploadInput { file: file.clone(), title: String::new(), description: String::new(), token: String::new() };
+            let input = UploadInput { file: file.clone(), ..Default::default() };
             run_upload(&plugin, "send", input).map(|o| o.url).unwrap_err().to_string()
         };
         // A host that is not listed, plain HTTP to another machine, and tricks in the address.
@@ -675,6 +675,61 @@ mod tests {
     }
 
     #[test]
+    fn privacy_category_and_thumbnail_reach_the_script() {
+        if std::process::Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+        let (port, server) = one_shot_server("{}");
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("tempo-upload-meta-{}.mp4", std::process::id()));
+        let thumb = dir.join(format!("tempo-upload-meta-{}.png", std::process::id()));
+        std::fs::write(&file, b"VIDEO").unwrap();
+        std::fs::write(&thumb, b"THUMB!").unwrap();
+        let script = r#"
+            function send(v)
+                tempo.notify(v.privacy .. "|" .. v.category .. "|" .. v.thumbnail_name .. "|" .. v.thumbnail_size)
+                tempo.http.upload{ url = "http://127.0.0.1:" .. v.title .. "/t", thumbnail = true }
+            end
+        "#;
+        let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
+        let input = UploadInput {
+            file: file.clone(),
+            title: port.to_string(),
+            privacy: "unlisted".into(),
+            category: "Gaming".into(),
+            thumbnail: Some(thumb.clone()),
+            ..Default::default()
+        };
+        let out = run_upload(&plugin, "send", input).unwrap();
+        let request = server.join().unwrap();
+        let _ = (std::fs::remove_file(&file), std::fs::remove_file(&thumb));
+        assert_eq!(out.messages, vec![format!("unlisted|Gaming|{}|6", thumb.file_name().unwrap().to_string_lossy())]);
+        assert!(request.ends_with("THUMB!"), "{request}");
+    }
+
+    #[test]
+    fn a_script_cannot_send_a_thumbnail_that_was_not_chosen() {
+        let file = std::env::temp_dir().join(format!("tempo-upload-nothumb-{}.bin", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let script = r#"function send(v)
+            if v.thumbnail_name ~= nil then error("unexpected") end
+            tempo.http.upload{ url = "http://127.0.0.1/", thumbnail = true }
+        end"#;
+        let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
+        let err = run_upload(&plugin, "send", UploadInput { file: file.clone(), ..Default::default() }).map(|o| o.url).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&file);
+        assert!(err.contains("no thumbnail"), "{err}");
+    }
+
+    #[test]
+    fn chapters_are_added_to_a_description_once() {
+        assert_eq!(description_with_chapters("Hello\n", "00:00 A"), "Hello\n\n00:00 A");
+        assert_eq!(description_with_chapters("", "00:00 A"), "00:00 A");
+        assert_eq!(description_with_chapters("Hi\n\n00:00 A", "00:00 A"), "Hi\n\n00:00 A");
+        assert_eq!(description_with_chapters("Hi ", ""), "Hi");
+    }
+
+    #[test]
     fn json_round_trips() {
         let file = std::env::temp_dir().join(format!("tempo-upload-json-{}.bin", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
@@ -684,7 +739,7 @@ mod tests {
             return t.name .. t.tags[2] .. math.floor(t.n)
         end"#;
         let plugin = Plugin::from_sources(UPLOADER, script, false).unwrap();
-        let input = UploadInput { file: file.clone(), title: String::new(), description: String::new(), token: String::new() };
+        let input = UploadInput { file: file.clone(), ..Default::default() };
         assert_eq!(run_upload(&plugin, "send", input).unwrap().url.as_deref(), Some("ay2"));
         let _ = std::fs::remove_file(&file);
     }

@@ -1,17 +1,19 @@
 //! Editing actions. Each builds commands and sends them through `AppState::execute`,
 //! so every one of them can be undone.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use tempo_timeline::{
-    AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
-    ClipEffect, EditClipCommand, InsertClipCommand, Marker, MarkerColor, MediaType, MoveClipCommand, OverwriteClipCommand,
-    PropertyChange, ReplaceClipCommand, SetClipPropertyCommand, SplitClipCommand, TitleData,
-    TitleType, TrackKind, TrimClipCommand, TrimEdge,
+    frame_to_us, us_to_frame, AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
+    ClipEffect, EditClipCommand, EditKind, EditTarget, InsertClipCommand, Marker, MarkerColor, MediaSource, MediaType, MoveClipCommand,
+    OverwriteClipCommand, PropertyChange, RationalFps, ReplaceClipCommand, SetClipPropertyCommand, SetTransitionCommand, SplitClipCommand,
+    TitleData, TitleType, Timeline, Track, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimClipCommand,
+    TrimEdge, RippleTrimCommand,
 };
 use uuid::Uuid;
 
-use crate::state::{AppState, Change, Gap};
+use crate::state::{AppState, Change, EditSelection, Gap};
 
 /// Still images get this length when placed on the timeline.
 const STILL_DURATION_US: i64 = 5_000_000;
@@ -25,13 +27,12 @@ pub enum Place {
 }
 
 /// Build the clip(s) a source produces: picture on a video track, sound on an audio track.
-fn clips_for_source(
-    state: &AppState,
-    source_id: Uuid,
-    at_us: i64,
-    video_track: Option<Uuid>,
-    audio_track: Option<Uuid>,
-) -> Vec<Clip> {
+pub(crate) fn clips_for_source(state: &AppState, source_id: Uuid, at_us: i64, video_track: Option<Uuid>, audio_track: Option<Uuid>) -> Vec<Clip> {
+    clips_for_source_marked(state, source_id, at_us, video_track, audio_track, true)
+}
+
+/// `use_marks` off places the whole source whatever the viewer's marks say.
+fn clips_for_source_marked(state: &AppState, source_id: Uuid, at_us: i64, video_track: Option<Uuid>, audio_track: Option<Uuid>, use_marks: bool) -> Vec<Clip> {
     let Some((media_type, duration, has_audio, name)) = state
         .with_project(|p| {
             p.sources.get(&source_id).map(|s| {
@@ -45,7 +46,7 @@ fn clips_for_source(
     };
 
     // Honour In/Out marks set on this clip in the viewer's source mode.
-    let marked = state.source_clip.get() == Some(source_id);
+    let marked = use_marks && state.source_clip.get() == Some(source_id);
     let full = if media_type == MediaType::Image { STILL_DURATION_US } else { duration.max(1) };
     let src_in = if marked { state.src_in.get().unwrap_or(0).clamp(0, full - 1) } else { 0 };
     let src_out = if marked { state.src_out.get().unwrap_or(full).clamp(src_in + 1, full) } else { full };
@@ -79,8 +80,9 @@ fn clips_for_source(
 
 /// Place a Media Pool source on the timeline. `track` overrides the destination
 /// track of its kind (used when a clip is dropped on a particular row), and
-/// `at_us` the place (a drop); without it the clip goes to the playhead.
-pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Option<i64>, track: Option<Uuid>) {
+/// `at_us` the place (a drop); without it the clip goes to the playhead. `use_marks`
+/// off ignores the viewer's In/Out marks and places the whole clip.
+pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Option<i64>, track: Option<Uuid>, use_marks: bool) {
     let dropped = at_us.is_some();
     let mut video = state.dest_track(TrackKind::Video);
     let mut audio = state.dest_track(TrackKind::Audio);
@@ -101,7 +103,7 @@ pub fn place_source(state: &Rc<AppState>, source_id: Uuid, how: Place, at_us: Op
             .unwrap_or(0);
     }
 
-    let mut clips = clips_for_source(state, source_id, at, video, audio);
+    let mut clips = clips_for_source_marked(state, source_id, at, video, audio, use_marks);
     if clips.is_empty() {
         state.message("Nothing to place: pick a clip in the Media Pool first.");
         return;
@@ -217,7 +219,7 @@ pub fn current_source(state: &AppState) -> Option<Uuid> {
 
 pub fn place_current(state: &Rc<AppState>, how: Place) {
     match current_source(state) {
-        Some(id) => place_source(state, id, how, None, None),
+        Some(id) => place_source(state, id, how, None, None, true),
         None => state.message("Pick a clip in the Media Pool first."),
     }
 }
@@ -342,40 +344,282 @@ pub fn add_filter(state: &Rc<AppState>, filter: &ClipEffect) {
     }
 }
 
-/// Cross dissolve from the previous clip into each selected clip. The incoming
-/// clip needs footage before its In point to dissolve from.
-pub fn cross_dissolve(state: &Rc<AppState>, seconds: f64) {
-    let wanted = (seconds.max(0.0) * 1_000_000.0) as i64;
-    let frame = state.frame_us();
-    let mut reason: Option<&str> = None;
-    let mut commands: Vec<Box<dyn Command>> = Vec::new();
-    for (track, clip) in all_selected(state) {
-        // Length of the clip this one touches, if any.
-        let previous = state
-            .with_timeline(|t| t.find_track(track).and_then(|tr| tr.clips.iter().find(|c| c.timeline_out == clip.timeline_in).map(|c| c.duration_us())))
-            .flatten();
-        let Some(previous) = previous else {
-            reason = Some("A cross dissolve needs a clip touching the start of the selected one.");
-            continue;
-        };
-        let length = if wanted == 0 { 0 } else { wanted.min(clip.to_timeline_floor_us(clip.source_in)).min(previous / 2) };
-        if wanted > 0 && length < frame {
-            reason = Some("This clip starts at the very beginning of its footage, so there is nothing to dissolve from. Trim its start a little first.");
+// ---- Transitions ---------------------------------------------------------------
+//
+// Transitions are objects on clip edges (see tempo_timeline::transition). Resolve's
+// workflow: select an edit point (green) or a transition (red), Ctrl+T adds one,
+// Ctrl+C copies a selected transition, Ctrl+V pastes it on the selected edit, Up/Down
+// carry the edit selection from edit to edit.
+
+/// Resolve's standard transition duration (Preferences, Editing): one second.
+pub const STANDARD_TRANSITION_S: f64 = 1.0;
+
+/// Resolve's Cross Fade lives on sound; every other kind on pictures.
+fn is_audio_kind(kind: &TransitionKind) -> bool {
+    matches!(kind, TransitionKind::Crossfade)
+}
+
+/// Where the edit a transition belongs to is: its clip's start (In) or end (Out).
+pub(crate) fn transition_edit_us(track: &Track, t: &Transition) -> Option<i64> {
+    let clip = track.find_clip(t.clip_id)?;
+    Some(if t.edge == TransitionEdge::In { clip.timeline_in } else { clip.timeline_out })
+}
+
+/// `us` to the nearest whole frame.
+fn whole_frames(us: i64, fps: RationalFps) -> i64 {
+    frame_to_us(us_to_frame(us.max(0), fps), fps)
+}
+
+/// `template` (its kind, colour, ease and wanted length) fitted to an edit point as
+/// Resolve places it: inside the clip at a head or a tail; on a cut centred when the
+/// handles allow the whole length, else ending or starting on the cut, whichever fits
+/// it (or, when none does, leaves the most), shortened to what fits. Whole frames.
+pub(crate) fn fit_transition(
+    track: &Track,
+    edit: &EditTarget,
+    template: &Transition,
+    sources: &HashMap<Uuid, MediaSource>,
+    fps: RationalFps,
+) -> Result<Transition, &'static str> {
+    use TransitionAlignment::*;
+    let alignments: &[TransitionAlignment] = match edit.kind {
+        EditKind::Head => &[StartAtCut],
+        EditKind::Tail => &[EndAtCut],
+        EditKind::Cut => &[Centered, EndAtCut, StartAtCut],
+    };
+    let frame = frame_to_us(1, fps);
+    let wanted = whole_frames(template.duration_us, fps).max(frame);
+    let room = |al: &TransitionAlignment| track.max_transition_us(edit.clip_id, edit.edge, *al, sources, fps);
+    // `rev` so that on a tie `max_by_key` keeps the earlier, preferred alignment.
+    let alignment = *alignments.iter().find(|al| room(al) >= wanted).or_else(|| alignments.iter().rev().max_by_key(|al| room(al))).unwrap_or(&Centered);
+    let length = wanted.min(room(&alignment));
+    if length < frame {
+        return Err("There is not enough footage past the ends of these clips for a transition here.");
+    }
+    Ok(Transition { id: Uuid::new_v4(), clip_id: edit.clip_id, edge: edit.edge, alignment, duration_us: length, ..template.clone() })
+}
+
+/// The edit point of `track` nearest `at_us`: one within `reach_us`, or an edge of the
+/// clip under `at_us`. Where a transition dropped there goes.
+pub(crate) fn nearest_edit(track: &Track, at_us: i64, reach_us: i64) -> Option<EditTarget> {
+    let under = track.clip_at(at_us).map(|c| (c.timeline_in, c.timeline_out));
+    track
+        .edit_points()
+        .into_iter()
+        .filter(|e| (e.position_us - at_us).abs() <= reach_us || under.is_some_and(|(a, b)| e.position_us == a || e.position_us == b))
+        .min_by_key(|e| (e.position_us - at_us).abs())
+}
+
+/// The edit before (or after) `from_us` among `points`; the timeline's start and its
+/// end (`end_us`) count as edits, as with Resolve's Up and Down.
+pub(crate) fn neighbour_edit(points: impl IntoIterator<Item = i64>, from_us: i64, end_us: i64, forward: bool) -> Option<i64> {
+    let all = points.into_iter().chain([0, end_us]);
+    if forward {
+        all.filter(|p| *p > from_us).min()
+    } else {
+        all.filter(|p| *p < from_us).max()
+    }
+}
+
+/// The length of a transition while one of its free edges is dragged `delta_us` along
+/// the timeline: dragging away from the middle lengthens it, and a transition with
+/// both edges free (centred on a cut) changes on both sides at once. Whole frames,
+/// from one frame to `max_us`.
+pub(crate) fn dragged_length(from_us: i64, delta_us: i64, left_edge: bool, both_free: bool, max_us: i64, fps: RationalFps) -> i64 {
+    let grow = if left_edge { -delta_us } else { delta_us } * if both_free { 2 } else { 1 };
+    let frame = frame_to_us(1, fps);
+    whole_frames(from_us + grow, fps).clamp(frame, max_us.max(frame))
+}
+
+/// The edit at `position_us` on `track_id`, and the same edit on the tracks whose clips
+/// there are linked to its clips (picture and sound), when `linked` is on.
+pub(crate) fn edit_group(t: &Timeline, track_id: Uuid, position_us: i64, linked: bool) -> Vec<(Uuid, TrackKind)> {
+    let Some(track) = t.find_track(track_id) else { return Vec::new() };
+    let at_edit = |c: &&Clip| c.timeline_in == position_us || c.timeline_out == position_us;
+    let links: Vec<Uuid> = track.clips.iter().filter(at_edit).filter_map(|c| c.properties.link).collect();
+    let mut group = vec![(track_id, track.kind)];
+    if linked && !links.is_empty() {
+        let partners = t.tracks.iter().filter(|o| o.id != track_id && o.clips.iter().filter(at_edit).any(|c| c.properties.link.is_some_and(|l| links.contains(&l))));
+        group.extend(partners.map(|o| (o.id, o.kind)));
+    }
+    group
+}
+
+/// The selected transition and its track.
+pub fn selected_transition(state: &AppState) -> Option<(Uuid, Transition)> {
+    let Some(EditSelection::Transition { track_id, clip_id, edge }) = state.edit_selection.get() else { return None };
+    let t = state.with_timeline(|t| t.find_track(track_id)?.transition_at_edit(clip_id, edge).cloned()).flatten()?;
+    Some((track_id, t))
+}
+
+/// `template` fitted to the edit at `position_us` on a track (see `fit_transition`), or
+/// why it cannot go there.
+fn placed_transition(state: &AppState, track_id: Uuid, position_us: i64, template: &Transition) -> Result<Transition, &'static str> {
+    state.with_project(|p| place_on(&p.timeline, &p.sources, p.timeline_fps(), track_id, position_us, template)).unwrap_or(Err("Open a project first."))
+}
+
+fn place_on(
+    timeline: &Timeline,
+    sources: &HashMap<Uuid, MediaSource>,
+    fps: RationalFps,
+    track_id: Uuid,
+    position_us: i64,
+    template: &Transition,
+) -> Result<Transition, &'static str> {
+    let track = timeline.find_track(track_id).ok_or("That track is no longer there.")?;
+    if track.locked {
+        return Err("That track is locked. Click its lock in the track header to edit it.");
+    }
+    if is_audio_kind(&template.kind) != (track.kind == TrackKind::Audio) {
+        return Err(if track.kind == TrackKind::Audio { "Video transitions go on video tracks." } else { "Audio transitions go on audio tracks." });
+    }
+    let edit = track.edit_at(position_us).ok_or("There is no edit point there.")?;
+    fit_transition(track, &edit, template, sources, fps)
+}
+
+/// The standard transitions for Add Transition, one per free edit, each fitted with the
+/// ones before it already in place, so a short clip's two transitions share its length.
+/// Returns them with the reason the last refused edit gave, if any.
+fn fill_edits(
+    timeline: &Timeline,
+    sources: &HashMap<Uuid, MediaSource>,
+    fps: RationalFps,
+    edits: &[(Uuid, i64, TransitionKind)],
+    length_us: i64,
+) -> (Vec<(Uuid, Transition)>, Option<&'static str>) {
+    let mut scratch = timeline.clone();
+    let (mut placed, mut why) = (Vec::new(), None);
+    for (track_id, position, kind) in edits {
+        // No second transition on an edit that has one.
+        let taken = scratch.find_track(*track_id).and_then(|track| {
+            let edit = track.edit_at(*position)?;
+            Some(track.transition_at_edit(edit.clip_id, edit.edge).is_some())
+        });
+        if taken != Some(false) {
+            why = Some("There is already a transition there.");
             continue;
         }
-        let mut edited = clip.clone();
-        edited.properties.dissolve_in_us = length;
-        if edited != clip {
-            commands.push(Box::new(EditClipCommand::new("Cross Dissolve", edited)));
+        let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind.clone(), length_us, TransitionAlignment::Centered);
+        match place_on(&scratch, sources, fps, *track_id, *position, &template) {
+            Ok(t) => {
+                if SetTransitionCommand::set(*track_id, t.clone()).execute(&mut scratch).is_ok() {
+                    placed.push((*track_id, t));
+                }
+            }
+            Err(e) => why = Some(e),
         }
     }
-    if !commands.is_empty() {
-        state.execute(Box::new(CompositeCommand::new("Cross Dissolve", commands)));
-    } else if let Some(reason) = reason {
-        state.message(reason);
-    } else if state.selection.get().is_none() {
-        state.message("Select the clip that should dissolve in.");
+    (placed, why)
+}
+
+/// Ctrl+C with a transition selected: copy the transition alone, as Resolve does.
+pub fn copy_transition(state: &AppState) -> bool {
+    let Some((_, t)) = selected_transition(state) else { return false };
+    *state.transition_clipboard.borrow_mut() = Some(t);
+    true
+}
+
+/// Backspace / Delete with a transition selected: remove only the transition.
+pub fn delete_transition(state: &Rc<AppState>) -> bool {
+    let Some((track, t)) = selected_transition(state) else { return false };
+    state.execute(Box::new(SetTransitionCommand::remove(track, t.clip_id, t.edge)));
+    true
+}
+
+/// Ctrl+V with an edit point selected and a transition copied: put the copy on that
+/// edit (centred on a cut, inside the clip at a head or tail), replacing any there, as
+/// one undo step. The edit stays selected, so Up, Ctrl+V can carry on.
+pub fn paste_transition(state: &Rc<AppState>) -> bool {
+    let Some(EditSelection::Edit { track_id, position_us }) = state.edit_selection.get() else { return false };
+    let Some(copied) = state.transition_clipboard.borrow().clone() else { return false };
+    match placed_transition(state, track_id, position_us, &copied) {
+        Ok(t) => {
+            state.execute(Box::new(SetTransitionCommand::set(track_id, t)));
+        }
+        Err(why) => state.message(why),
     }
+    true
+}
+
+/// Change the length of a transition, limited to one frame and to what the handles allow.
+pub fn set_transition_length(state: &Rc<AppState>, track_id: Uuid, clip_id: Uuid, edge: TransitionEdge, length_us: i64) {
+    let changed = state
+        .with_project(|p| {
+            let track = p.timeline.find_track(track_id)?;
+            let mut t = track.transition_at_edit(clip_id, edge)?.clone();
+            let max = track.max_transition_us(clip_id, edge, t.alignment, &p.sources, p.timeline_fps());
+            t.duration_us = dragged_length(length_us, 0, false, false, max, p.timeline_fps());
+            Some(t)
+        })
+        .flatten();
+    if let Some(t) = changed {
+        state.execute(Box::new(SetTransitionCommand::set(track_id, t)));
+    }
+}
+
+/// Clicking a transition in the Effects panel: put `kind` on the selected edit point
+/// (and the edits linked to it), or on both ends of each selected clip.
+pub fn add_transition(state: &Rc<AppState>, kind: TransitionKind) {
+    if is_audio_kind(&kind) {
+        add_transitions(state, None, true);
+    } else {
+        add_transitions(state, Some(kind), false);
+    }
+}
+
+/// Resolve's Add Transition keys: Ctrl+T both, Alt+T `video` only, Shift+T `audio` only.
+/// The standard transition is a 1 s Cross Dissolve on pictures, a Cross Fade on sound.
+pub fn add_standard_transitions(state: &Rc<AppState>, video: bool, audio: bool) {
+    add_transitions(state, video.then_some(TransitionKind::CrossDissolve), audio);
+}
+
+/// The edits Add Transition works on: the selected edit point or transition with the
+/// edits linked to it, else both ends of every selected clip. (track, kind, position).
+fn edits_to_fill(state: &AppState) -> Vec<(Uuid, TrackKind, i64)> {
+    let linked = state.linked_selection.get();
+    let at = match state.edit_selection.get() {
+        Some(EditSelection::Edit { track_id, position_us }) => Some((track_id, position_us)),
+        Some(EditSelection::Transition { track_id, .. }) => {
+            selected_transition(state).and_then(|(_, t)| state.with_timeline(|tl| transition_edit_us(tl.find_track(track_id)?, &t)).flatten()).map(|p| (track_id, p))
+        }
+        None => None,
+    };
+    let mut edits: Vec<(Uuid, TrackKind, i64)> = match at {
+        Some((track_id, pos)) => state.with_timeline(|t| edit_group(t, track_id, pos, linked)).unwrap_or_default().into_iter().map(|(id, kind)| (id, kind, pos)).collect(),
+        None => {
+            let kinds = |id: Uuid| state.with_timeline(|t| t.find_track(id).map(|tr| tr.kind)).flatten().unwrap_or(TrackKind::Video);
+            all_selected(state).into_iter().flat_map(|(track, c)| [(track, kinds(track), c.timeline_in), (track, kinds(track), c.timeline_out)]).collect()
+        }
+    };
+    edits.sort_by_key(|(id, _, pos)| (*id, *pos));
+    edits.dedup();
+    edits
+}
+
+fn add_transitions(state: &Rc<AppState>, video: Option<TransitionKind>, audio: bool) {
+    let edits = edits_to_fill(state);
+    if edits.is_empty() {
+        state.message("Select an edit point or a clip on the timeline first.");
+        return;
+    }
+    let wanted: Vec<(Uuid, i64, TransitionKind)> = edits
+        .into_iter()
+        .filter_map(|(track_id, track_kind, position)| {
+            let kind = match track_kind {
+                TrackKind::Video => video.clone(),
+                TrackKind::Audio => audio.then_some(TransitionKind::Crossfade),
+            };
+            kind.map(|k| (track_id, position, k))
+        })
+        .collect();
+    let length = state.standard_transition_us();
+    let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.timeline_fps(), &wanted, length)) else { return };
+    if placed.is_empty() {
+        state.message(why.unwrap_or("There is already a transition there."));
+        return;
+    }
+    let commands: Vec<Box<dyn Command>> = placed.into_iter().map(|(track_id, t)| Box::new(SetTransitionCommand::set(track_id, t)) as Box<dyn Command>).collect();
+    state.execute(Box::new(CompositeCommand::new("Add Transition", commands)));
 }
 
 /// Link or unlink the selected clips (Resolve's Ctrl+Alt+L).
@@ -608,23 +852,42 @@ pub fn split_selected(state: &Rc<AppState>) {
 /// the clips after them move up to close the gap.
 pub fn trim_to_playhead(state: &Rc<AppState>, edge: TrimEdge, ripple: bool) {
     let pos = state.playhead_us();
+    let name = if ripple { "Ripple Trim" } else { "Trim" };
     // Only clips the playhead is inside can be trimmed to it.
-    let done = for_selected(state, if ripple { "Ripple Trim" } else { "Trim" }, |_, clip| {
+    let make = |_: Uuid, clip: &Clip| {
         let delta = match edge {
             TrimEdge::In => pos - clip.timeline_in,
             TrimEdge::Out => pos - clip.timeline_out,
         };
         (pos > clip.timeline_in && pos < clip.timeline_out).then(|| -> Box<dyn Command> {
             if ripple {
-                Box::new(tempo_timeline::RippleTrimCommand::new(clip.id, edge, delta))
+                Box::new(RippleTrimCommand::new(clip.id, edge, delta))
             } else {
                 Box::new(TrimClipCommand::new(clip.id, edge, delta))
             }
         })
-    });
+    };
+    // As Resolve: with nothing selected, the clips under the playhead are trimmed.
+    let done = if state.selected_ids().is_empty() {
+        let under = state.with_timeline(|t| clips_under(t, pos)).unwrap_or_default();
+        let commands: Vec<Box<dyn Command>> = under.iter().filter_map(|(track, clip)| make(*track, clip)).collect();
+        !commands.is_empty() && state.execute(Box::new(CompositeCommand::new(name, commands)))
+    } else {
+        for_selected(state, name, make)
+    };
     if !done {
-        state.message("Select a clip and put the playhead inside it first.");
+        state.message("Put the playhead inside a clip first.");
     }
+}
+
+/// The clips the playhead is strictly inside, on unlocked tracks, latest first.
+fn clips_under(timeline: &Timeline, pos: i64) -> Vec<(Uuid, Clip)> {
+    timeline
+        .tracks
+        .iter()
+        .filter(|t| !t.locked)
+        .flat_map(|t| t.clips.iter().filter(|c| pos > c.timeline_in && pos < c.timeline_out).map(|c| (t.id, c.clone())))
+        .collect()
 }
 
 /// Make the selected clips fade in up to the playhead, or fade out from it.
@@ -729,11 +992,18 @@ pub fn close_gap(state: &Rc<AppState>, gap: Gap) {
     }
 }
 
-/// Take a file out of the Media Pool. Files still used on the timeline stay.
+/// Take a file out of the Media Pool. Files still used on any timeline stay.
 pub fn remove_source(state: &Rc<AppState>, source: Uuid) {
-    let used = state.with_timeline(|t| t.tracks.iter().flat_map(|tr| tr.clips.iter()).any(|c| c.source_id == source)).unwrap_or(false);
-    if used {
-        state.message("This clip is used on the timeline. Delete it from the timeline first.");
+    let used_on = state
+        .with_project(|p| {
+            std::iter::once(&p.timeline)
+                .chain(&p.timelines)
+                .find(|t| t.tracks.iter().flat_map(|tr| tr.clips.iter()).any(|c| c.source_id == source))
+                .map(|t| t.name.clone())
+        })
+        .flatten();
+    if let Some(timeline) = used_on {
+        state.message(format!("This clip is used on {timeline}. Delete it from that timeline first."));
         return;
     }
     let removed = state.project.borrow_mut().as_mut().is_some_and(|p| p.sources.remove(&source).is_some());
@@ -812,9 +1082,9 @@ pub fn move_selected(state: &Rc<AppState>, delta_us: i64, shift: Option<(TrackKi
 /// it are trimmed the same way while linked selection is on.
 pub fn trim_clip(state: &Rc<AppState>, clip_id: Uuid, edge: TrimEdge, delta_us: i64, ripple: bool) {
     let mut ids = vec![clip_id];
-    if state.is_selected(clip_id) {
-        ids.extend(state.selected_ids().into_iter().filter(|id| *id != clip_id));
-    }
+    // A clip edge grabbed as an edit point leaves the clip unselected; its linked partners still follow.
+    let others = if state.is_selected(clip_id) { state.selected_ids() } else { state.linked_to(clip_id) };
+    ids.extend(others.into_iter().filter(|id| *id != clip_id));
     let link = state.with_timeline(|t| t.find_clip(clip_id).and_then(|(_, c)| c.properties.link)).flatten();
     // Only clips linked to this one follow; other selected clips are left alone.
     let partners: Vec<Uuid> = state
@@ -829,7 +1099,7 @@ pub fn trim_clip(state: &Rc<AppState>, clip_id: Uuid, edge: TrimEdge, delta_us: 
         .into_iter()
         .map(|id| -> Box<dyn Command> {
             if ripple {
-                Box::new(tempo_timeline::RippleTrimCommand::new(id, edge, delta_us))
+                Box::new(RippleTrimCommand::new(id, edge, delta_us))
             } else {
                 Box::new(TrimClipCommand::new(id, edge, delta_us))
             }
@@ -891,16 +1161,32 @@ pub fn move_track(state: &Rc<AppState>, step: i32) {
 // ---- Markers ---------------------------------------------------------------
 
 pub fn marker_at_playhead(state: &AppState) -> Option<Marker> {
-    let pos = state.playhead_us();
-    let frame = state.frame_us();
-    state.with_timeline(|t| t.markers.iter().find(|m| (m.position_us - pos).abs() < frame).cloned()).flatten()
+    let (pos, frame) = (state.playhead_us(), state.frame_us());
+    state.with_timeline(|t| marker_on_frame(&t.markers, pos, frame).cloned()).flatten()
 }
 
-pub fn add_marker(state: &Rc<AppState>) -> Option<Marker> {
+/// The marker on the same frame as `pos`.
+pub fn marker_on_frame(markers: &[Marker], pos: i64, frame_us: i64) -> Option<&Marker> {
+    markers.iter().find(|m| (m.position_us - pos).abs() < frame_us)
+}
+
+/// "Marker N" for a new marker: one more than the markers already there, and not a name in use.
+pub fn default_marker_name(others: &[Marker]) -> String {
+    (others.len() + 1..)
+        .map(|n| format!("Marker {n}"))
+        .find(|name| !others.iter().any(|m| &m.name == name))
+        .unwrap_or_default()
+}
+
+/// `named`: Ctrl+M (the popup) names it "Marker N" from the start, as Resolve does; M and
+/// the Marker button leave it unnamed, an editing note that is never exported as a chapter.
+pub fn add_marker(state: &Rc<AppState>, named: bool) -> Option<Marker> {
     if let Some(existing) = marker_at_playhead(state) {
         return Some(existing);
     }
-    let marker = Marker::new(state.frame_floor(state.playhead_us()), "", MarkerColor::Blue);
+    let others = state.with_timeline(|t| t.markers.clone()).unwrap_or_default();
+    let name = if named { default_marker_name(&others) } else { String::new() };
+    let marker = Marker::new(state.frame_floor(state.playhead_us()), name, MarkerColor::Blue);
     state.execute(Box::new(AddMarkerCommand::new(marker.clone()))).then_some(marker)
 }
 
@@ -934,23 +1220,35 @@ pub fn goto_marker(state: &Rc<AppState>, forward: bool) {
 
 // ---- Navigation and marks ----------------------------------------------------
 
-/// Jump to the next or previous cut on any track.
+/// Up / Down (Resolve's Previous / Next Edit), measured from the playhead. With an edit
+/// point or a transition selected, the playhead goes to the neighbouring edit on its
+/// track and that edit
+/// becomes the selection, so Up, Ctrl+V, Up, Ctrl+V… pastes on every cut. Otherwise
+/// the playhead goes to the next or previous cut on any track.
 pub fn goto_edit(state: &Rc<AppState>, forward: bool) {
-    let pos = state.player.position_us();
-    let target = state
+    // Previous / Next Edit are timeline commands: they count from the timeline playhead and
+    // move it, whatever the viewer shows. A selected edit or transition only says which
+    // track to follow; without one every track counts.
+    let at = state.playhead_us();
+    let track = match state.edit_selection.get() {
+        Some(EditSelection::Edit { track_id, .. } | EditSelection::Transition { track_id, .. }) => Some(track_id),
+        None => None,
+    };
+    let next = state
         .with_timeline(|t| {
-            let points = t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]);
-            if forward {
-                points.filter(|p| *p > pos).min()
-            } else {
-                points.filter(|p| *p < pos).max()
-            }
+            let points: Vec<i64> = match track {
+                Some(id) => t.find_track(id)?.edit_points().into_iter().map(|e| e.position_us).collect(),
+                None => t.tracks.iter().flat_map(|tr| tr.clips.iter()).flat_map(|c| [c.timeline_in, c.timeline_out]).collect(),
+            };
+            neighbour_edit(points, at, t.duration_us(), forward)
         })
         .flatten();
-    if let Some(t) = target {
-        state.player.pause();
-        state.player.seek(t, true);
+    let Some(pos) = next else { return };
+    if let Some(track_id) = track {
+        state.select_edit(Some(EditSelection::Edit { track_id, position_us: pos }));
     }
+    state.player.pause();
+    state.player.seek_timeline(pos);
 }
 
 pub fn step_frames(state: &Rc<AppState>, frames: i64) {
@@ -983,5 +1281,240 @@ pub fn mark_clip(state: &Rc<AppState>) {
         state.mark_in.set(Some(a));
         state.mark_out.set(Some(b));
         state.emit(Change::Options);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_names_count_up_and_skip_taken_ones() {
+        let m = |name: &str| Marker::new(0, name, MarkerColor::Blue);
+        assert_eq!(default_marker_name(&[]), "Marker 1");
+        assert_eq!(default_marker_name(&[m("Marker 1"), m("Section")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 2"), m("Intro")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 2")]), "Marker 3");
+        assert_eq!(default_marker_name(&[m("Marker 1"), m("Marker 3")]), "Marker 4");
+    }
+
+    #[test]
+    fn marker_is_found_only_on_the_same_frame() {
+        let markers = [Marker::new(1_000_000, "a", MarkerColor::Red)];
+        assert!(marker_on_frame(&markers, 1_020_000, 33_333).is_some());
+        assert!(marker_on_frame(&markers, 1_040_000, 33_333).is_none());
+    }
+
+    const S: i64 = 1_000_000;
+    const FPS: RationalFps = RationalFps::FPS_25;
+
+    /// A video track with A [0, 4 s] (footage 1-5 s) and B [4, 8 s] (footage `b_in` on),
+    /// both from 10 s files: A has 5 s of tail handle, B `b_in` of head handle.
+    fn cut(b_in: i64) -> (Track, HashMap<Uuid, MediaSource>) {
+        let mut track = Track::new(TrackKind::Video, 1, "Video 1", 0);
+        let mut sources = HashMap::new();
+        for (name, tin, sin) in [("a", 0, S), ("b", 4 * S, b_in)] {
+            let src = MediaSource::new(std::path::PathBuf::from(name), MediaType::Video, 10 * S);
+            track.clips.push(Clip::new(track.id, src.id, ClipType::Video, name, tin, tin + 4 * S, sin, sin + 4 * S));
+            sources.insert(src.id, src);
+        }
+        (track, sources)
+    }
+
+    fn standard(d: i64) -> Transition {
+        Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::DipToColor, d, TransitionAlignment::EndAtCut)
+    }
+
+    fn fit(track: &Track, sources: &HashMap<Uuid, MediaSource>, at: i64, d: i64) -> Result<(TransitionAlignment, i64, TransitionEdge), &'static str> {
+        let edit = track.edit_at(at).expect("an edit");
+        fit_transition(track, &edit, &standard(d), sources, FPS).map(|t| (t.alignment, t.duration_us, t.edge))
+    }
+
+    #[test]
+    fn a_transition_is_centred_on_a_cut_when_the_handles_allow() {
+        let (track, sources) = cut(2 * S);
+        assert_eq!(fit(&track, &sources, 4 * S, S), Ok((TransitionAlignment::Centered, S, TransitionEdge::In)));
+        // The kind, colour and ease come from the template; the clip edge from the edit.
+        let t = fit_transition(&track, &track.edit_at(4 * S).unwrap(), &standard(S), &sources, FPS).unwrap();
+        assert_eq!((t.kind, t.clip_id), (TransitionKind::DipToColor, track.clips[1].id));
+    }
+
+    #[test]
+    fn trim_without_a_selection_takes_the_clips_under_the_playhead_on_unlocked_tracks() {
+        let (track, _) = cut(2 * S);
+        let mut locked = track.clone();
+        locked.id = Uuid::new_v4();
+        locked.locked = true;
+        let mut timeline = Timeline::new();
+        timeline.tracks = vec![track, locked];
+        let under = clips_under(&timeline, 5 * S);
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].1.timeline_in, 4 * S);
+        // On a cut the playhead is inside neither clip.
+        assert!(clips_under(&timeline, 4 * S).is_empty());
+    }
+
+    #[test]
+    fn add_transition_on_a_short_clip_fits_its_two_transitions_together() {
+        // A [0, 4 s], a 0.6 s B, C after it: Ctrl+T on B puts a transition on both its cuts.
+        let (mut track, mut sources) = cut(2 * S);
+        track.clips[1].timeline_out = 4_600_000;
+        track.clips[1].source_out = 2_600_000;
+        let src = MediaSource::new(std::path::PathBuf::from("c"), MediaType::Video, 10 * S);
+        track.clips.push(Clip::new(track.id, src.id, ClipType::Video, "c", 4_600_000, 8 * S, 2 * S, 5_400_000));
+        sources.insert(src.id, src);
+        let id = track.id;
+        let mut timeline = Timeline::new();
+        timeline.tracks = vec![track];
+        let wanted = [(id, 4 * S, TransitionKind::CrossDissolve), (id, 4_600_000, TransitionKind::CrossDissolve)];
+        let (placed, _) = fill_edits(&timeline, &sources, FPS, &wanted, tempo_timeline::STANDARD_TRANSITION_US);
+        assert_eq!(placed.len(), 2);
+        // What is stored is what is drawn: put both on, and each span is as long as its duration.
+        let track = &mut timeline.tracks[0];
+        track.transitions = placed.iter().map(|(_, t)| t.clone()).collect();
+        for t in &track.transitions {
+            let (start, end) = track.transition_span(t).expect("a span");
+            assert_eq!(end - start, t.duration_us, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn short_handles_move_the_transition_off_centre_then_shorten_it() {
+        // No footage before B's In point: only "start on edit" fits.
+        let (track, sources) = cut(0);
+        assert_eq!(fit(&track, &sources, 4 * S, S), Ok((TransitionAlignment::StartAtCut, S, TransitionEdge::In)));
+        // Half a second of head: a 3 s transition does not fit centred (1 s at most) but starts on the cut.
+        let (track, sources) = cut(S / 2);
+        assert_eq!(fit(&track, &sources, 4 * S, 3 * S), Ok((TransitionAlignment::StartAtCut, 3 * S, TransitionEdge::In)));
+        // 6 s fits nowhere: the alignment with the most room, shortened (B is 4 s long).
+        assert_eq!(fit(&track, &sources, 4 * S, 6 * S), Ok((TransitionAlignment::StartAtCut, 4 * S, TransitionEdge::In)));
+    }
+
+    #[test]
+    fn no_footage_past_either_clip_refuses_the_transition() {
+        let (track, mut sources) = cut(0);
+        // A ends where its file ends.
+        sources.get_mut(&track.clips[0].source_id).unwrap().duration_us = 5 * S;
+        assert!(fit(&track, &sources, 4 * S, S).is_err());
+    }
+
+    #[test]
+    fn heads_and_tails_get_their_transition_inside_the_clip() {
+        let (track, sources) = cut(2 * S);
+        assert_eq!(fit(&track, &sources, 0, S), Ok((TransitionAlignment::StartAtCut, S, TransitionEdge::In)));
+        assert_eq!(fit(&track, &sources, 8 * S, S), Ok((TransitionAlignment::EndAtCut, S, TransitionEdge::Out)));
+        // Lengths are whole frames (25 fps: 40 ms).
+        assert_eq!(fit(&track, &sources, 8 * S, 1_010_000).map(|f| f.1), Ok(S));
+    }
+
+    #[test]
+    fn a_drop_goes_to_the_nearest_edit_in_reach() {
+        let (track, _) = cut(2 * S);
+        let at = |us, reach| nearest_edit(&track, us, reach).map(|e| (e.position_us, e.kind));
+        assert_eq!(at(3_900_000, 200_000), Some((4 * S, EditKind::Cut)));
+        // Over the middle of a clip: the nearer of its own edges, whatever the reach.
+        assert_eq!(at(S, 0), Some((0, EditKind::Head)));
+        assert_eq!(at(7 * S, 0), Some((8 * S, EditKind::Tail)));
+        // Past the end of the last clip: only within reach.
+        assert_eq!(at(9 * S, S / 2), None);
+        assert_eq!(at(9 * S, 3 * S / 2), Some((8 * S, EditKind::Tail)));
+    }
+
+    #[test]
+    fn a_copied_transition_is_placed_by_the_edit_it_lands_on_not_the_timeline_it_came_from() {
+        let (track, sources) = cut(2 * S);
+        let mut timeline = Timeline::new();
+        let track_id = track.id;
+        let b_id = track.clips[1].id;
+        timeline.tracks.push(track);
+        // Copied on another timeline: its clip id means nothing here.
+        let copied = Transition::new(Uuid::new_v4(), TransitionEdge::Out, TransitionKind::DipToColor, S, TransitionAlignment::EndAtCut);
+        let t = place_on(&timeline, &sources, FPS, track_id, 4 * S, &copied).expect("fits");
+        assert_eq!((t.clip_id, t.kind.clone(), t.duration_us), (b_id, TransitionKind::DipToColor, S));
+        // An audio transition does not go on a video track.
+        let fade = Transition::new(Uuid::new_v4(), TransitionEdge::In, TransitionKind::Crossfade, S, TransitionAlignment::Centered);
+        assert_eq!(place_on(&timeline, &sources, FPS, track_id, 4 * S, &fade), Err("Audio transitions go on audio tracks."));
+    }
+
+    #[test]
+    fn up_and_down_step_through_edits_and_the_timeline_ends() {
+        let points = [0, 4 * S, 8 * S];
+        assert_eq!(neighbour_edit(points, 4 * S, 10 * S, false), Some(0));
+        assert_eq!(neighbour_edit(points, 4 * S, 10 * S, true), Some(8 * S));
+        // The end of the timeline counts as an edit, even past this track's last clip.
+        assert_eq!(neighbour_edit(points, 8 * S, 10 * S, true), Some(10 * S));
+        assert_eq!(neighbour_edit(points, 10 * S, 10 * S, true), None);
+        assert_eq!(neighbour_edit(points, 0, 10 * S, false), None);
+        // A track starting later still lets Up reach the timeline start.
+        assert_eq!(neighbour_edit([2 * S], 2 * S, 10 * S, false), Some(0));
+    }
+
+    #[test]
+    fn dragging_an_edge_changes_the_length_in_whole_frames() {
+        // The left edge dragged 0.2 s left: 0.2 s longer, or 0.4 s when centred.
+        assert_eq!(dragged_length(S, -200_000, true, false, 3 * S, FPS), 1_200_000);
+        assert_eq!(dragged_length(S, -200_000, true, true, 3 * S, FPS), 1_400_000);
+        // The right edge dragged right lengthens, left shortens.
+        assert_eq!(dragged_length(S, 200_000, false, false, 3 * S, FPS), 1_200_000);
+        assert_eq!(dragged_length(S, -200_000, false, true, 3 * S, FPS), 600_000);
+        // A quarter of a frame rounds away.
+        assert_eq!(dragged_length(S, 10_000, false, false, 3 * S, FPS), S);
+        // At least one frame, at most what the handles allow.
+        assert_eq!(dragged_length(S, 5 * S, true, false, 3 * S, FPS), 40_000);
+        assert_eq!(dragged_length(S, -5 * S, true, true, 1_500_000, FPS), 1_500_000);
+    }
+
+    #[test]
+    fn an_edit_takes_its_linked_tracks_along() {
+        let mut t = Timeline::new_default();
+        let (v1, a1, v2) = (t.tracks[0].id, t.tracks[2].id, t.tracks[1].id);
+        let link = Some(Uuid::new_v4());
+        let mut pic = Clip::new(v1, Uuid::new_v4(), ClipType::Video, "p", 0, 4 * S, 0, 4 * S);
+        let mut snd = Clip::new(a1, pic.source_id, ClipType::Audio, "s", 0, 4 * S, 0, 4 * S);
+        (pic.properties.link, snd.properties.link) = (link, link);
+        t.tracks[0].clips.push(pic);
+        t.tracks[2].clips.push(snd);
+        t.tracks[1].clips.push(Clip::new(v2, Uuid::new_v4(), ClipType::Video, "o", 0, 4 * S, 0, 4 * S));
+        assert_eq!(edit_group(&t, v1, 4 * S, true), vec![(v1, TrackKind::Video), (a1, TrackKind::Audio)]);
+        assert_eq!(edit_group(&t, a1, 0, true), vec![(a1, TrackKind::Audio), (v1, TrackKind::Video)]);
+        assert_eq!(edit_group(&t, v1, 4 * S, false), vec![(v1, TrackKind::Video)]);
+    }
+
+    #[test]
+    fn only_a_marker_added_for_the_popup_gets_a_default_name() {
+        // Arrange: unnamed markers are editing notes and never become chapters (UI_SPEC 7.4).
+        let state = AppState::new();
+        *state.project.borrow_mut() = Some(tempo_timeline::Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30));
+
+        // Act
+        let note = add_marker(&state, false).map(|m| m.name);
+        state.player.seek_timeline(1_000_000);
+        let popup = add_marker(&state, true).map(|m| m.name);
+
+        // Assert
+        assert_eq!(note.as_deref(), Some(""));
+        assert_eq!(popup.as_deref(), Some("Marker 2"));
+    }
+
+    #[test]
+    fn a_source_is_placed_whole_when_the_marks_are_not_to_be_used() {
+        // Arrange: a 10 s source with In/Out marks on it in the viewer.
+        let state = AppState::new();
+        let mut project = tempo_timeline::Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30);
+        let src = MediaSource::new(std::path::PathBuf::from("a"), MediaType::Video, 10 * S);
+        let (id, track) = (src.id, project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id));
+        project.sources.insert(id, src);
+        *state.project.borrow_mut() = Some(project);
+        state.source_clip.set(Some(id));
+        state.src_in.set(Some(2 * S));
+        state.src_out.set(Some(5 * S));
+
+        // Act
+        let marked = clips_for_source_marked(&state, id, 0, track, None, true);
+        let whole = clips_for_source_marked(&state, id, 0, track, None, false);
+
+        // Assert
+        assert_eq!((marked[0].source_in, marked[0].source_out), (2 * S, 5 * S));
+        assert_eq!((whole[0].source_in, whole[0].source_out), (0, 10 * S));
     }
 }

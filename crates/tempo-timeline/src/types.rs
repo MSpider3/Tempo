@@ -111,8 +111,24 @@ pub struct ClipProperties {
     pub fade_in_us: i64,
     #[serde(default)]
     pub fade_out_us: i64,
+    /// Set by `Track::transition_layers` on a video transition's fade: the transition's
+    /// Ease, ratios and curve shape that fade's ramp. Never saved; own fades stay linear.
+    #[serde(skip)]
+    pub fade_in_shape: Option<Box<Transition>>,
+    #[serde(skip)]
+    pub fade_out_shape: Option<Box<Transition>>,
+    /// Set by `Track::transition_layers` on the pieces of an Additive or Non-Additive
+    /// Dissolve: how the piece is drawn onto the picture under it. Never saved.
+    #[serde(skip)]
+    pub blend: crate::transition::PictureBlend,
+    /// Set by `Track::transition_layers` for Blur Dissolves: where this clip is blurred
+    /// (see `Clip::transition_blur`). Never saved.
+    #[serde(skip)]
+    pub blur_ramps: Vec<crate::transition::BlurRamp>,
     /// Cross dissolve: this clip starts appearing this long *before* its start,
     /// over the end of the clip it touches, using footage from before its In point.
+    /// Deprecated: kept so old files still read; loading turns it into a `Transition`
+    /// (`Track::convert_legacy_dissolves`). New code adds transitions instead.
     #[serde(default)]
     pub dissolve_in_us: i64,
     /// Clips that share a link id (a video clip and its sound) are selected,
@@ -150,6 +166,10 @@ impl Default for ClipProperties {
             enabled: true,
             fade_in_us: 0,
             fade_out_us: 0,
+            fade_in_shape: None,
+            fade_out_shape: None,
+            blend: crate::transition::PictureBlend::Normal,
+            blur_ramps: Vec::new(),
             dissolve_in_us: 0,
             link: None,
             effects: Vec::new(),
@@ -378,6 +398,9 @@ impl Clip {
 
     /// The part of this clip that plays before its start during a cross
     /// dissolve, as a clip of its own that fades in. `None` if it has no dissolve.
+    ///
+    /// Deprecated: dissolves are `Transition`s now (see `crate::transition`); renderers
+    /// should switch to `Track::transition_layers`. Kept until they have.
     pub fn dissolve_lead(&self) -> Option<Clip> {
         let d = self.properties.dissolve_in_us.min(self.to_timeline_floor_us(self.source_in));
         if d <= 0 {
@@ -419,10 +442,12 @@ impl Clip {
         let to_end = self.timeline_out - timeline_time_us;
         let mut factor = 1.0f32;
         if p.fade_in_us > 0 && from_start < p.fade_in_us {
-            factor = factor.min(from_start.max(0) as f32 / p.fade_in_us as f32);
+            let ramp = from_start.max(0) as f32 / p.fade_in_us as f32;
+            factor = factor.min(p.fade_in_shape.as_ref().map_or(ramp, |t| t.progress_at(ramp)));
         }
         if p.fade_out_us > 0 && to_end < p.fade_out_us {
-            factor = factor.min(to_end.max(0) as f32 / p.fade_out_us as f32);
+            let ramp = to_end.max(0) as f32 / p.fade_out_us as f32;
+            factor = factor.min(p.fade_out_shape.as_ref().map_or(ramp, |t| 1.0 - t.progress_at(1.0 - ramp)));
         }
         factor
     }
@@ -448,6 +473,58 @@ pub enum TransitionKind {
     FadeFromBlack,
     FadeFromWhite,
     Plugin(String),
+    /// Resolve's "Dip To Color Dissolve": the picture dissolves to `Transition::color`
+    /// over the first half and from it over the second.
+    DipToColor,
+    /// Resolve's "Additive Dissolve": the two pictures add up, so the middle is brighter.
+    AdditiveDissolve,
+    /// Resolve's "Non-Additive Dissolve": each pixel takes the brighter of the two pictures.
+    NonAdditiveDissolve,
+    /// Resolve's "Blur Dissolve": the outgoing picture blurs as it dissolves into the
+    /// incoming one, which comes in blurred and sharpens.
+    BlurDissolve,
+}
+
+impl TransitionKind {
+    /// Resolve's Effects > Video Transitions > Dissolve, in its order (Smooth Cut, an
+    /// optical-flow effect, is not offered).
+    pub const VIDEO_DISSOLVES: [TransitionKind; 5] = [
+        TransitionKind::AdditiveDissolve,
+        TransitionKind::BlurDissolve,
+        TransitionKind::CrossDissolve,
+        TransitionKind::DipToColor,
+        TransitionKind::NonAdditiveDissolve,
+    ];
+
+    /// The name Resolve shows for this transition (Effects panel, Inspector, timeline box).
+    pub fn resolve_name(&self) -> String {
+        match self {
+            TransitionKind::AdditiveDissolve => "Additive Dissolve".into(),
+            TransitionKind::BlurDissolve => "Blur Dissolve".into(),
+            TransitionKind::CrossDissolve => "Cross Dissolve".into(),
+            TransitionKind::DipToColor => "Dip To Color Dissolve".into(),
+            TransitionKind::NonAdditiveDissolve => "Non-Additive Dissolve".into(),
+            TransitionKind::Crossfade => "Cross Fade".into(),
+            TransitionKind::Plugin(name) => name.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// The id the Effects panel drags for a video dissolve.
+    pub fn effect_id(&self) -> Option<&'static str> {
+        Some(match self {
+            TransitionKind::AdditiveDissolve => "additive-dissolve",
+            TransitionKind::BlurDissolve => "blur-dissolve",
+            TransitionKind::CrossDissolve => "cross-dissolve",
+            TransitionKind::DipToColor => "dip-to-color",
+            TransitionKind::NonAdditiveDissolve => "non-additive-dissolve",
+            _ => return None,
+        })
+    }
+
+    pub fn from_effect_id(id: &str) -> Option<TransitionKind> {
+        Self::VIDEO_DISSOLVES.into_iter().find(|k| k.effect_id() == Some(id))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +544,39 @@ pub struct Transition {
     pub alignment: TransitionAlignment,
     pub plugin_id: Option<String>,
     pub plugin_params: Option<String>,
+    /// Colour of a Dip To Color dissolve, RGB 0.0-1.0. Black unless set.
+    #[serde(default)]
+    pub color: [f32; 3],
+    #[serde(default)]
+    pub ease: TransitionEase,
+    /// Resolve's Start Ratio and End Ratio: how far the mix has gone at the start and end
+    /// of the transition, 0.0-1.0 (Resolve shows 0-100). 0 and 1 unless set.
+    #[serde(default)]
+    pub start_ratio: f32,
+    #[serde(default = "full_ratio")]
+    pub end_ratio: f32,
+    /// Resolve's Transition Curve keys: `[place, value]`, both 0.0-1.0, `place` through
+    /// the transition, sorted. Empty: the curve follows the Ease (see `Transition::curve_at`).
+    #[serde(default)]
+    pub curve: Vec<[f32; 2]>,
+    /// The switch on the Inspector's Video section: off, the transition stays on the
+    /// timeline but plays as a cut.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn full_ratio() -> f32 {
+    1.0
+}
+
+/// Resolve's transition Ease setting: how the mix speeds up and slows down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransitionEase {
+    #[default]
+    None,
+    In,
+    Out,
+    InOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,8 +585,88 @@ pub enum MarkerColor {
     Green,
     Blue,
     Yellow,
+    /// Not one of Resolve's; kept so markers from older Tempo files keep their colour.
     Orange,
     Purple,
+    Cyan,
+    Pink,
+    Fuchsia,
+    Rose,
+    Lavender,
+    Sky,
+    Mint,
+    Lemon,
+    Sand,
+    Cocoa,
+    Cream,
+}
+
+impl MarkerColor {
+    /// Resolve's 16 marker colours, in the order its marker popup shows them.
+    pub const RESOLVE: [MarkerColor; 16] = [
+        Self::Blue,
+        Self::Cyan,
+        Self::Green,
+        Self::Yellow,
+        Self::Red,
+        Self::Pink,
+        Self::Purple,
+        Self::Fuchsia,
+        Self::Rose,
+        Self::Lavender,
+        Self::Sky,
+        Self::Mint,
+        Self::Lemon,
+        Self::Sand,
+        Self::Cocoa,
+        Self::Cream,
+    ];
+
+    /// The name Resolve shows for the colour.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Yellow => "Yellow",
+            Self::Orange => "Orange",
+            Self::Purple => "Purple",
+            Self::Cyan => "Cyan",
+            Self::Pink => "Pink",
+            Self::Fuchsia => "Fuchsia",
+            Self::Rose => "Rose",
+            Self::Lavender => "Lavender",
+            Self::Sky => "Sky",
+            Self::Mint => "Mint",
+            Self::Lemon => "Lemon",
+            Self::Sand => "Sand",
+            Self::Cocoa => "Cocoa",
+            Self::Cream => "Cream",
+        }
+    }
+
+    /// The colour as `#rrggbb`: the one place marker colours are defined.
+    pub fn hex(self) -> &'static str {
+        match self {
+            Self::Red => "#e0443e",
+            Self::Green => "#3cb44b",
+            Self::Blue => "#3a7bd5",
+            Self::Yellow => "#f2c12e",
+            Self::Orange => "#e0893a",
+            Self::Purple => "#8e44ad",
+            Self::Cyan => "#1fc6d6",
+            Self::Pink => "#ff6fa8",
+            Self::Fuchsia => "#d633a5",
+            Self::Rose => "#e8a0a8",
+            Self::Lavender => "#b39ddb",
+            Self::Sky => "#8ecae6",
+            Self::Mint => "#98e0b5",
+            Self::Lemon => "#f7f08a",
+            Self::Sand => "#c8ad7f",
+            Self::Cocoa => "#7b5a43",
+            Self::Cream => "#f3e9d2",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +677,9 @@ pub struct Marker {
     pub color: MarkerColor,
     pub duration_us: i64,
     pub note: String,
+    /// Resolve's Keyword field in the marker dialog.
+    #[serde(default)]
+    pub keyword: String,
 }
 
 impl Marker {
@@ -498,6 +691,7 @@ impl Marker {
             color,
             duration_us: 0,
             note: String::new(),
+            keyword: String::new(),
         }
     }
 }
@@ -517,6 +711,27 @@ pub struct Track {
     pub sort_order: u32,
     pub clips: Vec<Clip>,
     pub transitions: Vec<Transition>,
+    /// Resolve's Audio Track Type. Only audio tracks use it.
+    #[serde(default)]
+    pub audio_type: AudioTrackType,
+}
+
+/// Resolve's Audio Track Type: a Mono track plays its sound down the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioTrackType {
+    Mono,
+    #[default]
+    Stereo,
+}
+
+impl AudioTrackType {
+    /// What Resolve's track header shows: "1.0" or "2.0".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mono => "1.0",
+            Self::Stereo => "2.0",
+        }
+    }
 }
 
 impl Track {
@@ -540,6 +755,7 @@ impl Track {
             sort_order,
             clips: Vec::new(),
             transitions: Vec::new(),
+            audio_type: AudioTrackType::Stereo,
         }
     }
 
@@ -574,6 +790,8 @@ impl Track {
 
     /// Every dissolve lead-in on this track, as clips. A dissolve needs a clip
     /// to dissolve from: if the clip before was moved or deleted, there is none.
+    ///
+    /// Deprecated: use `Track::transition_layers`. Kept until the renderers switch.
     pub fn dissolve_leads(&self) -> Vec<Clip> {
         self.clips.iter().filter(|c| self.has_clip_ending_at(c.timeline_in)).filter_map(Clip::dissolve_lead).collect()
     }
@@ -600,8 +818,31 @@ impl Track {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timeline {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    #[serde(default = "first_timeline_name")]
+    pub name: String,
     pub tracks: Vec<Track>,
     pub markers: Vec<Marker>,
+    /// Resolve's Start Timecode: what the timeline's first frame reads as. Positions stay
+    /// 0-based; only what is shown (and typed) is moved by this. 0 for older files.
+    #[serde(default)]
+    pub start_tc_us: i64,
+    /// Width and height when "Use Project Settings" was off; `None` uses the project's.
+    /// The frame rate is always the project's.
+    #[serde(default)]
+    pub resolution: Option<(u32, u32)>,
+    /// The frame rate when "Use Project Settings" was off; `None` uses the project's.
+    #[serde(default)]
+    pub fps: Option<RationalFps>,
+}
+
+/// Resolve's default Start Timecode, 01:00:00:00.
+pub const RESOLVE_START_TC_US: i64 = 3_600_000_000;
+
+/// The name a project's first timeline gets, as in Resolve.
+pub fn first_timeline_name() -> String {
+    "Timeline 1".to_string()
 }
 
 impl Default for Timeline {
@@ -613,20 +854,35 @@ impl Default for Timeline {
 impl Timeline {
     pub fn new() -> Self {
         Self {
+            id: Uuid::new_v4(),
+            name: first_timeline_name(),
             tracks: Vec::new(),
             markers: Vec::new(),
+            start_tc_us: 0,
+            resolution: None,
+            fps: None,
         }
+    }
+
+    /// An empty timeline with `video` and `audio` tracks, as Resolve's Create New Timeline makes.
+    pub fn with_tracks(name: impl Into<String>, video: u32, audio: u32) -> Self {
+        let tracks = (1..=video)
+            .map(|i| Track::new(TrackKind::Video, i, format!("Video {i}"), i - 1))
+            .chain((1..=audio).map(|i| Track::new(TrackKind::Audio, i, format!("Audio {i}"), video + i - 1)));
+        Self { name: name.into(), tracks: tracks.collect(), ..Self::new() }
     }
 
     pub fn new_default() -> Self {
         Self {
+            id: Uuid::new_v4(),
+            name: first_timeline_name(),
             tracks: vec![
                 Track::new(TrackKind::Video, 1, "Video 1", 0),
                 Track::new(TrackKind::Video, 2, "Video 2", 1),
                 Track::new(TrackKind::Audio, 1, "Audio 1", 2),
                 Track::new(TrackKind::Audio, 2, "Audio 2", 3),
             ],
-            markers: Vec::new(),
+            ..Self::new()
         }
     }
 
@@ -836,12 +1092,117 @@ pub struct Project {
     pub sample_rate: u32,
     pub channels: u32,
     pub proxy_dir: PathBuf,
+    /// The open timeline: every edit, the viewer and the player work on this one.
     pub timeline: Timeline,
+    /// The project's other timelines, waiting to be opened.
+    #[serde(default)]
+    pub timelines: Vec<Timeline>,
     pub sources: HashMap<Uuid, MediaSource>,
     pub ui_state: UiState,
 }
 
 impl Project {
+    /// The open timeline's picture size: its own, or the project's.
+    pub fn output_size(&self) -> (u32, u32) {
+        self.timeline.resolution.unwrap_or((self.width, self.height))
+    }
+
+    /// The open timeline's frame rate: its own, or the project's. Everything about the
+    /// timeline (frames, timecode, snapping, playback, export) counts in this.
+    pub fn timeline_fps(&self) -> RationalFps {
+        self.timeline.fps.unwrap_or(self.fps)
+    }
+
+    /// Every timeline, the open one included, as `(id, name)` sorted by name for menus.
+    pub fn timeline_list(&self) -> Vec<(Uuid, String)> {
+        let mut list: Vec<_> = std::iter::once(&self.timeline).chain(&self.timelines).map(|t| (t.id, t.name.clone())).collect();
+        list.sort_by_key(|a| a.1.to_lowercase());
+        list
+    }
+
+    /// Opens timeline `id`, putting the open one away. False when there is no such timeline.
+    pub fn open_timeline(&mut self, id: Uuid) -> bool {
+        let Some(i) = self.timelines.iter().position(|t| t.id == id) else { return false };
+        std::mem::swap(&mut self.timeline, &mut self.timelines[i]);
+        true
+    }
+
+    /// Adds `timeline` and opens it.
+    pub fn add_timeline(&mut self, timeline: Timeline) {
+        self.timelines.push(std::mem::replace(&mut self.timeline, timeline));
+    }
+
+    fn timeline_mut(&mut self, id: Uuid) -> Option<&mut Timeline> {
+        std::iter::once(&mut self.timeline).chain(&mut self.timelines).find(|t| t.id == id)
+    }
+
+    fn timeline_name_taken(&self, name: &str, except: Option<Uuid>) -> bool {
+        self.timeline_list().iter().any(|(id, n)| Some(*id) != except && n.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames timeline `id`. False when there is no such timeline, the name is blank or
+    /// another timeline already has it (case ignored).
+    pub fn rename_timeline(&mut self, id: Uuid, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.timeline_name_taken(name, Some(id)) {
+            return false;
+        }
+        let Some(timeline) = self.timeline_mut(id) else { return false };
+        timeline.name = name.to_string();
+        true
+    }
+
+    /// Deletes timeline `id`. False for the open timeline (so the last one always stays)
+    /// or one that does not exist.
+    pub fn remove_timeline(&mut self, id: Uuid) -> bool {
+        let Some(i) = self.timelines.iter().position(|t| t.id == id) else { return false };
+        self.timelines.remove(i);
+        true
+    }
+
+    /// Adds a copy of timeline `id`, not opened, named "<name> Copy" (or "Copy 2", …).
+    /// Everything in it gets new ids, with links and transitions following their clips.
+    pub fn duplicate_timeline(&mut self, id: Uuid) -> Option<Uuid> {
+        let mut copy = std::iter::once(&self.timeline).chain(&self.timelines).find(|t| t.id == id)?.clone();
+        let base = format!("{} Copy", copy.name);
+        copy.name = std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base} {n}")))
+            .find(|n| !self.timeline_name_taken(n, None))
+            .unwrap_or(base);
+        copy.id = Uuid::new_v4();
+        let mut links: HashMap<Uuid, Uuid> = HashMap::new();
+        for track in &mut copy.tracks {
+            track.id = Uuid::new_v4();
+            let mut clip_ids: HashMap<Uuid, Uuid> = HashMap::new();
+            for clip in &mut track.clips {
+                let new_id = Uuid::new_v4();
+                clip_ids.insert(clip.id, new_id);
+                clip.id = new_id;
+                clip.track_id = track.id;
+                if let Some(link) = clip.properties.link {
+                    clip.properties.link = Some(*links.entry(link).or_insert_with(Uuid::new_v4));
+                }
+            }
+            // A transition whose clip is gone would be dropped on the next load anyway.
+            track.transitions.retain_mut(|t| {
+                t.id = Uuid::new_v4();
+                clip_ids.get(&t.clip_id).map(|c| t.clip_id = *c).is_some()
+            });
+        }
+        for marker in &mut copy.markers {
+            marker.id = Uuid::new_v4();
+        }
+        let new_id = copy.id;
+        self.timelines.push(copy);
+        Some(new_id)
+    }
+
+    /// "Timeline N" with the first N no timeline uses yet.
+    pub fn next_timeline_name(&self) -> String {
+        let names = self.timeline_list();
+        (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n.eq_ignore_ascii_case(c))).unwrap_or_default()
+    }
+
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: RationalFps) -> Self {
         let now = 0; // will be populated with unix us timestamp
         Self {
@@ -856,6 +1217,7 @@ impl Project {
             channels: 2,
             proxy_dir: PathBuf::from("/tmp/tempo_proxies"),
             timeline: Timeline::new_default(),
+            timelines: Vec::new(),
             sources: HashMap::new(),
             ui_state: UiState::default(),
         }
@@ -866,7 +1228,7 @@ impl Project {
     /// clips are on the timeline. Odd rates snap to the nearest standard one, and frame
     /// sizes to even numbers. A portrait clip gives a vertical project.
     pub fn first_import_offer(&self, source: &MediaSource) -> Option<FormatOffer> {
-        if source.media_type != MediaType::Video || self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        if source.media_type != MediaType::Video || self.has_clips() || self.timeline.fps.is_some() {
             return None;
         }
         let (w, h, fps) = (source.video_width?, source.video_height?, source.video_fps?);
@@ -888,10 +1250,15 @@ impl Project {
         (offer != FormatOffer { width: self.width, height: self.height, fps: self.fps }).then_some(offer)
     }
 
+    /// Whether any timeline, open or not, has clips placed on the project's frame grid.
+    fn has_clips(&self) -> bool {
+        std::iter::once(&self.timeline).chain(&self.timelines).any(|t| t.tracks.iter().any(|tr| !tr.clips.is_empty()))
+    }
+
     /// Change the project's frame size and rate. Only while the timeline is empty, since
     /// clips are placed on the frame grid.
     pub fn apply_format(&mut self, offer: &FormatOffer) -> crate::Result<()> {
-        if self.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        if self.has_clips() {
             return Err(crate::TimelineError::CommandFailed("the frame rate can't change once clips are on the timeline".into()));
         }
         (self.width, self.height, self.fps) = (offer.width, offer.height, offer.fps);
@@ -980,6 +1347,25 @@ mod tests {
         assert_eq!(p.first_import_offer(&clip), None);
         assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
         assert_eq!((p.width, p.fps), (1920, RationalFps::FPS_30));
+    }
+
+    #[test]
+    fn no_offer_when_another_timeline_has_clips() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let mut other = Timeline::new_default();
+        let track = other.tracks[0].id;
+        other.tracks[0].clips.push(Clip::new(track, Uuid::new_v4(), ClipType::Video, "c", 0, 1, 0, 1));
+        p.timelines.push(other);
+        assert_eq!(p.first_import_offer(&video(3840, 2160, RationalFps::FPS_24)), None);
+        assert!(p.apply_format(&FormatOffer { width: 3840, height: 2160, fps: RationalFps::FPS_24 }).is_err());
+        assert_eq!(p.fps, RationalFps::FPS_30);
+    }
+
+    #[test]
+    fn no_offer_when_the_open_timeline_has_its_own_frame_rate() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        p.timeline.fps = Some(RationalFps::FPS_25);
+        assert_eq!(p.first_import_offer(&video(3840, 2160, RationalFps::FPS_24)), None);
     }
 
     #[test]
@@ -1366,5 +1752,198 @@ mod tests {
         // A dissolve cannot use footage that does not exist before the In point.
         b.source_in = 200_000;
         assert_eq!(b.dissolve_lead().unwrap().duration_us(), 200_000);
+    }
+
+    fn project() -> Project {
+        Project::new("p", 1920, 1080, RationalFps::FPS_30)
+    }
+
+    #[test]
+    fn with_tracks_makes_video_then_audio_in_order() {
+        let t = Timeline::with_tracks("Cut", 3, 2);
+        let got: Vec<_> = t.tracks.iter().map(|tr| (tr.kind, tr.kind_index, tr.name.as_str(), tr.sort_order)).collect();
+        assert_eq!(t.name, "Cut");
+        assert_eq!(
+            got,
+            vec![
+                (TrackKind::Video, 1, "Video 1", 0),
+                (TrackKind::Video, 2, "Video 2", 1),
+                (TrackKind::Video, 3, "Video 3", 2),
+                (TrackKind::Audio, 1, "Audio 1", 3),
+                (TrackKind::Audio, 2, "Audio 2", 4),
+            ]
+        );
+        assert!(t.markers.is_empty());
+    }
+
+    #[test]
+    fn with_tracks_allows_zero_tracks_and_gives_each_timeline_its_own_id() {
+        let (a, b) = (Timeline::with_tracks("a", 0, 0), Timeline::with_tracks("b", 0, 0));
+        assert!(a.tracks.is_empty());
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn add_timeline_opens_the_new_one_and_keeps_the_old_intact() {
+        let mut p = project();
+        let old_id = p.timeline.id;
+        p.timeline.markers.push(Marker::new(5, "m", MarkerColor::Blue));
+        let new = Timeline::with_tracks("Timeline 2", 1, 1);
+        let new_id = new.id;
+        p.add_timeline(new);
+        assert_eq!(p.timeline.id, new_id);
+        assert_eq!(p.timelines.len(), 1);
+        assert_eq!(p.timelines[0].id, old_id);
+        assert_eq!(p.timelines[0].tracks.len(), 4);
+        assert_eq!(p.timelines[0].markers.len(), 1);
+    }
+
+    #[test]
+    fn open_timeline_swaps_back_and_keeps_markers() {
+        let mut p = project();
+        let first = p.timeline.id;
+        p.timeline.markers.push(Marker::new(5, "m", MarkerColor::Blue));
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let opened = p.open_timeline(first);
+        assert!(opened);
+        assert_eq!(p.timeline.id, first);
+        assert_eq!(p.timeline.markers.len(), 1);
+        assert_eq!(p.timelines.len(), 1);
+        assert_eq!(p.timelines[0].name, "Timeline 2");
+    }
+
+    #[test]
+    fn open_timeline_returns_false_for_unknown_and_already_open_ids() {
+        let mut p = project();
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let open = p.timeline.id;
+        assert!(!p.open_timeline(Uuid::new_v4()));
+        assert!(!p.open_timeline(open));
+        assert_eq!(p.timeline.id, open);
+        assert_eq!(p.timelines.len(), 1);
+    }
+
+    #[test]
+    fn timeline_list_includes_the_open_timeline_sorted_ignoring_case() {
+        let mut p = project();
+        p.timeline.name = "charlie".into();
+        p.add_timeline(Timeline::with_tracks("Alpha", 1, 1));
+        p.add_timeline(Timeline::with_tracks("bravo", 1, 1));
+        let names: Vec<_> = p.timeline_list().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["Alpha", "bravo", "charlie"]);
+        assert!(p.timeline_list().iter().any(|(id, _)| *id == p.timeline.id));
+    }
+
+    #[test]
+    fn next_timeline_name_skips_names_in_use() {
+        let mut p = project();
+        assert_eq!(p.next_timeline_name(), "Timeline 2");
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 3");
+    }
+
+    #[test]
+    fn next_timeline_name_ignores_case() {
+        let mut p = project();
+        p.add_timeline(Timeline::with_tracks("timeline 2", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 3");
+    }
+
+    #[test]
+    fn next_timeline_name_fills_a_gap() {
+        let mut p = project();
+        p.timeline.name = "Timeline 2".into();
+        p.add_timeline(Timeline::with_tracks("Timeline 3", 1, 1));
+        assert_eq!(p.next_timeline_name(), "Timeline 1");
+    }
+
+    #[test]
+    fn old_project_json_without_timeline_fields_still_loads() {
+        let p = project();
+        let mut v = serde_json::to_value(&p).unwrap();
+        v.as_object_mut().unwrap().remove("timelines");
+        let t = v["timeline"].as_object_mut().unwrap();
+        t.remove("id");
+        t.remove("name");
+        let back: Project = serde_json::from_value(v).unwrap();
+        assert!(back.timelines.is_empty());
+        assert_eq!(back.timeline.name, "Timeline 1");
+    }
+
+    fn project_with_a_second_timeline() -> (Project, Uuid, Uuid) {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let first = p.timeline.id;
+        p.add_timeline(Timeline::with_tracks("Timeline 2", 1, 1));
+        let open = p.timeline.id;
+        (p, first, open)
+    }
+
+    #[test]
+    fn rename_timeline_refuses_blank_and_taken_names() {
+        let (mut p, first, open) = project_with_a_second_timeline();
+        assert!(p.rename_timeline(first, "  Edit  "));
+        assert!(p.rename_timeline(open, "Grade"));
+        assert_eq!(p.timeline.name, "Grade");
+        assert!(!p.rename_timeline(open, "edit"));
+        assert!(!p.rename_timeline(open, "   "));
+        assert!(!p.rename_timeline(Uuid::new_v4(), "Other"));
+        assert!(p.rename_timeline(open, "GRADE"));
+        let names: Vec<_> = p.timeline_list().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["Edit", "GRADE"]);
+    }
+
+    #[test]
+    fn remove_timeline_keeps_the_open_one() {
+        let (mut p, first, open) = project_with_a_second_timeline();
+        assert!(!p.remove_timeline(open));
+        assert!(p.remove_timeline(first));
+        assert!(!p.remove_timeline(first));
+        assert_eq!(p.timeline_list().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_timeline_copies_everything_under_new_ids() {
+        let mut p = Project::new("p", 1920, 1080, RationalFps::FPS_30);
+        let (v, a) = (p.timeline.tracks[0].id, p.timeline.tracks[2].id);
+        let link = Uuid::new_v4();
+        let mut pic = Clip::new(v, Uuid::new_v4(), ClipType::Video, "c", 0, 1_000_000, 0, 1_000_000);
+        let mut snd = Clip::new(a, pic.source_id, ClipType::Audio, "c", 0, 1_000_000, 0, 1_000_000);
+        (pic.properties.link, snd.properties.link) = (Some(link), Some(link));
+        let t = Transition::new(pic.id, TransitionEdge::Out, TransitionKind::DipToColor, 500_000, TransitionAlignment::EndAtCut);
+        p.timeline.tracks[0].clips.push(pic.clone());
+        p.timeline.tracks[0].transitions.push(t.clone());
+        p.timeline.tracks[2].clips.push(snd);
+        p.timeline.add_marker(Marker::new(0, "m", MarkerColor::Red));
+        let original = p.timeline.clone();
+
+        let id = p.duplicate_timeline(original.id).unwrap();
+        let again = p.duplicate_timeline(original.id).unwrap();
+        assert_eq!(p.timeline, original, "the open timeline is untouched and stays open");
+        let copy = p.timelines.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(copy.name, "Timeline 1 Copy");
+        assert_eq!(p.timelines.iter().find(|t| t.id == again).unwrap().name, "Timeline 1 Copy 2");
+        assert_ne!(copy.markers[0].id, original.markers[0].id);
+        let (cv, ca) = (&copy.tracks[0], &copy.tracks[2]);
+        assert_ne!(cv.id, v);
+        let (cpic, csnd) = (&cv.clips[0], &ca.clips[0]);
+        assert_ne!(cpic.id, pic.id);
+        assert_eq!(cpic.track_id, cv.id);
+        assert_eq!(csnd.track_id, ca.id);
+        assert_eq!(cpic.properties.link, csnd.properties.link);
+        assert_ne!(cpic.properties.link, Some(link));
+        let ct = &cv.transitions[0];
+        assert_ne!(ct.id, t.id);
+        assert_eq!((ct.clip_id, ct.kind.clone(), ct.duration_us), (cpic.id, TransitionKind::DipToColor, 500_000));
+        assert_eq!(p.duplicate_timeline(Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn video_dissolves_have_resolve_names_and_round_trip_their_drag_ids() {
+        let names: Vec<String> = TransitionKind::VIDEO_DISSOLVES.iter().map(TransitionKind::resolve_name).collect();
+        assert_eq!(names, ["Additive Dissolve", "Blur Dissolve", "Cross Dissolve", "Dip To Color Dissolve", "Non-Additive Dissolve"]);
+        for kind in TransitionKind::VIDEO_DISSOLVES {
+            assert_eq!(TransitionKind::from_effect_id(kind.effect_id().unwrap()), Some(kind));
+        }
+        assert_eq!(TransitionKind::from_effect_id("fade-in"), None);
     }
 }

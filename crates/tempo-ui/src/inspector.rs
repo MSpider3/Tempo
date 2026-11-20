@@ -5,10 +5,15 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4 as gtk;
+use gtk4::glib;
 use gtk4::prelude::*;
-use tempo_timeline::{Clip, ClipType, Command, EditClipCommand, PropertyChange, SetClipPropertyCommand, TitleType};
+use tempo_timeline::{
+    frame_to_us, us_to_frame, Clip, ClipType, Command, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand, SetTransitionCommand,
+    TitleType, TrackKind, Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind,
+};
+use uuid::Uuid;
 
-use crate::state::{AppState, Change};
+use crate::state::{AppState, Change, EditSelection};
 use crate::util::{label, tool_button};
 
 /// Turns a new field value and the clip as it is now into the command that applies it.
@@ -19,6 +24,10 @@ pub struct Inspector {
     state: Rc<AppState>,
     title: gtk::Label,
     body: gtk::Box,
+    scroller: gtk::ScrolledWindow,
+    /// What the panel shows (a transition, or the selected clips): its scroll position
+    /// is kept while this stays the same.
+    shown: Cell<Option<(Option<EditSelection>, Option<Uuid>)>>,
     /// Set while an edit from the Inspector itself is applied, so the fields are
     /// not rebuilt under the user's hands.
     busy: Rc<Cell<bool>>,
@@ -51,13 +60,27 @@ impl Inspector {
             .build();
         root.append(&title);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.append(&gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
+        let scroller = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
+        root.append(&scroller);
 
-        let inspector = Rc::new(Self { root, state: state.clone(), title, body, busy: Rc::new(Cell::new(false)) });
+        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, shown: Cell::new(None), busy: Rc::new(Cell::new(false)) });
         let i = inspector.clone();
         state.connect(move |change| {
             if matches!(change, Change::Selection | Change::Timeline | Change::Project) {
+                // Editing keeps the panel where the user is; something else selected starts at the top.
+                let now = Some((i.state.edit_selection.get(), i.state.selected_ids().first().copied()));
+                let at = if i.shown.replace(now) == now { i.scroller.vadjustment().value() } else { 0.0 };
+                // An edit from the curve graph rebuilds the panel; keep the keyboard on the new graph
+                // so the next Delete removes a key, not the transition.
+                let graph_focused = i.root.root().and_then(|r| r.focus()).is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
                 i.rebuild();
+                if graph_focused {
+                    if let Some(graph) = descendant_with_class(i.body.upcast_ref(), crate::keybinds::OWNS_DELETE_KEYS) {
+                        graph.grab_focus();
+                    }
+                }
+                let adjustment = i.scroller.vadjustment();
+                glib::idle_add_local_once(move || adjustment.set_value(at));
             }
         });
         inspector.rebuild();
@@ -70,6 +93,11 @@ impl Inspector {
         }
         while let Some(child) = self.body.first_child() {
             self.body.remove(&child);
+        }
+        if let Some(EditSelection::Transition { track_id, clip_id, edge }) = self.state.edit_selection.get() {
+            if self.transition_panel(track_id, clip_id, edge) {
+                return;
+            }
         }
         let Some(clip) = self.state.selected_clip() else {
             self.title.set_text("Inspector");
@@ -288,11 +316,245 @@ impl Inspector {
         let max = clip.duration_us() as f64 / 2e6;
         self.number_row(&grid, 0, "Fade In s", p.fade_in_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_in());
         self.number_row(&grid, 1, "Fade Out s", p.fade_out_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_out());
-        // Shown only once a dissolve exists; it is added from the Effects panel or with Ctrl+T.
-        if p.dissolve_in_us > 0 {
-            let dissolve = edit("Cross Dissolve", |v, c| c.properties.dissolve_in_us = ((v * 1e6) as i64).min(c.to_timeline_floor_us(c.source_in)));
-            self.number_row(&grid, 2, "Dissolve s", p.dissolve_in_us as f64 / 1e6, (0.0, clip.to_timeline_floor_us(clip.source_in) as f64 / 1e6, 0.1, 1), clip, dissolve);
+    }
+
+    /// Resolve's transition panel for the selected transition. Returns false when the
+    /// transition is gone, so the caller shows the clip instead. Every change is one
+    /// `SetTransitionCommand`; the panel is rebuilt from the timeline afterwards.
+    fn transition_panel(&self, track_id: Uuid, clip_id: Uuid, edge: TransitionEdge) -> bool {
+        let Some(view) = TransitionView::read(&self.state, (track_id, clip_id, edge)) else { return false };
+        let t = &view.transition;
+        self.title.set_text(&format!("Transition - {}", kind_name(&t.kind)));
+        let sel = (track_id, clip_id, edge);
+        let state = &self.state;
+        // Resolve's section header with an on/off switch; off plays the edit as a cut.
+        let header = gtk::Box::builder().css_classes(["inspector-section"]).build();
+        let heading = label(if view.track_kind == TrackKind::Audio { "Audio" } else { "Video" }, &["tempo-heading"]);
+        heading.set_hexpand(true);
+        heading.set_xalign(0.0);
+        header.append(&heading);
+        let switch = gtk::Switch::builder().active(t.enabled).valign(gtk::Align::Center).tooltip_text("Off: this edit plays as a cut").build();
+        switch.update_property(&[gtk::accessible::Property::Label("Transition on or off")]);
+        let s = state.clone();
+        switch.connect_active_notify(move |sw| {
+            let on = sw.is_active();
+            edit_transition(&s, sel, |t| t.enabled = on);
+        });
+        header.append(&switch);
+        self.body.append(&header);
+        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(8).margin_top(10).margin_bottom(12).margin_start(12).margin_end(12).sensitive(t.enabled).build();
+        self.body.append(&grid);
+
+        // Audio transitions (Cross Fade) have no type choice and no colour.
+        let video = has_video_controls(view.track_kind);
+        if video {
+            Self::row_label(&grid, 0, "Transition Type");
+            let names = TransitionKind::VIDEO_DISSOLVES.map(|k| k.resolve_name());
+            let kinds = gtk::DropDown::from_strings(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            let at = TransitionKind::VIDEO_DISSOLVES.iter().position(|k| *k == t.kind).unwrap_or(2);
+            kinds.set_selected(at as u32);
+            let s = state.clone();
+            kinds.connect_selected_notify(move |d| {
+                let Some(kind) = TransitionKind::VIDEO_DISSOLVES.get(d.selected() as usize).cloned() else { return };
+                edit_transition(&s, sel, |t| t.kind = kind);
+            });
+            grid.attach(&kinds, 1, 0, 1, 1);
         }
+
+        Self::row_label(&grid, 1, "Duration");
+        let frames = us_to_frame(t.duration_us, view.fps);
+        let seconds = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(t.duration_us as f64 / 1e6, 0.0, 3600.0, 0.1, 1.0, 0.0)).digits(1).numeric(true).hexpand(true).build();
+        seconds.update_property(&[gtk::accessible::Property::Label("Duration in seconds")]);
+        let frame_spin = gtk::SpinButton::builder().adjustment(&gtk::Adjustment::new(frames as f64, 1.0, 1_000_000.0, 1.0, 10.0, 0.0)).numeric(true).build();
+        frame_spin.update_property(&[gtk::accessible::Property::Label("Duration in frames")]);
+        let (s, fps, shown_tenths) = (state.clone(), view.fps, (t.duration_us as f64 / 1e5).round());
+        seconds.connect_value_changed(move |sp| {
+            // Showing one decimal rounds the value; only a real edit changes the length.
+            if (sp.value() * 10.0).round() == shown_tenths {
+                return;
+            }
+            let frames = seconds_to_frames(sp.value(), fps);
+            edit_transition(&s, sel, |t| t.duration_us = frame_to_us(frames, fps));
+        });
+        let (s, fps) = (state.clone(), view.fps);
+        frame_spin.connect_value_changed(move |sp| {
+            let frames = sp.value() as i64;
+            edit_transition(&s, sel, |t| t.duration_us = frame_to_us(frames, fps));
+        });
+        let durations = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        durations.append(&seconds);
+        durations.append(&label("Seconds", &["tempo-dim"]));
+        durations.append(&frame_spin);
+        durations.append(&label("Frames", &["tempo-dim"]));
+        durations.set_tooltip_text(Some(&format!("Longest {:.2} s ({} frames)", view.max_us as f64 / 1e6, us_to_frame(view.max_us, view.fps))));
+        grid.attach(&durations, 1, 1, 1, 1);
+
+        let default_button = gtk::Button::builder().label("Set as Default Duration").halign(gtk::Align::Start).tooltip_text("New transitions get this length").build();
+        let (s, duration_us) = (state.clone(), t.duration_us);
+        default_button.connect_clicked(move |_| {
+            s.settings.borrow_mut().transition_us = duration_us;
+            let snapshot = s.settings.borrow().clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(Err(e)) = gtk::gio::spawn_blocking(move || snapshot.save()).await {
+                    tracing::warn!("could not save settings: {e}");
+                }
+            });
+            s.message(format!("New transitions are {:.2} s long", duration_us as f64 / 1e6));
+        });
+        grid.attach(&default_button, 1, 3, 1, 1);
+
+        Self::row_label(&grid, 4, "Alignment");
+        let aligns = gtk::Box::builder().css_classes(["linked"]).build();
+        let mut group: Option<gtk::ToggleButton> = None;
+        for (name, icon, alignment) in [("Start on Edit", "format-justify-left-symbolic", TransitionAlignment::StartAtCut), ("Center on Edit", "format-justify-center-symbolic", TransitionAlignment::Centered), ("End on Edit", "format-justify-right-symbolic", TransitionAlignment::EndAtCut)] {
+            let button = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(name).hexpand(true).sensitive(alignment_enabled(view.edit_kind, alignment)).build();
+            button.update_property(&[gtk::accessible::Property::Label(name)]);
+            button.set_group(group.as_ref());
+            button.set_active(t.alignment == alignment);
+            let s = state.clone();
+            button.connect_toggled(move |b| {
+                if b.is_active() {
+                    edit_transition(&s, sel, |t| t.alignment = alignment);
+                }
+            });
+            group.get_or_insert_with(|| button.clone());
+            aligns.append(&button);
+        }
+        grid.attach(&aligns, 1, 4, 1, 1);
+
+        if video {
+            Self::ratio_row(&grid, 5, "Start Ratio", t.start_ratio, sel, state, |t, r| t.start_ratio = r, 0.0);
+            Self::ratio_row(&grid, 6, "End Ratio", t.end_ratio, sel, state, |t, r| t.end_ratio = r, 1.0);
+            Self::ease_row(&grid, 7, t, sel, state);
+            Self::curve_row(&grid, 8, t, sel, state);
+            grid.attach(&curve_graph(t, sel, state), 0, 9, 2, 1);
+        }
+        if video && t.kind == TransitionKind::DipToColor {
+            Self::row_label(&grid, 10, "Color");
+            let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+            button.set_rgba(&gtk::gdk::RGBA::new(t.color[0], t.color[1], t.color[2], 1.0));
+            let s = state.clone();
+            button.connect_rgba_notify(move |b| {
+                let c = b.rgba();
+                edit_transition(&s, sel, |t| t.color = [c.red(), c.green(), c.blue()]);
+            });
+            grid.attach(&button, 1, 10, 1, 1);
+        }
+        true
+    }
+
+    /// Slider and field sharing one adjustment, with a reset arrow. Returns the adjustment,
+    /// a flag that is set while the program (not the user) moves it, and the row.
+    /// `commit` runs once the user has been still for a moment, so a drag is one undo step.
+    fn slider_row(adj: &gtk::Adjustment, digits: u32, label_text: &str, commit: impl Fn(f64) + 'static) -> (Rc<Cell<bool>>, gtk::Box, gtk::Button) {
+        const QUIET_MS: u64 = 300;
+        let spin = gtk::SpinButton::builder().adjustment(adj).digits(digits).numeric(true).build();
+        spin.update_property(&[gtk::accessible::Property::Label(label_text)]);
+        let scale = gtk::Scale::builder().adjustment(adj).hexpand(true).draw_value(false).build();
+        scale.update_property(&[gtk::accessible::Property::Label(label_text)]);
+        let reset = tool_button("edit-undo-symbolic", &format!("Reset {label_text}"));
+        let refreshing = Rc::new(Cell::new(false));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+        let commit = Rc::new(commit);
+        let (flag, adj_value) = (refreshing.clone(), adj.clone());
+        adj.connect_value_changed(move |_| {
+            if flag.get() {
+                return;
+            }
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let (commit, pending_slot, adj) = (commit.clone(), pending.clone(), adj_value.clone());
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(QUIET_MS), move || {
+                pending_slot.borrow_mut().take();
+                commit(adj.value());
+            });
+            *pending.borrow_mut() = Some(id);
+        });
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&scale);
+        row.append(&spin);
+        row.append(&reset);
+        (refreshing, row, reset)
+    }
+
+    /// Start / End Ratio: percent field and slider for a 0.0-1.0 ratio.
+    fn ratio_row(grid: &gtk::Grid, row: i32, name: &str, ratio: f32, sel: TransitionRef, state: &Rc<AppState>, set: fn(&mut Transition, f32), default_ratio: f32) {
+        Self::row_label(grid, row, name);
+        let adj = gtk::Adjustment::new(f64::from(ratio_to_percent(ratio)), 0.0, 100.0, 1.0, 10.0, 0.0);
+        let s = state.clone();
+        let (_, cell, reset) = Self::slider_row(&adj, 0, name, move |v| {
+            let ratio = percent_to_ratio(v);
+            edit_transition(&s, sel, |t| set(t, ratio));
+        });
+        let s = state.clone();
+        reset.connect_clicked(move |_| edit_transition(&s, sel, |t| set(t, default_ratio)));
+        grid.attach(&cell, 1, row, 1, 1);
+    }
+
+    fn ease_row(grid: &gtk::Grid, row: i32, t: &Transition, sel: TransitionRef, state: &Rc<AppState>) {
+        const EASES: [TransitionEase; 4] = [TransitionEase::None, TransitionEase::In, TransitionEase::Out, TransitionEase::InOut];
+        Self::row_label(grid, row, "Ease");
+        let drop = gtk::DropDown::from_strings(&["None", "In", "Out", "In & Out"]);
+        drop.set_selected(EASES.iter().position(|e| *e == t.ease).unwrap_or(0) as u32);
+        // Curve keys set the shape; the panel is rebuilt after Reset Curve, which re-enables this.
+        if !t.curve.is_empty() {
+            drop.set_sensitive(false);
+            drop.set_tooltip_text(Some("The curve keys set the shape. Reset the curve to use Ease."));
+        }
+        let s = state.clone();
+        drop.connect_selected_notify(move |d| {
+            let ease = EASES.get(d.selected() as usize).copied().unwrap_or_default();
+            edit_transition(&s, sel, |t| t.ease = ease);
+        });
+        grid.attach(&drop, 1, row, 1, 1);
+    }
+
+    /// Transition Curve at the playhead: shows the mix there; typing keys it.
+    fn curve_row(grid: &gtk::Grid, row: i32, t: &Transition, sel: TransitionRef, state: &Rc<AppState>) {
+        const OUTSIDE: &str = "Move the playhead into the transition to key its curve.";
+        Self::row_label(grid, row, "Transition Curve");
+        let adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 0.01, 0.1, 0.0);
+        let s = state.clone();
+        let (refreshing, cell, reset) = Self::slider_row(&adj, 3, "Transition Curve", move |value| {
+            let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) else { return };
+            edit_transition(&s, sel, |t| *t = t.with_curve_key(u, value as f32));
+        });
+        reset.set_tooltip_text(Some("Reset Curve"));
+        reset.set_sensitive(!t.curve.is_empty());
+        let s = state.clone();
+        reset.connect_clicked(move |_| edit_transition(&s, sel, |t| t.curve.clear()));
+        // Show the curve where the playhead is; insensitive outside the transition.
+        let refresh = {
+            let (cell, adj, refreshing, s) = (cell.clone(), adj.clone(), refreshing.clone(), state.clone());
+            move || {
+                let view = TransitionView::read(&s, sel);
+                let u = view.as_ref().and_then(|v| playhead_fraction(s.playhead_us(), v.span?));
+                for child in std::iter::successors(cell.first_child(), |w| w.next_sibling()).filter(|w| !w.is::<gtk::Button>()) {
+                    child.set_sensitive(u.is_some());
+                }
+                cell.set_tooltip_text(if u.is_some() { None } else { Some(OUTSIDE) });
+                if let (Some(u), Some(v)) = (u, view) {
+                    if cell.focus_child().is_none() {
+                        refreshing.set(true);
+                        adj.set_value(f64::from(v.transition.curve_at(u)));
+                        refreshing.set(false);
+                    }
+                }
+            }
+        };
+        refresh();
+        // The panel is rebuilt on every edit; the poll ends with the row.
+        let weak = cell.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || match weak.upgrade() {
+            Some(c) if c.is_mapped() => {
+                refresh();
+                glib::ControlFlow::Continue
+            }
+            Some(_) => glib::ControlFlow::Continue,
+            None => glib::ControlFlow::Break,
+        });
+        grid.attach(&cell, 1, row, 1, 1);
     }
 
     fn title_section(&self, clip: &Clip) {
@@ -364,5 +626,475 @@ impl Inspector {
             });
         });
         grid.attach(&place, 1, 2, 1, 1);
+    }
+}
+
+/// The transition being edited and what limits it, read from the project.
+struct TransitionView {
+    transition: Transition,
+    /// Where the transition lies on the timeline, in µs.
+    span: Option<(i64, i64)>,
+    max_us: i64,
+    edit_kind: EditKind,
+    track_kind: TrackKind,
+    fps: RationalFps,
+}
+
+type TransitionRef = (Uuid, Uuid, TransitionEdge);
+
+impl TransitionView {
+    fn read(state: &AppState, (track_id, clip_id, edge): TransitionRef) -> Option<Self> {
+        state
+            .with_project(|p| {
+                let track = p.timeline.find_track(track_id)?;
+                let transition = track.transition_at_edit(clip_id, edge)?.clone();
+                let clip = track.find_clip(clip_id)?;
+                let edit_kind = if edge == TransitionEdge::Out { EditKind::Tail } else { track.edit_at(clip.timeline_in)?.kind };
+                let max_us = track.max_transition_us(clip_id, edge, transition.alignment, &p.sources, p.timeline_fps());
+                let span = track.transition_span(&transition);
+                Some(Self { transition, span, max_us, edit_kind, track_kind: track.kind, fps: p.timeline_fps() })
+            })
+            .flatten()
+    }
+}
+
+/// Apply `change` to the transition as one undo step. The length stays whole frames,
+/// at least one, and within what the new alignment allows.
+fn edit_transition(state: &Rc<AppState>, (track_id, clip_id, edge): TransitionRef, change: impl FnOnce(&mut Transition)) {
+    let Some(view) = TransitionView::read(state, (track_id, clip_id, edge)) else { return };
+    let mut edited = view.transition.clone();
+    change(&mut edited);
+    let max_us = state
+        .with_project(|p| p.timeline.find_track(track_id).map_or(0, |t| t.max_transition_us(clip_id, edge, edited.alignment, &p.sources, p.timeline_fps())))
+        .unwrap_or(0);
+    if max_us <= 0 {
+        state.message("No room for a transition here");
+        return;
+    }
+    edited.duration_us = clamp_transition_us(edited.duration_us, max_us, view.fps);
+    if edited != view.transition {
+        state.execute(Box::new(SetTransitionCommand::set(track_id, edited)));
+    }
+}
+
+fn percent_to_ratio(percent: f64) -> f32 {
+    (percent / 100.0).clamp(0.0, 1.0) as f32
+}
+
+fn ratio_to_percent(ratio: f32) -> f32 {
+    (ratio * 100.0).clamp(0.0, 100.0)
+}
+
+/// How far through the transition the playhead is, 0.0-1.0; `None` outside it.
+fn playhead_fraction(playhead_us: i64, (start, end): (i64, i64)) -> Option<f32> {
+    (end > start && (start..=end).contains(&playhead_us)).then(|| (playhead_us - start) as f32 / (end - start) as f32)
+}
+
+fn kind_name(kind: &TransitionKind) -> String {
+    kind.resolve_name()
+}
+
+const GRAPH_HEIGHT: i32 = 110;
+const GRAPH_PAD: f64 = 10.0;
+const KEY_HIT_PX: f64 = 9.0;
+/// Keys closer than this in place would be merged by `with_curve_key`.
+const MIN_KEY_GAP: f32 = 0.02;
+
+/// Pixel of a (place, value) point in a graph `w` x `h` px; value 1 is at the top.
+fn graph_point(u: f32, v: f32, w: f64, h: f64) -> (f64, f64) {
+    (GRAPH_PAD + f64::from(u) * (w - 2.0 * GRAPH_PAD), GRAPH_PAD + (1.0 - f64::from(v)) * (h - 2.0 * GRAPH_PAD))
+}
+
+/// The (place, value) under a pixel, clamped to 0..1.
+fn graph_value(x: f64, y: f64, w: f64, h: f64) -> (f32, f32) {
+    let u = (x - GRAPH_PAD) / (w - 2.0 * GRAPH_PAD).max(1.0);
+    let v = 1.0 - (y - GRAPH_PAD) / (h - 2.0 * GRAPH_PAD).max(1.0);
+    (u.clamp(0.0, 1.0) as f32, v.clamp(0.0, 1.0) as f32)
+}
+
+/// Where a key value lands on the graph: the mix runs from Start Ratio to End Ratio.
+fn to_level(v: f32, (start, end): (f32, f32)) -> f32 {
+    start + (end - start) * v
+}
+
+/// The key value that sits at graph `level`; `fallback` when the ratios are equal (the
+/// level then says nothing about the value).
+fn from_level(level: f32, (start, end): (f32, f32), fallback: f32) -> f32 {
+    if (end - start).abs() < 1e-4 { fallback } else { ((level - start) / (end - start)).clamp(0.0, 1.0) }
+}
+
+/// The curve as drawn: `steps + 1` (place, level) samples of what playback mixes.
+fn sample_drawn_curve(t: &Transition, steps: usize) -> Vec<(f32, f32)> {
+    (0..=steps).map(|i| i as f32 / steps as f32).map(|u| (u, t.progress_at(u))).collect()
+}
+
+thread_local! {
+    /// The selected curve key per transition, kept across the panel rebuild an edit causes.
+    static KEPT_KEY: Cell<Option<(TransitionRef, usize)>> = const { Cell::new(None) };
+}
+
+/// The kept key for `sel` if it still exists among `len` keys.
+fn kept_selection<R: PartialEq>(kept: Option<(R, usize)>, sel: &R, len: usize) -> Option<usize> {
+    kept.filter(|(r, i)| r == sel && *i < len).map(|(_, i)| i)
+}
+
+/// The key nearest to the pixel, if within reach.
+fn hit_key(keys: &[[f32; 2]], levels: (f32, f32), x: f64, y: f64, w: f64, h: f64) -> Option<usize> {
+    let dist = |k: &[f32; 2]| {
+        let (kx, ky) = graph_point(k[0], to_level(k[1], levels), w, h);
+        (kx - x).hypot(ky - y)
+    };
+    keys.iter().enumerate().map(|(i, k)| (i, dist(k))).filter(|(_, d)| *d <= KEY_HIT_PX).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i)
+}
+
+/// Key `index` moved to (u, v), clamped to 0..1 and kept between its neighbours.
+fn move_key(keys: &[[f32; 2]], index: usize, u: f32, v: f32) -> Vec<[f32; 2]> {
+    let mut moved = keys.to_vec();
+    if let Some(key) = moved.get_mut(index) {
+        let low = if index == 0 { 0.0 } else { keys[index - 1][0] + MIN_KEY_GAP };
+        let high = keys.get(index + 1).map_or(1.0, |n| n[0] - MIN_KEY_GAP);
+        *key = [u.clamp(low, high.max(low)), v.clamp(0.0, 1.0)];
+    }
+    moved
+}
+
+/// A key added at (u, v); `None` when another key is too close.
+fn add_key(keys: &[[f32; 2]], u: f32, v: f32) -> Option<Vec<[f32; 2]>> {
+    if keys.iter().any(|k| (k[0] - u).abs() < MIN_KEY_GAP) {
+        return None;
+    }
+    let mut added = keys.to_vec();
+    added.push([u, v]);
+    added.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    Some(added)
+}
+
+/// The curve editor under the Transition Curve row. Edits are one undo step each
+/// (a drag commits on release); the panel is rebuilt afterwards.
+/// The first widget under `w` (or `w` itself) with the CSS class.
+fn descendant_with_class(w: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+    if w.has_css_class(class) {
+        return Some(w.clone());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(found) = descendant_with_class(&c, class) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+fn curve_graph(t: &Transition, sel: TransitionRef, state: &Rc<AppState>) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().content_height(GRAPH_HEIGHT).hexpand(true).focusable(true).can_focus(true).css_classes([crate::keybinds::OWNS_DELETE_KEYS]).build();
+    area.set_tooltip_text(Some("Drag a key to move it. Double-click to add one. Right-click or Delete removes the selected key."));
+    area.update_property(&[gtk::accessible::Property::Label("Transition curve graph")]);
+    let shape = Rc::new(RefCell::new(t.clone()));
+    let selected: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(kept_selection(KEPT_KEY.get(), &sel, t.curve.len())));
+    let levels = (t.start_ratio, t.end_ratio);
+    let select = {
+        let selected = selected.clone();
+        move |i: Option<usize>| {
+            selected.set(i);
+            KEPT_KEY.set(i.map(|i| (sel, i)));
+        }
+    };
+    let size = |a: &gtk::DrawingArea| (f64::from(a.width()), f64::from(a.height()));
+
+    let (sh, selected_draw, s) = (shape.clone(), selected.clone(), state.clone());
+    area.set_draw_func(move |a, cr, w, h| {
+        let (w, h) = (f64::from(w), f64::from(h));
+        let paint = |name: &str| {
+            let c = crate::util::css_color(a, name);
+            cr.set_source_rgba(f64::from(c.red()), f64::from(c.green()), f64::from(c.blue()), f64::from(c.alpha()));
+        };
+        paint("tempo_bg_inset");
+        cr.rectangle(0.0, 0.0, w, h);
+        let _ = cr.fill();
+        let (x0, y0) = graph_point(0.0, 1.0, w, h);
+        let (x1, y1) = graph_point(1.0, 0.0, w, h);
+        paint("tempo_line_soft");
+        cr.set_line_width(1.0);
+        cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+        let _ = cr.stroke();
+        let shape = sh.borrow();
+        // Faint guides at Start and End Ratio.
+        cr.set_dash(&[3.0, 3.0], 0.0);
+        for ratio in [shape.start_ratio, shape.end_ratio] {
+            let (_, y) = graph_point(0.0, ratio, w, h);
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            let _ = cr.stroke();
+        }
+        cr.set_dash(&[], 0.0);
+        if let Some(u) = TransitionView::read(&s, sel).and_then(|v| playhead_fraction(s.playhead_us(), v.span?)) {
+            paint("tempo_accent");
+            let (px, _) = graph_point(u, 0.0, w, h);
+            cr.move_to(px.round() + 0.5, y0);
+            cr.line_to(px.round() + 0.5, y1);
+            let _ = cr.stroke();
+        }
+        paint("tempo_text");
+        cr.set_line_width(2.0);
+        for (i, (u, level)) in sample_drawn_curve(&shape, 64).into_iter().enumerate() {
+            let (x, y) = graph_point(u, level, w, h);
+            if i == 0 { cr.move_to(x, y) } else { cr.line_to(x, y) }
+        }
+        let _ = cr.stroke();
+        for (i, k) in shape.curve.iter().enumerate() {
+            let (x, y) = graph_point(k[0], to_level(k[1], (shape.start_ratio, shape.end_ratio)), w, h);
+            paint(if selected_draw.get() == Some(i) { "tempo_accent" } else { "tempo_text_bright" });
+            cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    });
+
+    // Redraw for the playhead; ends with the widget.
+    let weak = area.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || match weak.upgrade() {
+        Some(a) => {
+            if a.is_mapped() {
+                a.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        }
+        None => glib::ControlFlow::Break,
+    });
+
+    let commit = {
+        let s = state.clone();
+        move |keys: Vec<[f32; 2]>| edit_transition(&s, sel, |t| t.curve = keys)
+    };
+
+    // Drag a key; commit on release.
+    let drag = gtk::GestureDrag::builder().button(1).build();
+    let moving: Rc<Cell<Option<(usize, f64, f64)>>> = Rc::default();
+    let (sh, mv, select_c, a) = (shape.clone(), moving.clone(), select.clone(), area.clone());
+    drag.connect_drag_begin(move |_, x, y| {
+        let (w, h) = size(&a);
+        let hit = hit_key(&sh.borrow().curve, levels, x, y, w, h);
+        mv.set(hit.map(|i| (i, x, y)));
+        select_c(hit);
+        a.grab_focus();
+        a.queue_draw();
+    });
+    let (sh, mv, a) = (shape.clone(), moving.clone(), area.clone());
+    drag.connect_drag_update(move |_, dx, dy| {
+        let Some((i, x, y)) = mv.get() else { return };
+        let (w, h) = size(&a);
+        let (u, level) = graph_value(x + dx, y + dy, w, h);
+        let old = sh.borrow().curve.get(i).map_or(0.0, |k| k[1]);
+        let moved = move_key(&sh.borrow().curve, i, u, from_level(level, levels, old));
+        sh.borrow_mut().curve = moved;
+        a.queue_draw();
+    });
+    let (sh, mv, commit_drag, original) = (shape.clone(), moving, commit.clone(), t.curve.clone());
+    drag.connect_drag_end(move |_, dx, dy| {
+        let Some(_) = mv.take() else { return };
+        let keys = sh.borrow().curve.clone();
+        if (dx != 0.0 || dy != 0.0) && keys != original {
+            commit_drag(keys);
+        }
+    });
+    area.add_controller(drag);
+
+    // Double-click on empty space adds a key on the curve there.
+    let click = gtk::GestureClick::builder().button(1).build();
+    let (sh, a, commit_add, select_a) = (shape.clone(), area.clone(), commit.clone(), select.clone());
+    click.connect_pressed(move |_, presses, x, y| {
+        let (w, h) = size(&a);
+        let shape = sh.borrow();
+        if presses != 2 || hit_key(&shape.curve, levels, x, y, w, h).is_some() {
+            return;
+        }
+        let (u, _) = graph_value(x, y, w, h);
+        if let Some(keys) = add_key(&shape.curve, u, shape.curve_at(u)) {
+            drop(shape);
+            select_a(None);
+            commit_add(keys);
+        }
+    });
+    area.add_controller(click);
+
+    // Right-click on a key removes it.
+    let right = gtk::GestureClick::builder().button(3).build();
+    let (sh, a, commit_remove, select_r) = (shape.clone(), area.clone(), commit.clone(), select.clone());
+    right.connect_pressed(move |_, _, x, y| {
+        let (w, h) = size(&a);
+        let hit = hit_key(&sh.borrow().curve, levels, x, y, w, h);
+        if let Some(i) = hit {
+            select_r(None);
+            let mut keys = sh.borrow().curve.clone();
+            keys.remove(i);
+            commit_remove(keys);
+        }
+    });
+    area.add_controller(right);
+
+    // Delete or BackSpace removes the selected key.
+    let keys_ctl = gtk::EventControllerKey::new();
+    let sh = shape;
+    keys_ctl.connect_key_pressed(move |_, key, _, _| {
+        use gtk::gdk::Key;
+        let Some(i) = selected.get().filter(|_| matches!(key, Key::Delete | Key::BackSpace)) else { return glib::Propagation::Proceed };
+        let mut keys = sh.borrow().curve.clone();
+        if i < keys.len() {
+            keys.remove(i);
+            select(None);
+            commit(keys);
+        }
+        glib::Propagation::Stop
+    });
+    area.add_controller(keys_ctl);
+    area
+}
+
+/// The Type dropdown and Color are video-only.
+fn has_video_controls(kind: TrackKind) -> bool {
+    kind == TrackKind::Video
+}
+
+fn seconds_to_frames(seconds: f64, fps: RationalFps) -> i64 {
+    (seconds * fps.to_f64()).round() as i64
+}
+
+/// A length in whole frames, from 1 frame up to `max_us`.
+fn clamp_transition_us(duration_us: i64, max_us: i64, fps: RationalFps) -> i64 {
+    let frames = us_to_frame(duration_us, fps).max(1);
+    frame_to_us(frames, fps).min(max_us)
+}
+
+/// A head transition can only start on the edit, a tail one only end on it.
+fn alignment_enabled(kind: EditKind, alignment: TransitionAlignment) -> bool {
+    match kind {
+        EditKind::Cut => true,
+        EditKind::Head => alignment == TransitionAlignment::StartAtCut,
+        EditKind::Tail => alignment == TransitionAlignment::EndAtCut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ratios_and_playhead_fraction_map_as_expected() {
+        assert_eq!(percent_to_ratio(50.0), 0.5);
+        assert_eq!(percent_to_ratio(250.0), 1.0);
+        assert_eq!(ratio_to_percent(0.25), 25.0);
+        assert_eq!(playhead_fraction(150, (100, 200)), Some(0.5));
+        assert_eq!(playhead_fraction(99, (100, 200)), None);
+        assert_eq!(playhead_fraction(201, (100, 200)), None);
+        assert_eq!(playhead_fraction(5, (5, 5)), None);
+    }
+
+    #[test]
+    fn audio_transition_panel_is_cross_fade_without_video_controls() {
+        assert_eq!(super::kind_name(&super::TransitionKind::Crossfade), "Cross Fade");
+        assert!(!super::has_video_controls(super::TrackKind::Audio));
+        assert!(super::has_video_controls(super::TrackKind::Video));
+    }
+
+    use super::*;
+
+    #[test]
+    fn graph_pixels_map_both_ways_and_clamp() {
+        let (x, y) = graph_point(0.5, 0.25, 220.0, 110.0);
+        assert_eq!((x, y), (110.0, 10.0 + 0.75 * 90.0));
+        let (u, v) = graph_value(x, y, 220.0, 110.0);
+        assert!((u - 0.5).abs() < 1e-6 && (v - 0.25).abs() < 1e-6);
+        assert_eq!(graph_value(-50.0, 500.0, 220.0, 110.0), (0.0, 0.0));
+        assert_eq!(graph_value(900.0, -5.0, 220.0, 110.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn drawn_curve_runs_from_start_ratio_to_end_ratio() {
+        let t = Transition { start_ratio: 0.2, end_ratio: 0.6, ..Transition::new(Uuid::nil(), TransitionEdge::In, TransitionKind::CrossDissolve, 1, TransitionAlignment::Centered) };
+        let drawn = sample_drawn_curve(&t, 4);
+        assert_eq!(drawn.len(), 5);
+        assert!((drawn[0].1 - 0.2).abs() < 1e-6 && (drawn[2].1 - 0.4).abs() < 1e-6 && (drawn[4].1 - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn key_levels_round_trip_through_the_ratios_and_flat_ratios_keep_the_value() {
+        assert!((to_level(0.5, (0.2, 0.6)) - 0.4).abs() < 1e-6);
+        assert!((from_level(0.4, (0.2, 0.6), 0.9) - 0.5).abs() < 1e-6);
+        assert_eq!(from_level(0.4, (0.3, 0.3), 0.9), 0.9);
+        assert_eq!(from_level(0.0, (0.2, 0.6), 0.9), 0.0);
+    }
+
+    #[test]
+    fn hit_key_finds_a_key_drawn_at_its_ratio_level() {
+        let keys = [[0.5, 0.8]];
+        let (x, y) = graph_point(0.5, 0.4, 220.0, 110.0);
+        assert_eq!(hit_key(&keys, (0.0, 0.5), x, y, 220.0, 110.0), Some(0));
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x, y, 220.0, 110.0), None);
+    }
+
+    #[test]
+    fn selection_is_kept_for_the_same_transition_only_and_while_the_key_exists() {
+        assert_eq!(kept_selection(Some((1, 2)), &1, 3), Some(2));
+        assert_eq!(kept_selection(Some((1, 2)), &9, 3), None);
+        assert_eq!(kept_selection(Some((1, 2)), &1, 2), None);
+        assert_eq!(kept_selection::<i32>(None, &1, 3), None);
+    }
+
+    #[test]
+    fn a_moved_key_keeps_its_index_so_the_kept_selection_still_points_at_it() {
+        let keys = [[0.2, 0.3], [0.8, 0.7]];
+        let moved = move_key(&keys, 0, 0.5, 0.9);
+        assert_eq!(kept_selection(Some((7, 0)), &7, moved.len()), Some(0));
+        assert_eq!(moved[0], [0.5, 0.9]);
+    }
+
+    #[test]
+    fn hit_key_picks_the_nearest_key_within_reach() {
+        let keys = [[0.25, 0.5], [0.75, 0.5]];
+        let (x, y) = graph_point(0.75, 0.5, 220.0, 110.0);
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x + 3.0, y - 2.0, 220.0, 110.0), Some(1));
+        assert_eq!(hit_key(&keys, (0.0, 1.0), x + 30.0, y, 220.0, 110.0), None);
+        assert_eq!(hit_key(&[], (0.0, 1.0), x, y, 220.0, 110.0), None);
+    }
+
+    #[test]
+    fn a_key_stays_between_its_neighbours_and_inside_the_graph() {
+        let keys = [[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]];
+        assert_eq!(move_key(&keys, 1, 0.9, 2.0)[1], [0.8 - MIN_KEY_GAP, 1.0]);
+        assert_eq!(move_key(&keys, 1, 0.0, -1.0)[1], [0.2 + MIN_KEY_GAP, 0.0]);
+        assert_eq!(move_key(&keys, 0, -1.0, 0.4)[0], [0.0, 0.4]);
+        assert_eq!(move_key(&keys, 2, 2.0, 0.4)[2], [1.0, 0.4]);
+        assert_eq!(move_key(&keys, 9, 0.5, 0.5), keys.to_vec());
+    }
+
+    #[test]
+    fn adding_a_key_keeps_order_and_refuses_a_crowded_place() {
+        let keys = [[0.2, 0.3], [0.8, 0.7]];
+        assert_eq!(add_key(&keys, 0.5, 0.5), Some(vec![[0.2, 0.3], [0.5, 0.5], [0.8, 0.7]]));
+        assert_eq!(add_key(&keys, 0.21, 0.5), None);
+        assert_eq!(add_key(&[], 0.5, 0.5), Some(vec![[0.5, 0.5]]));
+    }
+
+    const FPS_30: RationalFps = RationalFps { num: 30, den: 1 };
+
+    #[test]
+    fn seconds_and_frames_are_linked_in_whole_frames() {
+        assert_eq!(seconds_to_frames(1.0, FPS_30), 30);
+        assert_eq!(seconds_to_frames(0.52, FPS_30), 16);
+        assert_eq!(us_to_frame(frame_to_us(16, FPS_30), FPS_30), 16);
+    }
+
+    #[test]
+    fn length_is_clamped_to_one_frame_and_the_maximum() {
+        let max = frame_to_us(45, FPS_30);
+        assert_eq!(clamp_transition_us(0, max, FPS_30), frame_to_us(1, FPS_30));
+        assert_eq!(clamp_transition_us(5_000_000, max, FPS_30), max);
+        assert_eq!(clamp_transition_us(frame_to_us(12, FPS_30), max, FPS_30), frame_to_us(12, FPS_30));
+    }
+
+    #[test]
+    fn head_and_tail_allow_only_their_alignment() {
+        use TransitionAlignment::*;
+        assert!([StartAtCut, Centered, EndAtCut].iter().all(|a| alignment_enabled(EditKind::Cut, *a)));
+        assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Head, a)), [true, false, false]);
+        assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Tail, a)), [false, false, true]);
     }
 }

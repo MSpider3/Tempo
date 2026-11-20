@@ -7,11 +7,11 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, MAX_SPEED, MIN_SPEED};
+use tempo_timeline::{AudioTrackType, ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
 
 use crate::actions;
 use crate::keybinds;
-use crate::state::AppState;
+use crate::state::{timecode, AppState};
 use crate::util::label;
 
 fn form_grid() -> gtk::Grid {
@@ -36,14 +36,54 @@ pub struct NewProject {
 
 const SHAPES: [(&str, (u32, u32)); 3] = [("Landscape 16:9", (16, 9)), ("Vertical 9:16", (9, 16)), ("Square 1:1", (1, 1))];
 const SIZES: [(&str, u32); 3] = [("720p", 720), ("1080p", 1080), ("4K", 2160)];
-const RATES: [(&str, RationalFps); 6] = [
+const RATES: [(&str, RationalFps); 8] = [
     ("23.976", RationalFps::FPS_23_976),
     ("24", RationalFps::FPS_24),
     ("25", RationalFps::FPS_25),
     ("29.97", RationalFps::FPS_29_97),
     ("30", RationalFps::FPS_30),
+    ("50", RationalFps::FPS_50),
+    ("59.94", RationalFps::FPS_59_94),
     ("60", RationalFps::FPS_60),
 ];
+
+/// Index of `fps` in `RATES`, or of 30 when the rate is not listed.
+fn rate_index(fps: RationalFps) -> u32 {
+    RATES.iter().position(|r| r.1 == fps).or_else(|| RATES.iter().position(|r| r.1 == RationalFps::FPS_30)).unwrap_or(0) as u32
+}
+
+/// The timeline's own rate: None when it is the project's.
+fn timeline_fps_choice(chosen: RationalFps, project: RationalFps) -> Option<RationalFps> {
+    (chosen != project).then_some(chosen)
+}
+
+/// One frame in microseconds, computed as `parse_timecode` does for 00:00:00:01.
+fn one_frame_us(fps: f64) -> i64 {
+    (1_000_000.0 / fps) as i64
+}
+
+/// The frame a time is in, with the same rounding as `AppState::frame_floor`
+/// (a time within a tenth of a frame of the next frame counts as that frame).
+fn frame_count(us: i64, fps: RationalFps) -> i64 {
+    let (num, den) = (fps.num.max(1) as i128, fps.den.max(1) as i128);
+    ((us.max(0) as i128 * num * 10 + den * 1_000_000) / (den * 10_000_000)) as i64
+}
+
+/// The rate a new timeline will have: the project's, or the dropdown's when Use Project Settings is off.
+fn chosen_timeline_fps(use_project: bool, selected: RationalFps, project: RationalFps) -> RationalFps {
+    if use_project { project } else { selected }
+}
+
+/// Resolve shows a point marker's duration as one frame.
+fn shown_marker_duration_us(duration_us: i64, fps: f64) -> i64 {
+    duration_us.max(one_frame_us(fps))
+}
+
+/// One frame or less (counted in whole frames, as `frame_floor` does) stays a point
+/// marker, stored as 0; longer is stored as `floored_us`.
+fn stored_marker_duration_us(typed_us: i64, floored_us: i64, fps: RationalFps) -> i64 {
+    if frame_count(typed_us, fps) <= 1 { 0 } else { floored_us }
+}
 
 pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject) + 'static) {
     let name = gtk::Entry::builder().text("Untitled Project").activates_default(true).build();
@@ -51,7 +91,7 @@ pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject
     let size = gtk::DropDown::from_strings(&SIZES.map(|s| s.0));
     size.set_selected(1);
     let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
-    rate.set_selected(4);
+    rate.set_selected(rate_index(RationalFps::FPS_30));
 
     let grid = form_grid();
     form_row(&grid, 0, "Name", &name);
@@ -87,50 +127,289 @@ pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject
     dialog.present(Some(parent));
 }
 
-const MARKER_COLORS: [(&str, MarkerColor); 6] = [
-    ("Blue", MarkerColor::Blue),
-    ("Green", MarkerColor::Green),
-    ("Yellow", MarkerColor::Yellow),
-    ("Red", MarkerColor::Red),
-    ("Orange", MarkerColor::Orange),
-    ("Purple", MarkerColor::Purple),
-];
-
 /// Edit a marker's name, colour and note.
 pub fn edit_marker(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, marker: Marker) {
-    let name = gtk::Entry::builder().text(&marker.name).activates_default(true).build();
+    // An unnamed marker gets "Marker N" as in Resolve, and keeps it when the dialog is closed with Esc.
+    let others = state.with_timeline(|t| t.markers.iter().filter(|m| m.id != marker.id).cloned().collect::<Vec<_>>()).unwrap_or_default();
+    let default_name = if marker.name.is_empty() { actions::default_marker_name(&others) } else { marker.name.clone() };
+    let name = gtk::Entry::builder().text(&default_name).activates_default(true).build();
     let note = gtk::Entry::builder().text(&marker.note).activates_default(true).build();
-    let color = gtk::DropDown::from_strings(&MARKER_COLORS.map(|c| c.0));
-    color.set_selected(MARKER_COLORS.iter().position(|c| c.1 == marker.color).unwrap_or(0) as u32);
+    // A legacy Orange marker shows no dot marked until another is picked.
+    let selected_color = Rc::new(std::cell::Cell::new(marker.color));
+    let color = gtk::FlowBox::builder().selection_mode(gtk::SelectionMode::None).max_children_per_line(8).min_children_per_line(8).column_spacing(2).row_spacing(2).build();
+    let mut first: Option<gtk::ToggleButton> = None;
+    for c in MarkerColor::RESOLVE {
+        let dot = gtk::Label::new(None);
+        dot.set_markup(&format!("<span foreground=\"{}\" size=\"x-large\">●</span>", c.hex()));
+        let button = gtk::ToggleButton::builder().child(&dot).css_classes(["flat"]).tooltip_text(c.name()).build();
+        button.update_property(&[gtk::accessible::Property::Label(c.name())]);
+        button.set_focus_on_click(false);
+        match &first {
+            Some(f) => button.set_group(Some(f)),
+            None => first = Some(button.clone()),
+        }
+        button.set_active(c == marker.color);
+        let chosen = selected_color.clone();
+        button.connect_toggled(move |b| {
+            if b.is_active() {
+                chosen.set(c);
+            }
+        });
+        color.append(&button);
+    }
+
+    let fps = state.fps();
+    let time = gtk::Entry::builder().text(state.position_tc(marker.position_us)).activates_default(true).build();
+    let keyword = gtk::Entry::builder().text(&marker.keyword).activates_default(true).build();
+    // A length, so no Start Timecode: a point marker reads as one frame, as in Resolve.
+    let duration = gtk::Entry::builder().text(timecode(shown_marker_duration_us(marker.duration_us, fps), fps)).activates_default(true).build();
+    duration.set_tooltip_text(Some("Length as a timecode; one frame (00:00:00:01) or less marks a single point"));
 
     let grid = form_grid();
-    form_row(&grid, 0, "Name", &name);
-    form_row(&grid, 1, "Colour", &color);
-    form_row(&grid, 2, "Note", &note);
+    form_row(&grid, 0, "Time", &time);
+    form_row(&grid, 1, "Duration", &duration);
+    form_row(&grid, 2, "Name", &name);
+    form_row(&grid, 3, "Notes", &note);
+    form_row(&grid, 4, "Keyword", &keyword);
+    form_row(&grid, 5, "Colour", &color);
     let hint = label("Named markers become chapters when you export.", &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
-    grid.attach(&hint, 1, 3, 1, 1);
+    grid.attach(&hint, 1, 6, 1, 1);
 
-    let dialog = adw::AlertDialog::builder().heading("Marker").extra_child(&grid).build();
-    dialog.add_responses(&[("remove", "Remove Marker"), ("cancel", "Cancel"), ("done", "Done")]);
+    let dialog = adw::AlertDialog::builder().heading("Markers").extra_child(&grid).build();
+    dialog.add_responses(&[("remove", "Remove Marker"), ("done", "Done")]);
     dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("done"));
-    dialog.set_close_response("cancel");
+    dialog.set_close_response("close");
     let state = state.clone();
+    let name_field = name.clone();
     dialog.connect_response(None, move |_, response| match response {
         "remove" => actions::delete_marker(&state, marker.id),
         "done" => {
             let mut edited = marker.clone();
-            edited.name = name.text().trim().to_string();
+            edited.name = name_field.text().trim().to_string();
             edited.note = note.text().trim().to_string();
-            edited.color = MARKER_COLORS[color.selected() as usize].1;
+            edited.keyword = keyword.text().trim().to_string();
+            edited.color = selected_color.get();
+            // A time that does not parse leaves the marker where it was.
+            if let Some(us) = typed_position_us(&time.text(), fps, state.start_tc_us()) {
+                edited.position_us = state.frame_floor(us);
+            }
+            // A duration that does not parse stays as it was.
+            if let Some(us) = parse_timecode(&duration.text(), fps) {
+                let rate = state.with_project(|p| p.timeline_fps()).unwrap_or(RationalFps::FPS_30);
+                edited.duration_us = stored_marker_duration_us(us, state.frame_floor(us), rate);
+            }
             if edited != marker {
                 actions::update_marker(&state, edited);
             }
         }
+        // Esc: the marker stays, with its default name if it had none.
+        _ if marker.name.is_empty() => {
+            let mut named = marker.clone();
+            named.name = default_name.clone();
+            actions::update_marker(&state, named);
+        }
         _ => {}
     });
     dialog.present(Some(parent));
+    // Resolve opens with the name selected: type it and press Enter.
+    name.grab_focus();
+    name.select_region(0, -1);
+}
+
+/// `HH:MM:SS:FF` (also `MM:SS:FF` or `SS:FF`, `;` as well as `:`) to microseconds.
+/// None when it is malformed or the frames are past the frame rate.
+fn parse_timecode(text: &str, fps: f64) -> Option<i64> {
+    let fps_i = fps.round().max(1.0) as i64;
+    let mut parts: Vec<i64> = text.trim().split([':', ';']).map(|p| p.trim().parse::<i64>().ok().filter(|n| *n >= 0)).collect::<Option<_>>()?;
+    if parts.len() < 2 || parts.len() > 4 {
+        return None;
+    }
+    // Right to left: frames, seconds, minutes, hours.
+    parts.reverse();
+    let frames = parts[0];
+    if frames >= fps_i || parts.get(1).is_some_and(|s| *s >= 60) || parts.get(2).is_some_and(|m| *m >= 60) {
+        return None;
+    }
+    let secs = parts[1] + parts.get(2).unwrap_or(&0) * 60 + parts.get(3).unwrap_or(&0) * 3600;
+    Some(((secs * fps_i + frames) as f64 * 1_000_000.0 / fps) as i64)
+}
+
+/// A typed timecode (which includes the Start Timecode) as a timeline position.
+/// None when it is malformed or lies before the timeline starts.
+fn typed_position_us(text: &str, fps: f64, start_tc_us: i64) -> Option<i64> {
+    parse_timecode(text, fps).map(|us| us - start_tc_us).filter(|us| *us >= 0)
+}
+
+/// Resolve's 01:00:00:00 counted in frames, so it reads that at 23.976/29.97/59.94 too.
+fn default_start_tc_us(fps: f64) -> i64 {
+    parse_timecode("01:00:00:00", fps).unwrap_or(tempo_timeline::RESOLVE_START_TC_US)
+}
+
+/// What the Create New Timeline dialog asks for, as a timeline.
+fn timeline_from_form(name: String, video: u32, audio: u32, audio_type: AudioTrackType, start_tc_us: i64, resolution: Option<(u32, u32)>, fps: Option<RationalFps>) -> Timeline {
+    let mut timeline = Timeline::with_tracks(name, video, audio);
+    timeline.start_tc_us = start_tc_us;
+    timeline.resolution = resolution;
+    timeline.fps = fps;
+    for track in timeline.tracks.iter_mut().filter(|t| t.kind == tempo_timeline::TrackKind::Audio) {
+        track.audio_type = audio_type;
+    }
+    timeline
+}
+
+/// Mark In/Out can seed the new timeline only when the Media Pool pick is the clip open in
+/// the viewer's source mode and has an In or an Out.
+fn marks_available(selected: Option<uuid::Uuid>, source: Option<uuid::Uuid>, src_in: Option<i64>, src_out: Option<i64>) -> bool {
+    selected.is_some() && selected == source && (src_in.is_some() || src_out.is_some())
+}
+
+/// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
+/// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
+pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let Some(default) = state.with_project(|p| p.next_timeline_name()) else { return };
+    let name = gtk::Entry::builder().text(&default).activates_default(true).build();
+    let tracks = |label| {
+        let spin = gtk::SpinButton::with_range(1.0, 8.0, 1.0);
+        spin.update_property(&[gtk::accessible::Property::Label(label)]);
+        spin
+    };
+    let video = tracks("No. of Video Tracks");
+    let audio = tracks("No. of Audio Tracks");
+    let project_rate = state.with_project(|p| p.fps).unwrap_or(RationalFps::FPS_30);
+    let fps = project_rate.to_f64();
+    let start = gtk::Entry::builder().text(timecode(default_start_tc_us(fps), fps)).activates_default(true).build();
+    let audio_type = gtk::DropDown::from_strings(&["Mono", "Stereo"]);
+    audio_type.set_selected(1);
+    // Resolve's options are checkboxes whose label toggles them.
+    let check_button = |text: &str| gtk::CheckButton::builder().label(text).active(true).halign(gtk::Align::Start).build();
+    // On: an empty timeline. Off: it starts with the clip picked in the Media Pool.
+    let empty = check_button("Empty Timeline");
+    empty.set_tooltip_text(Some("Turn off to start the timeline with the clip selected in the Media Pool"));
+    let use_project = check_button("Use Project Settings");
+    // Resolve's option is off until asked for, and greyed out unless the picked clip has marks.
+    let use_marks = check_button("Use Selected Mark In/Out");
+    use_marks.set_active(false);
+    let marks = marks_available(state.media_selection.get(), state.source_clip.get(), state.src_in.get(), state.src_out.get());
+    use_marks.set_sensitive(marks);
+    if !marks {
+        use_marks.set_tooltip_text(Some("Set In/Out on the clip in the viewer's source mode and select it in the Media Pool"));
+    }
+    empty.bind_property("active", &use_marks, "sensitive").transform_to(move |_, empty: bool| Some(marks && !empty)).sync_create().build();
+    let (project_w, project_h, project_fps) = state.with_project(|p| (p.width, p.height, p.fps)).unwrap_or((1920, 1080, RationalFps::FPS_30));
+    let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    width.set_value(project_w as f64);
+    let height = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    height.set_value(project_h as f64);
+    let size = form_grid();
+    form_row(&size, 0, "Width", &width);
+    form_row(&size, 1, "Height", &height);
+    let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
+    rate.set_selected(rate_index(project_fps));
+    form_row(&size, 2, "Timeline Frame Rate", &rate);
+    let reveal = gtk::Revealer::builder().child(&size).build();
+    use_project.bind_property("active", &reveal, "reveal-child").transform_to(|_, on: bool| Some(!on)).sync_create().build();
+
+    let grid = form_grid();
+    form_row(&grid, 0, "Start Timecode", &start);
+    form_row(&grid, 1, "Timeline Name", &name);
+    form_row(&grid, 2, "No. of Video Tracks", &video);
+    form_row(&grid, 3, "No. of Audio Tracks", &audio);
+    form_row(&grid, 4, "Audio Track Type", &audio_type);
+    grid.attach(&empty, 1, 5, 1, 1);
+    grid.attach(&use_marks, 1, 6, 1, 1);
+    grid.attach(&reveal, 0, 7, 2, 1);
+    grid.set_margin_start(24);
+    grid.set_margin_end(24);
+    grid.set_margin_top(12);
+    grid.set_margin_bottom(12);
+
+    // Resolve's button row: Use Project Settings bottom left, Cancel and Create right.
+    let cancel = gtk::Button::with_label("Cancel");
+    let create = gtk::Button::with_label("Create");
+    create.add_css_class("suggested-action");
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    let bar = gtk::Box::builder().spacing(8).margin_start(24).margin_end(24).margin_top(8).margin_bottom(12).build();
+    bar.append(&use_project);
+    bar.append(&spacer);
+    bar.append(&cancel);
+    bar.append(&create);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&grid));
+    view.add_bottom_bar(&bar);
+    let dialog = adw::Dialog::builder().title("Create New Timeline").child(&view).build();
+    dialog.set_default_widget(Some(&create));
+    let closer = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(d) = closer.upgrade() {
+            d.close();
+        }
+    });
+    let taken = state.with_project(|p| p.timeline_list()).unwrap_or_default();
+    // The rate the new timeline gets decides what the Start Timecode means.
+    let chosen_fps = {
+        let (use_project, rate) = (use_project.clone(), rate.clone());
+        move || chosen_timeline_fps(use_project.is_active(), RATES[rate.selected() as usize].1, project_fps).to_f64()
+    };
+    // The default follows the rate until the user types a different Start Timecode.
+    let default_start = Rc::new(std::cell::RefCell::new(start.text().to_string()));
+    // Weak: the dialog owns the entry, so a strong ref here would keep both alive forever.
+    let check = {
+        let (name, start, chosen_fps, create) = (name.clone(), start.clone(), chosen_fps.clone(), create.clone());
+        move || {
+            let typed = name.text().trim().to_lowercase();
+            let free = !typed.is_empty() && !taken.iter().any(|(_, n)| n.to_lowercase() == typed);
+            let valid_start = parse_timecode(&start.text(), chosen_fps()).is_some();
+            create.set_sensitive(free && valid_start);
+        }
+    };
+    let on_name = check.clone();
+    name.connect_changed(move |_| on_name());
+    let on_start = check.clone();
+    start.connect_changed(move |_| on_start());
+    let follow = {
+        let (start, chosen_fps, default_start) = (start.clone(), chosen_fps.clone(), default_start.clone());
+        move || {
+            let rate = chosen_fps();
+            if start.text() == default_start.borrow().as_str() {
+                let text = timecode(default_start_tc_us(rate), rate);
+                *default_start.borrow_mut() = text.clone();
+                start.set_text(&text);
+            }
+            check();
+        }
+    };
+    let on_switch = follow.clone();
+    use_project.connect_active_notify(move |_| on_switch());
+    rate.connect_selected_notify(move |_| follow());
+    let state = state.clone();
+    let field = name.clone();
+    let closer = dialog.downgrade();
+    create.connect_clicked(move |_| {
+        let typed = field.text().trim().to_string();
+        let title = if typed.is_empty() { default.clone() } else { typed };
+        let new_fps = chosen_fps();
+        let start_tc_us = parse_timecode(&start.text(), new_fps).unwrap_or_else(|| default_start_tc_us(new_fps));
+        let timeline_fps = (!use_project.is_active()).then(|| timeline_fps_choice(RATES[rate.selected() as usize].1, project_fps)).flatten();
+        let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
+        let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
+        state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps));
+        if !empty.is_active() {
+            match state.media_selection.get() {
+                Some(source) => {
+                    actions::place_source(&state, source, actions::Place::Overwrite, Some(0), None, use_marks.is_active());
+                }
+                None => state.message("No clip is selected in the Media Pool, so the timeline is empty."),
+            }
+        }
+        if let Some(d) = closer.upgrade() {
+            d.close();
+        }
+    });
+    dialog.present(Some(parent));
+    name.grab_focus();
 }
 
 /// Resolve's Change Clip Speed (R): a speed in percent, and Ripple Sequence (on by
@@ -146,7 +425,7 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     }
     let Some((fps, limits)) = state.with_project(|p| {
         let limits = p.sources.iter().filter(|(_, s)| s.duration_us > 0).map(|(id, s)| (*id, s.duration_us)).collect::<std::collections::HashMap<_, _>>();
-        (p.fps, limits)
+        (p.timeline_fps(), limits)
     }) else {
         return;
     };
@@ -200,20 +479,52 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
 }
 
 /// Ask for the details of an upload, then run the plugin's uploader on a worker.
-pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: crate::plugins::Uploader, file: std::path::PathBuf, title: &str, description: &str) {
-    let title_entry = gtk::Entry::builder().text(title).build();
+/// `draft` holds the starting values; its token is ignored.
+pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: crate::plugins::Uploader, draft: tempo_plugin::UploadInput) {
+    let title_entry = gtk::Entry::builder().text(draft.title.as_str()).build();
     let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
-    text.buffer().set_text(description);
+    text.buffer().set_text(&draft.description);
     let description_box = gtk::ScrolledWindow::builder().child(&text).min_content_height(110).min_content_width(320).css_classes(["card"]).build();
+    let privacy = gtk::DropDown::from_strings(&["Private", "Unlisted", "Public"]);
+    privacy.set_selected(tempo_plugin::PRIVACY.iter().position(|p| *p == draft.privacy).unwrap_or(0) as u32);
+    let category = gtk::DropDown::from_strings(&tempo_plugin::CATEGORIES);
+    category.set_selected(tempo_plugin::CATEGORIES.iter().position(|c| *c == draft.category).unwrap_or(0) as u32);
+    let thumb_entry = gtk::Entry::builder().hexpand(true).placeholder_text("No thumbnail").build();
+    if let Some(t) = &draft.thumbnail {
+        thumb_entry.set_text(&t.to_string_lossy());
+    }
+    let thumb_pick = gtk::Button::with_label("…");
+    thumb_pick.set_tooltip_text(Some("Choose a thumbnail image (jpg or png)"));
+    let entry = thumb_entry.clone();
+    thumb_pick.connect_clicked(move |b| {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images (jpg, png)"));
+        filter.add_mime_type("image/jpeg");
+        filter.add_mime_type("image/png");
+        let dialog = gtk::FileDialog::builder().title("Thumbnail").modal(true).default_filter(&filter).build();
+        let entry = entry.clone();
+        dialog.open(b.root().and_downcast::<gtk::Window>().as_ref(), gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let thumb_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    thumb_row.append(&thumb_entry);
+    thumb_row.append(&thumb_pick);
     let token = gtk::PasswordEntry::builder().show_peek_icon(true).build();
 
     let grid = form_grid();
     form_row(&grid, 0, "Title", &title_entry);
     form_row(&grid, 1, "Description", &description_box);
-    form_row(&grid, 2, "Access token", &token);
+    form_row(&grid, 2, "Thumbnail", &thumb_row);
+    form_row(&grid, 3, "Privacy", &privacy);
+    form_row(&grid, 4, "Category", &category);
+    form_row(&grid, 5, "Access token", &token);
     let hint = label(&format!("The token is kept in your keyring and given only to {}.", uploader.plugin.name), &["tempo-dim", "tempo-small"]);
     hint.set_xalign(0.0);
-    grid.attach(&hint, 1, 3, 1, 1);
+    grid.attach(&hint, 1, 6, 1, 1);
+    let file = draft.file;
 
     // Fill in the token saved last time.
     let id = uploader.plugin.id.clone();
@@ -238,6 +549,9 @@ pub fn upload(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, uploader: cr
             file: file.clone(),
             title: title_entry.text().trim().to_string(),
             description: buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string(),
+            privacy: tempo_plugin::PRIVACY.get(privacy.selected() as usize).unwrap_or(&"private").to_string(),
+            category: tempo_plugin::CATEGORIES.get(category.selected() as usize).unwrap_or(&"Film & Animation").to_string(),
+            thumbnail: Some(thumb_entry.text().trim().to_string()).filter(|t| !t.is_empty()).map(std::path::PathBuf::from),
             token: token.text().to_string(),
         };
         let (state, uploader, parent) = (state.clone(), uploader.clone(), parent_widget.clone());
@@ -605,4 +919,120 @@ pub fn plugins(parent: &impl IsA<gtk::Window>, plugins: &Rc<crate::plugins::Plug
         });
     });
     dialog.present(Some(parent.as_ref()));
+}
+
+#[cfg(test)]
+mod marker_time_tests {
+    use super::{marks_available, chosen_timeline_fps, default_start_tc_us, frame_count, one_frame_us, parse_timecode, rate_index, shown_marker_duration_us, stored_marker_duration_us, timeline_fps_choice, timeline_from_form, typed_position_us, RATES};
+    use tempo_timeline::{AudioTrackType, RationalFps, TrackKind};
+
+    #[test]
+    fn marks_apply_only_to_the_selected_clip_with_a_mark() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(marks_available(Some(a), Some(a), Some(5), None));
+        assert!(marks_available(Some(a), Some(a), None, Some(9)));
+        assert!(!marks_available(Some(a), Some(a), None, None));
+        assert!(!marks_available(Some(a), Some(b), Some(5), Some(9)));
+        assert!(!marks_available(None, None, Some(5), Some(9)));
+    }
+
+    #[test]
+    fn typed_position_subtracts_start_timecode() {
+        let start = 3_600_000_000;
+        assert_eq!(typed_position_us("01:00:01:00", 24.0, start), Some(1_000_000));
+        assert_eq!(typed_position_us("01:00:00:00", 24.0, start), Some(0));
+        assert_eq!(typed_position_us("00:59:59:00", 24.0, start), None);
+    }
+
+    /// Every listed rate, as the dialogs see it.
+    fn all_rates() -> impl Iterator<Item = RationalFps> {
+        RATES.iter().map(|r| r.1)
+    }
+
+    /// `AppState::frame_floor` for a rate: the start of the frame a time is in.
+    fn frame_floor(us: i64, fps: RationalFps) -> i64 {
+        (frame_count(us, fps) as i128 * fps.den as i128 * 1_000_000 + fps.num as i128 / 2).div_euclid(fps.num as i128) as i64
+    }
+
+    #[test]
+    fn point_marker_shows_one_frame_and_one_frame_stores_as_point() {
+        for rate in all_rates() {
+            let fps = rate.to_f64();
+            let one = one_frame_us(fps);
+            assert_eq!(shown_marker_duration_us(0, fps), one);
+            assert_eq!(shown_marker_duration_us(one * 5, fps), one * 5);
+            assert_eq!(crate::state::timecode(shown_marker_duration_us(0, fps), fps), "00:00:00:01", "{fps}");
+            // Renaming a point marker re-parses its shown duration and must keep it a point.
+            let typed = parse_timecode("00:00:00:01", fps).unwrap();
+            assert_eq!(stored_marker_duration_us(typed, frame_floor(typed, rate), rate), 0, "{fps}");
+            assert_eq!(stored_marker_duration_us(0, 0, rate), 0, "{fps}");
+            let two = parse_timecode("00:00:00:02", fps).unwrap();
+            assert_eq!(stored_marker_duration_us(two, frame_floor(two, rate), rate), frame_floor(two, rate), "{fps}");
+        }
+    }
+
+    #[test]
+    fn start_timecode_is_read_at_the_new_timelines_rate() {
+        let (project, selected) = (RationalFps::FPS_30, RationalFps::FPS_25);
+        assert_eq!(chosen_timeline_fps(true, selected, project), project);
+        assert_eq!(chosen_timeline_fps(false, selected, project), selected);
+        for rate in [RationalFps::FPS_29_97, RationalFps::FPS_23_976] {
+            let fps = chosen_timeline_fps(false, rate, project).to_f64();
+            assert_eq!(crate::state::timecode(default_start_tc_us(fps), fps), "01:00:00:00");
+        }
+        let at25 = chosen_timeline_fps(false, selected, project).to_f64();
+        assert_eq!(parse_timecode("01:00:00:27", at25), None);
+        let us = parse_timecode("01:00:00:12", at25).unwrap();
+        assert_eq!(crate::state::timecode(us, at25), "01:00:00:12");
+    }
+
+    #[test]
+    fn timeline_fps_is_none_when_it_equals_the_project_rate() {
+        assert_eq!(timeline_fps_choice(RationalFps::FPS_30, RationalFps::FPS_30), None);
+        assert_eq!(timeline_fps_choice(RationalFps::FPS_24, RationalFps::FPS_30), Some(RationalFps::FPS_24));
+        assert_eq!(RATES[rate_index(RationalFps::FPS_59_94) as usize].0, "59.94");
+    }
+
+    #[test]
+    fn marker_duration_timecode_round_trips_without_start_offset() {
+        for fps in [24.0, 25.0, 29.97] {
+            let one_frame = (1_000_000.0 / fps) as i64;
+            let text = crate::state::timecode(one_frame, fps);
+            assert_eq!(text, "00:00:00:01");
+            assert_eq!(parse_timecode(&text, fps), Some(one_frame));
+        }
+        assert_eq!(parse_timecode("00:00:00:00", 24.0), Some(0));
+    }
+
+    #[test]
+    fn default_start_reads_one_hour_at_ntsc_rates() {
+        for fps in [23.976, 29.97, 59.94, 24.0, 25.0] {
+            assert_eq!(crate::state::timecode(default_start_tc_us(fps), fps), "01:00:00:00", "{fps}");
+        }
+    }
+
+    #[test]
+    fn form_values_reach_the_timeline() {
+        let t = timeline_from_form("T".into(), 1, 2, AudioTrackType::Mono, 5, Some((1080, 1920)), Some(RationalFps::FPS_50));
+        assert_eq!((t.start_tc_us, t.resolution), (5, Some((1080, 1920))));
+        assert!(t.tracks.iter().filter(|x| x.kind == TrackKind::Audio).all(|x| x.audio_type == AudioTrackType::Mono));
+        assert_eq!(timeline_from_form("T".into(), 1, 1, AudioTrackType::Stereo, 0, None, None).resolution, None);
+    }
+
+    #[test]
+    fn timecode_text_reads_back() {
+        assert_eq!(parse_timecode("00:00:01:00", 24.0), Some(1_000_000));
+        assert_eq!(parse_timecode("01:00:00:00", 25.0), Some(3_600_000_000));
+        assert_eq!(parse_timecode("1:12", 24.0), Some(1_500_000));
+        assert_eq!(parse_timecode("00:00:00;05", 25.0), Some(200_000));
+    }
+
+    #[test]
+    fn bad_timecode_is_refused() {
+        assert_eq!(parse_timecode("abc", 24.0), None);
+        assert_eq!(parse_timecode("00:00:00:24", 24.0), None);
+        assert_eq!(parse_timecode("00:75:00:00", 24.0), None);
+        assert_eq!(parse_timecode("-1:00", 24.0), None);
+        assert_eq!(parse_timecode("5", 24.0), None);
+    }
 }

@@ -32,6 +32,11 @@
   </requires>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0" date="2026-11-20" type="development">
+      <description>
+        <p>Alpha. Resolve-style transitions (Additive, Blur, Cross, Dip To Color and Non-Additive Dissolve) with the full Inspector, transition copy and paste, timelines in the Media Pool, a Resolve-style Create New Timeline dialog, marker colours, zoom presets and upload fields on the Export page.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-21" type="development">
       <description>
         <p>Alpha. Smoother playback of heavy footage, faster proxies with sound, Resolve-style project backups, Change Clip Speed, fade handles, Solo, and a 10 MB export for Discord.</p>

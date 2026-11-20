@@ -1,5 +1,6 @@
 //! tempo-export: Video and audio encoding pipeline (H.264, AAC, EDL, FCPXML).
 
+pub mod audio_mix;
 pub mod chapters;
 pub mod edl;
 pub mod error;

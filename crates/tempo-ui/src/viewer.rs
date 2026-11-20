@@ -6,11 +6,24 @@ use std::time::Duration;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::{gio, glib};
 
 use crate::player::{Player, Snapshot};
 use crate::state::{timecode, AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
+
+const MARKER_CLASSES: [&str; 17] = [
+    "marker-blue", "marker-cyan", "marker-green", "marker-yellow", "marker-red", "marker-pink", "marker-purple", "marker-fuchsia",
+    "marker-rose", "marker-lavender", "marker-sky", "marker-mint", "marker-lemon", "marker-sand", "marker-cocoa", "marker-cream",
+    "marker-orange",
+];
+
+/// The overlay's CSS class for a colour: "marker-" and the colour's name.
+fn marker_class(color: tempo_timeline::MarkerColor) -> &'static str {
+    let name = format!("marker-{}", color.name().to_lowercase());
+    MARKER_CLASSES.iter().copied().find(|c| *c == name).unwrap_or(MARKER_CLASSES[0])
+}
 
 pub struct Viewer {
     pub root: gtk::Box,
@@ -24,7 +37,12 @@ pub struct Viewer {
     /// Called when "Dual viewer" is switched in the menu.
     dual_listener: RefCell<Option<Box<dyn Fn(bool)>>>,
     name: gtk::Label,
+    /// The name above the picture: in timeline mode, a menu of the project's timelines.
+    switcher: gtk::MenuButton,
     proxy_badge: gtk::Label,
+    /// Resolve's box over the picture while the playhead is parked on a marker.
+    marker_box: gtk::Box,
+    marker_lines: [gtk::Label; 3],
     /// Shown while a Media Pool clip is in the viewer: the way back.
     back: gtk::Button,
     scrub: gtk::Scale,
@@ -77,7 +95,18 @@ impl Viewer {
         start.append(&quality);
         start.append(&back);
         header.set_start_widget(Some(&start));
-        header.set_center_widget(Some(&name));
+        let switcher = gtk::MenuButton::builder().child(&name).css_classes(["flat"]).build();
+        header.set_center_widget(Some(&switcher));
+        let actions = gio::SimpleActionGroup::new();
+        let open = gio::SimpleAction::new("open-timeline", Some(glib::VariantTy::STRING));
+        let s = state.clone();
+        open.connect_activate(move |_, target| {
+            if let Some(id) = target.and_then(|t| t.str()).and_then(|t| uuid::Uuid::parse_str(t).ok()) {
+                s.open_timeline(id);
+            }
+        });
+        actions.add_action(&open);
+        root.insert_action_group("viewer", Some(&actions));
         header.set_end_widget(Some(&end));
         root.append(&header);
 
@@ -89,6 +118,14 @@ impl Viewer {
         proxy_badge.set_visible(false);
         let overlay = gtk::Overlay::builder().child(&surface).css_classes(["viewer-surround"]).build();
         overlay.add_overlay(&proxy_badge);
+        let marker_lines = [label("", &[]), label("", &[]), label("", &[])];
+        let marker_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).halign(gtk::Align::Start).valign(gtk::Align::Start).can_target(false).visible(false).build();
+        marker_box.add_css_class("marker-overlay");
+        for l in &marker_lines {
+            l.set_xalign(0.0);
+            marker_box.append(l);
+        }
+        overlay.add_overlay(&marker_box);
         root.append(&overlay);
 
         // Scrub bar.
@@ -130,7 +167,10 @@ impl Viewer {
             shown_source: Cell::new(None),
             dual_listener: RefCell::new(None),
             name,
+            switcher,
             proxy_badge,
+            marker_box,
+            marker_lines,
             back,
             scrub,
             play,
@@ -172,7 +212,8 @@ impl Viewer {
         // a few atomics unless a new picture or position has arrived.
         let v = viewer.clone();
         let last_serial = Cell::new(0u64);
-        let last_pos = Cell::new(-1i64);
+        // Position plus the Start Timecode: a timeline switch can change the label with the playhead still at 0.
+        let last_pos = Cell::new((-1i64, 0i64, false));
         let last_playing = Cell::new(false);
         let last_duration = Cell::new(-1i64);
         viewer.surface.add_tick_callback(move |_, _| {
@@ -188,8 +229,11 @@ impl Viewer {
                 v.scrub.set_range(0.0, duration.max(1) as f64);
             }
             let pos = player.position_us();
-            if pos != last_pos.replace(pos) {
-                tc.set_text(&timecode(pos, v.state.fps()));
+            // Only timeline positions carry the Start Timecode; a source's own time does not.
+            let on_timeline = !v.source_only && !v.state.source_mode();
+            if (pos, v.state.start_tc_us(), on_timeline) != last_pos.replace((pos, v.state.start_tc_us(), on_timeline)) {
+                tc.set_text(&if on_timeline { v.state.position_tc(pos) } else { timecode(pos, v.state.fps()) });
+                v.update_marker_box();
                 v.scrub.set_value(pos as f64);
                 for l in v.position_listeners.borrow().iter() {
                     l(pos);
@@ -197,6 +241,7 @@ impl Viewer {
             }
             let playing = player.is_playing();
             if playing != last_playing.replace(playing) {
+                v.update_marker_box();
                 v.play.set_icon_name(if playing { "media-playback-pause-symbolic" } else { "media-playback-start-symbolic" });
             }
             glib::ControlFlow::Continue
@@ -217,12 +262,35 @@ impl Viewer {
                     v.refresh();
                 }
             }
+            if matches!(change, Change::Timelines) {
+                v.refresh();
+            }
             if matches!(change, Change::Project | Change::Timeline | Change::Media) {
+                v.update_marker_box();
                 v.refresh();
             }
         });
         viewer.refresh();
         viewer
+    }
+
+    /// Show "Time" and "Name" over the picture while the playhead rests on a marker.
+    fn update_marker_box(&self) {
+        let marker = (!self.source_only && !self.player.is_playing() && !self.state.source_mode()).then(|| crate::actions::marker_at_playhead(&self.state)).flatten();
+        for class in MARKER_CLASSES {
+            self.marker_box.remove_css_class(class);
+        }
+        let Some(m) = marker else {
+            self.marker_box.set_visible(false);
+            return;
+        };
+        self.marker_box.add_css_class(marker_class(m.color));
+        let [time, name, note] = &self.marker_lines;
+        time.set_text(&format!("Time {}", self.state.position_tc(m.position_us)));
+        name.set_text(&format!("Name {}", m.name));
+        note.set_text(&format!("Note {}", m.note));
+        note.set_visible(!m.note.is_empty());
+        self.marker_box.set_visible(true);
     }
 
     /// Called with the playhead position whenever it moves.
@@ -278,7 +346,7 @@ impl Viewer {
                 .with_project(|p| {
                     p.sources.get(&id).map(|s| {
                         let has_video = s.media_type != tempo_timeline::MediaType::Audio;
-                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.fps, has_video, s.audio_channels.is_some())
+                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.timeline_fps(), has_video, s.audio_channels.is_some())
                     })
                 })
                 .flatten()
@@ -312,6 +380,31 @@ impl Viewer {
         }
     }
 
+    /// Resolve's timeline menu: every timeline, then Create New Timeline.
+    fn refresh_timeline_menu(&self) {
+        let timelines = if self.source_only || self.state.source_mode() { None } else { self.state.with_project(|p| p.timeline_list()) };
+        self.switcher.set_always_show_arrow(timelines.is_some());
+        self.switcher.set_tooltip_text(timelines.as_ref().map(|_| "Timelines in this project"));
+        let Some(timelines) = timelines else {
+            self.switcher.set_menu_model(None::<&gio::MenuModel>);
+            return;
+        };
+        let list = gio::Menu::new();
+        for (id, name) in timelines {
+            let item = gio::MenuItem::new(Some(&name), None);
+            item.set_action_and_target_value(Some("viewer.open-timeline"), Some(&id.to_string().to_variant()));
+            list.append_item(&item);
+        }
+        let create = gio::Menu::new();
+        let item = gio::MenuItem::new(Some("Create New Timeline…"), None);
+        item.set_action_and_target_value(Some("win.do"), Some(&"win.new-timeline".to_variant()));
+        create.append_item(&item);
+        let menu = gio::Menu::new();
+        menu.append_section(None, &list);
+        menu.append_section(None, &create);
+        self.switcher.set_menu_model(Some(&menu));
+    }
+
     fn refresh(&self) {
         let state = &self.state;
         self.back.set_visible(!self.source_only && state.source_mode());
@@ -322,13 +415,14 @@ impl Viewer {
                 let title = match source.and_then(|id| p.sources.get(&id)) {
                     Some(s) => s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     None if self.source_only => "Source".to_string(),
-                    None => "Timeline".to_string(),
+                    None => p.timeline.name.clone(),
                 };
-                (p.width, p.height, title)
+                (p.output_size().0, p.output_size().1, title)
             })
             .unwrap_or((1920, 1080, String::new()));
         self.surface.set_frame_size(w, h);
         self.name.set_text(&title);
+        self.refresh_timeline_menu();
         // Shown while any clip is previewed from its proxy.
         let proxied = state.with_project(|p| p.sources.values().any(|s| s.proxy_ready)).unwrap_or(false);
         let uses_proxies = state.settings.borrow().playback_height != 0;
@@ -401,4 +495,23 @@ fn viewer_menu() -> (gtk::Popover, gtk::CheckButton) {
     check.set_tooltip_text(Some("Show the source clip in its own viewer beside the timeline viewer"));
     list.append(&check);
     (gtk::Popover::builder().child(&list).build(), check)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_colours_in_the_stylesheet_match_the_model() {
+        let css = include_str!("../../../assets/style/tempo.css");
+        let all: Vec<_> = tempo_timeline::MarkerColor::RESOLVE.into_iter().chain([tempo_timeline::MarkerColor::Orange]).collect();
+        for color in all.iter().copied() {
+            let name = color.name().to_lowercase();
+            let prefix = format!("@define-color tempo_marker_{name} ");
+            let line = css.lines().find(|l| l.starts_with(&prefix)).unwrap_or_else(|| panic!("no tempo_marker_{name} in tempo.css"));
+            assert_eq!(line[prefix.len()..].trim().trim_end_matches(';'), color.hex(), "{name}");
+            assert_eq!(marker_class(color), format!("marker-{name}"));
+        }
+        assert_eq!(css.matches("@define-color tempo_marker_").count(), all.len());
+    }
 }

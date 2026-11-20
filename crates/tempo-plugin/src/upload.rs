@@ -16,11 +16,39 @@ use mlua::{Lua, Table, Value};
 
 use crate::{first_line, sandbox, script_error, Plugin, PluginError};
 
+/// Choices for `UploadInput::privacy`, as the script receives them.
+pub const PRIVACY: [&str; 3] = ["private", "unlisted", "public"];
+
+/// Choices for `UploadInput::category` (YouTube's list), as the script receives them.
+pub const CATEGORIES: [&str; 15] = [
+    "Film & Animation", "Autos & Vehicles", "Music", "Pets & Animals", "Sports", "Travel & Events", "Gaming", "People & Blogs",
+    "Comedy", "Entertainment", "News & Politics", "Howto & Style", "Education", "Science & Technology", "Nonprofits & Activism",
+];
+
+/// The description with the chapter list added, unless it is already in it.
+pub fn description_with_chapters(description: &str, chapter_list: &str) -> String {
+    let description = description.trim_end();
+    if chapter_list.is_empty() || description.contains(chapter_list) {
+        description.to_string()
+    } else if description.is_empty() {
+        chapter_list.to_string()
+    } else {
+        format!("{description}\n\n{chapter_list}")
+    }
+}
+
 /// What an uploader is given.
+#[derive(Clone, Default)]
 pub struct UploadInput {
     pub file: PathBuf,
     pub title: String,
     pub description: String,
+    /// One of `PRIVACY`.
+    pub privacy: String,
+    /// One of `CATEGORIES`.
+    pub category: String,
+    /// A cover image the script can send with `tempo.http.upload{ thumbnail = true }`.
+    pub thumbnail: Option<PathBuf>,
     /// The access token or key the user entered for this plugin.
     pub token: String,
 }
@@ -199,6 +227,10 @@ pub fn run_upload(plugin: &Plugin, function: &str, input: UploadInput) -> Result
     let (lua, deadline) = sandbox().map_err(fail)?;
     let messages = Rc::new(RefCell::new(Vec::new()));
     let size = std::fs::metadata(&input.file).map_err(|e| PluginError::Io(input.file.clone(), e))?.len();
+    let thumbnail_size = match &input.thumbnail {
+        Some(t) => Some(std::fs::metadata(t).map_err(|e| PluginError::Io(t.clone(), e))?.len()),
+        None => None,
+    };
 
     let build = || -> mlua::Result<Option<String>> {
         let tempo = lua.create_table()?;
@@ -213,12 +245,19 @@ pub fn run_upload(plugin: &Plugin, function: &str, input: UploadInput) -> Result
         let send = {
             let allowed = plugin.network.clone();
             let file = input.file.clone();
+            let thumbnail = input.thumbnail.clone();
             let deadline: Rc<Cell<Instant>> = deadline.clone();
             Rc::new(move |lua: &Lua, options: Table, with_file: bool| -> mlua::Result<Table> {
                 let url: String = options.get("url")?;
                 let plain_http = check_url(&url, &allowed).map_err(script_error)?;
                 let headers = string_pairs(options.get("headers")?)?;
                 let body: Option<mlua::String> = options.get("body")?;
+                // `thumbnail = true` sends the cover image instead of the video.
+                let file = if with_file && options.get::<Option<bool>>("thumbnail")?.unwrap_or(false) {
+                    thumbnail.clone().ok_or_else(|| script_error("there is no thumbnail to send"))?
+                } else {
+                    file.clone()
+                };
                 let payload = if with_file {
                     match options.get::<Option<String>>("field")? {
                         Some(field) if !field.is_empty() && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => Payload::Form(&file, field, string_pairs(options.get("form")?)?),
@@ -272,6 +311,13 @@ pub fn run_upload(plugin: &Plugin, function: &str, input: UploadInput) -> Result
         video.set("token", input.token.as_str())?;
         video.set("file_name", input.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())?;
         video.set("size", size)?;
+        video.set("privacy", input.privacy.as_str())?;
+        video.set("category", input.category.as_str())?;
+        // The script can name the cover image and ask for it to be sent, never read its path.
+        if let (Some(t), Some(n)) = (&input.thumbnail, thumbnail_size) {
+            video.set("thumbnail_name", t.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())?;
+            video.set("thumbnail_size", n)?;
+        }
         entry.call::<Option<String>>(video)
     };
     let url = build().map_err(fail)?;

@@ -6,6 +6,136 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
+Alpha. The Edit page works much more like DaVinci Resolve's:
+- transitions are their own objects, with Resolve's five dissolves and the full Inspector;
+- Resolve-style copy and paste of transitions, and `Up`/`Down` between edits;
+- timelines in the Media Pool, and a Create New Timeline dialog that matches Resolve;
+- marker colours, zoom presets and upload fields on the Export page;
+- end-to-end tests of the real app on a private Wayland session.
+
+### Added
+
+- **Transitions work as in DaVinci Resolve.** A transition is its own object on the timeline.
+  - The Effects panel lists Video Transitions › Dissolve, with Resolve's names: **Additive
+    Dissolve**, **Blur Dissolve**, **Cross Dissolve**, **Dip To Color Dissolve** (black or
+    white for a fade to black or white) and **Non-Additive Dissolve**. The Inspector's
+    Transition Type lists the same five. Additive mixes as screen and Non-Additive keeps the
+    brighter pixel; Blur blurs both clips up to the middle of the mix. Playback and export
+    match. Drag one onto a cut, or onto the start or end of a clip. A box shows
+    where it will land. Audio tracks refuse video transitions.
+  - On a cut it is centred when both clips have footage to spare; otherwise it starts or
+    ends on the cut. On the first clip's start it fades from black, and on the last clip's
+    end it fades to black.
+  - Click a transition to select it (red outline). Drag its free edge to change its length
+    in whole frames; a centred one changes on both sides. A tooltip shows the change and the
+    new length. Lengths never go past the footage the clips have.
+  - The Inspector shows, in Resolve's order: Transition Type; Duration in seconds and
+    frames; **Set as Default Duration** (new transitions from drops and `Ctrl+T` get that
+    length); Alignment (Start, Center, End on Edit); **Start Ratio** and **End Ratio**;
+    **Ease** (None, In, Out, In & Out); **Transition Curve**; and, for Dip To Color, the
+    colour. Ratios and the curve have sliders and reset arrows.
+  - Transition Curve shows the curve at the playhead. Typing a value (or dragging its
+    slider) keys the curve there, and the mix follows a line through the keys. Ease is
+    off while the curve has keys.
+  - Playback and export both follow the ratios, ease and curve. Sound cross fades and a
+    clip's own fades stay straight.
+  - Click a clip edge to select the edit point (green bracket). `Up` and `Down` move the
+    selected edit point with the playhead. They count from the timeline playhead, also while
+    a source clip is shown in the viewer.
+  - `Ctrl+C` on a selected transition copies just the transition, and `Ctrl+V` puts it on the
+    selected edit point. So `Up`, `Ctrl+V`, `Up`, `Ctrl+V`… gives every cut the same transition.
+  - `Backspace` or `Delete` on a selected transition removes only the transition.
+  - `Ctrl+T` adds the standard transition (1 s) on the selected edit, picture and sound;
+    `Alt+T` adds it to the picture only and `Shift+T` to the sound only (a Cross Fade).
+  - Right-click a transition for Copy, Delete and Change Transition Duration….
+  - Sound cross fades are equal power. Video transitions leave the sound alone.
+  - Project files now use schema 5. Older dissolves open as transitions.
+- **Several timelines per project.**
+  - `Ctrl+N` opens Create New Timeline, with a name and the number of video and audio tracks.
+  - The Media Pool right-click menu has Create New Timeline too.
+  - The name above the viewer is a menu of the project's timelines, sorted by name. Pick one to
+    open it. The playhead goes to the start.
+  - Each timeline keeps its own clips, markers and undo history.
+  - Project files now use schema 3. Older files open as one timeline named "Timeline 1".
+- **Edit a marker** by double-clicking it in the timeline ruler. The Markers dialog sets its
+  time, duration (as a timecode), name, notes, **keyword** and colour, and removes it, as in
+  Resolve. New markers are named "Marker N" with the name selected, so `Ctrl+M`, type,
+  `Enter` names it. `Esc` keeps the marker.
+- **Markers on the ruler**: hover one to see its time and name; drag it to move it (it snaps
+  to cuts and the playhead). A marker with a duration shows as a bar.
+- **Marker overlay on the viewer**: with the playhead on a marker, the viewer shows its time
+  and name, as in Resolve.
+- **Zoom presets** above the timeline: Full Extent, Detail (around the playhead) and Custom
+  (the zoom you last set by hand).
+- Dragging a clip shows how far it moved, and trimming shows how much, as `ss:ff`.
+- **Timelines in the Media Pool.** Double-click to open; right-click to rename, duplicate or
+  delete one.
+- Create New Timeline has **Empty Timeline**. Turn it off to start the timeline with the clip
+  selected in the Media Pool.
+- Create New Timeline has **Start Timecode** (01:00:00:00 by default), **Audio Track Type**
+  (Mono or Stereo), **Use Selected Mark In/Out** (place only the marked part of the clip) and,
+  bottom left next to Cancel and Create as in Resolve, **Use Project Settings**. Turn that off to give the timeline its own
+  width, height and frame rate. Timecode, frame steps, snapping, transition limits,
+  playback and export of that timeline use its own rate. The ruler, viewer, timecode label,
+  marker times and EDL export count from the Start Timecode.
+- Audio track headers show "2.0" (stereo) or "1.0" (mono). A mono track plays down the
+  middle, in playback and export.
+- **Ghost tracks**: dragging a clip from the Media Pool into the space above the top video
+  track shows a new V2 (and A2 for clips with sound) with headers. Drop there to make the
+  tracks and place the clip in one undo step. An audio-only clip dragged below the last
+  audio track makes a new audio track. A box shows where the clip will land, the drag shows
+  the clip's thumbnail, and the first drop on an empty timeline zooms to fit.
+- **Resolve's 16 marker colours** in the Markers dialog (Blue, Cyan, Green, Yellow, Red,
+  Pink, Purple, Fuchsia, Rose, Lavender, Sky, Mint, Lemon, Sand, Cocoa, Cream), on the ruler
+  and on the viewer. A point marker's Duration reads 00:00:00:01, as in Resolve.
+- The Inspector's transition page has a **Video** (or **Audio**) header with an on/off
+  switch. Off, the transition stays on the timeline (dimmed) but plays and exports as a cut.
+- **Transition Curve graph** in the Inspector: click to add a key, drag a key to move it,
+  each drag is one undo step. The graph draws the curve as played, with dashed Start and End
+  Ratio guides, and the dragged key stays selected.
+- The transition edge tooltip shows how far the dragged edge moved (`+` is right) and then
+  the new length, as in Resolve.
+- The drop box is blue with the clip's thumbnail for video and green for audio.
+- **End-to-end tests on Wayland.** `scripts/e2e.sh` runs the real app on a private headless
+  mutter with real mouse and keyboard input and screenshots, and never touches your own
+  desktop. Any person or AI can add a scenario; see `docs/TESTING_E2E.md`. Scenarios also
+  record the app's sound from a private PipeWire and check the Deliver upload fields without
+  uploading anything.
+- Project files now use schema 6.
+- **Edit animations**: trims, deletes and ripples slide clips, transitions, the playhead and
+  the view into place over about 120 ms instead of jumping.
+- **Upload from the Export page**, as Resolve's "Upload directly to YouTube": when an uploader
+  plugin is on, Render Settings has Title, Description, Upload Thumbnail, Privacy and Category.
+  They are kept per job, and the job uploads once it has rendered. Plugins receive the
+  privacy, category and thumbnail.
+- Export render-queue jobs are named "<project> | <timeline>". Each job renders the timeline
+  that was open when it was queued.
+
+### Changed
+
+- New transitions are one second long, Resolve's standard transition duration. This was half
+  a second.
+- Right-click Fade In and Fade Out are one second long, like the Effects panel.
+- `Shift+[` and `Shift+]` (Trim Start / Trim End) with nothing selected trim the clip under
+  the playhead, as in Resolve.
+
+### Fixed
+
+- A dissolve no longer stops working when the clip before it moves.
+- An export whose range starts or ends inside a fade or a Dip To Color keeps the ramp. Audio
+  fades are smooth in exports.
+- Two sound transitions on one short clip no longer get their handle footage mixed up.
+- `Ctrl+T` on a short clip fits its two transitions together.
+- A new timeline shows in the Media Pool at once, and the viewer and timecode show its start
+  straight away.
+- The icon column of the Effects panel items stretched across half the row.
+- Fedora 45 (FFmpeg 9):
+  - Export failed for titles containing `%`.
+  - Sound was slightly wrong just after a seek, because AAC and Opus need a short pre-roll.
+  - The export progress bar could step backwards.
+
 ## [0.2.0] - 2026-10-21
 
 Alpha. Built for slower computers first:

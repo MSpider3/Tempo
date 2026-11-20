@@ -53,6 +53,8 @@ pub enum HintZone {
     ClipBody,
     ClipEdge,
     FadeHandle,
+    /// A transition box on the timeline.
+    TransitionEdge,
     Ruler,
     Viewer,
     MediaPool,
@@ -65,8 +67,15 @@ fn hint_actions(zone: HintZone) -> (&'static str, &'static [(&'static str, &'sta
             "Drag to move",
             &[("win.tool-blade", "Blade"), ("win.split-clip", "Split"), ("win.delete", "Delete"), ("win.ripple-delete", "Delete and close gap")],
         ),
-        HintZone::ClipEdge => ("Drag to trim · Shift+drag in Trim mode rolls", &[("win.tool-trim", "Trim mode (ripples)"), ("win.tool-select", "Selection mode"), ("win.snap-toggle", "Snapping")]),
+        HintZone::ClipEdge => (
+            "Click to select the edit · drag to trim · Shift+drag in Trim mode rolls",
+            &[("win.transition-add", "Add transition"), ("win.paste", "Paste transition"), ("win.tool-trim", "Trim mode (ripples)"), ("win.snap-toggle", "Snapping")],
+        ),
         HintZone::FadeHandle => ("Drag toward the middle to fade", &[("win.fade-in-to-playhead", "Fade in to playhead"), ("win.fade-out-to-playhead", "Fade out to playhead")]),
+        HintZone::TransitionEdge => (
+            "Click to select · drag an edge to change its length",
+            &[("win.copy", "Copy"), ("win.delete", "Delete"), ("win.clip-prev", "Previous edit"), ("win.clip-next", "Next edit")],
+        ),
         HintZone::Ruler => ("Click or drag to move the playhead", &[("win.mark-in", "Mark In"), ("win.mark-out", "Mark Out"), ("win.marker-add", "Marker")]),
         HintZone::Viewer => ("", &[("win.play-toggle", "Play"), ("win.play-reverse", "Reverse"), ("win.stop", "Stop"), ("win.play-forward", "Forward"), ("win.viewer-toggle", "Source / timeline")]),
         HintZone::MediaPool => (
@@ -87,12 +96,22 @@ pub fn hint(zone: HintZone, binds: &[Keybind], show: impl Fn(&str) -> String) ->
     std::iter::once(mouse.to_string()).filter(|m| !m.is_empty()).chain(keys).collect::<Vec<_>>().join(" · ")
 }
 
+/// CSS class of a focusable widget that uses Delete and BackSpace itself (the Inspector's curve graph).
+pub const OWNS_DELETE_KEYS: &str = "owns-delete-keys";
+
+fn is_delete_accel(accel: &str) -> bool {
+    accel.ends_with("Delete") || accel.ends_with("BackSpace")
+}
+
 fn belongs_to_focus(focus: &gtk::Widget, accel: &str) -> bool {
     if focus.is::<gtk::Text>() || focus.is::<gtk::TextView>() || focus.is::<gtk::Editable>() {
         return true;
     }
     // Anything open on top of the editor keeps all of its keys.
     if focus.ancestor(gtk::Popover::static_type()).is_some() || focus.ancestor(libadwaita::Dialog::static_type()).is_some() {
+        return true;
+    }
+    if focus.has_css_class(OWNS_DELETE_KEYS) && is_delete_accel(accel) {
         return true;
     }
     let in_list = [gtk::GridView::static_type(), gtk::ListView::static_type(), gtk::DropDown::static_type(), gtk::ListBox::static_type()]
@@ -139,12 +158,18 @@ mod tests {
     use std::collections::HashMap;
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
-    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>n", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+
+    #[test]
+    fn only_the_delete_keys_are_kept_for_widgets_that_own_them() {
+        assert!(["Delete", "BackSpace", "<Shift>BackSpace"].iter().all(|a| is_delete_accel(a)));
+        assert!(!["space", "<Primary>z", "x"].iter().any(|a| is_delete_accel(a)));
+    }
 
     #[test]
     fn every_hint_names_a_bound_action() {
         let binds = load();
-        for zone in [HintZone::ClipBody, HintZone::ClipEdge, HintZone::FadeHandle, HintZone::Ruler, HintZone::Viewer, HintZone::MediaPool] {
+        for zone in [HintZone::ClipBody, HintZone::ClipEdge, HintZone::FadeHandle, HintZone::TransitionEdge, HintZone::Ruler, HintZone::Viewer, HintZone::MediaPool] {
             for (action, _) in hint_actions(zone).1 {
                 assert!(binds.iter().any(|b| b.action == *action && !b.keys.is_empty()), "{action} has no key");
             }
@@ -158,6 +183,16 @@ mod tests {
         // Resolve's split is Ctrl+\, not Ctrl+B; the hint must say what the key really is.
         assert!(text.contains("[<Primary>backslash] Split"), "{text}");
         assert!(text.contains("[<Shift>BackSpace] Delete and close gap"), "{text}");
+        let text = hint(HintZone::ClipEdge, &load(), |k| format!("[{k}]"));
+        assert!(text.contains("[<Primary>t] Add transition"), "{text}");
+    }
+
+    #[test]
+    fn transition_keys_follow_resolve() {
+        let key = |action: &str| load().into_iter().find(|b| b.action == action).and_then(|b| b.keys.first().cloned());
+        assert_eq!(key("win.transition-add").as_deref(), Some("<Primary>t"));
+        assert_eq!(key("win.transition-add-video").as_deref(), Some("<Alt>t"));
+        assert_eq!(key("win.transition-add-audio").as_deref(), Some("<Shift>t"));
     }
 
     #[test]
@@ -166,7 +201,7 @@ mod tests {
         for bind in load() {
             for key in bind.keys.iter().chain(bind.alt.iter()) {
                 let norm = key.to_lowercase();
-                assert!(!RESERVED.contains(&norm.as_str()), "{key} is reserved but bound to {}", bind.action);
+                assert!(!RESERVED.iter().any(|r| r.to_lowercase() == norm), "{key} is reserved but bound to {}", bind.action);
                 if let Some(other) = seen.insert(norm, bind.action.clone()) {
                     assert_eq!(other, bind.action, "{key} is bound to both {other} and {}", bind.action);
                 }
