@@ -10,4 +10,7 @@ Quick forms: `scripts/e2e.sh 02_transitions` (by name), `scripts/e2e.sh /any/pat
 alone, from anywhere: `python3 tests/e2e/tempo_e2e.py run --report /tmp/out <scenario ...>`
 (it uses the binary and fixture the script left; `TEMPO_E2E_APP` and `TEMPO_E2E_PROJECT`
 pick others). The app is started
-with `TEMPO_NO_AUDIO=1` and `TEMPO_NO_PROXY=1`.
+with `TEMPO_NO_AUDIO=1` and `TEMPO_NO_PROXY=1`, except in scenarios with `AUDIO = True`
+(`18_sound`): there it plays into a null sink in the session's private PipeWire and the
+harness records it (`e2e_audio.py`, `s.record_audio()`; see "Sound" in the doc). A scenario
+can also set `DATA_FILES` to put files (a plugin, say) in the session's `XDG_DATA_HOME`.
