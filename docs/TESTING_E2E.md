@@ -113,6 +113,11 @@ anything missing. No root, no X server, no other compositor.
 | `19_landing_thumbnail` | dragging a Media Pool clip over V1: the landing box shows the clip's thumbnail (lime pixels for the lime clip; none there before) |
 | `20_deliver_upload` | Export page with a stand-in YouTube uploader plugin (`DATA_FILES`): "Upload directly to YouTube" shows Title, Description, Upload Thumbnail + path row, Privacy, Category; a job with its own title/description renders to the session dir (file exists, ffprobe 12 s); the upload stops at the "needs a token" dialog (token comes from `secret-tool`, which finds nothing on the private bus), the plugin script never runs and the app has no TCP connection. Notes record that Chapters has no colour filter yet |
 | `21_paste_transition_other_timeline` | Duplicate Timeline from the Media Pool menu; Ctrl+C a transition on timeline 1, switch with the dropdown above the viewer, select the 8 s edit, Ctrl+V: same kind and length, centred there |
+| `22_dissolve_pixels` | Cross, Additive, Non-Additive and Blur Dissolve on the 8 s cut (lime to blue), viewer at the middle: Cross (0,127,127), Additive and Non-Additive (0,254,254), Blur's picture edge steps less than at the start of the mix |
+| `23_dissolve_names` | the Effects panel's Dissolve group and the Inspector's Transition Type list are exactly Additive, Blur, Cross, Dip To Color, Non-Additive Dissolve, in that order |
+| `24_new_timeline_marks` | Create New Timeline: Use Project Settings left of Cancel/Create in the bottom bar; with In/Out on a source clip, Empty Timeline off and Use Selected Mark In/Out on, the new clip's length is the marked span |
+| `25_curve_guides` | the curve graph's dashed guides at Start Ratio 20 % and End Ratio 80 % are outline-coloured, none at 50 %; a dragged key stays selected and Delete removes it |
+| `26_updown_source` | with a source clip shown in the viewer (scrubbed to about 5.4 s), Down/Up move the timeline playhead 4 s to 8 s to 12 s and back, from its own position |
 
 ## Sound
 
