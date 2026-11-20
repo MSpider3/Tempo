@@ -9,8 +9,12 @@ All notable changes to Tempo are recorded here. The format follows
 ### Added
 
 - **Transitions work as in DaVinci Resolve.** A transition is its own object on the timeline.
-  - The Effects panel lists Video Transitions › Dissolve: **Cross Dissolve** and **Dip To
-    Color Dissolve**. Drag one onto a cut, or onto the start or end of a clip. A box shows
+  - The Effects panel lists Video Transitions › Dissolve, with Resolve's names: **Additive
+    Dissolve**, **Blur Dissolve**, **Cross Dissolve**, **Dip To Color Dissolve** (black or
+    white for a fade to black or white) and **Non-Additive Dissolve**. The Inspector's
+    Transition Type lists the same five. Additive mixes as screen and Non-Additive keeps the
+    brighter pixel; Blur blurs both clips up to the middle of the mix. Playback and export
+    match. Drag one onto a cut, or onto the start or end of a clip. A box shows
     where it will land. Audio tracks refuse video transitions.
   - On a cut it is centred when both clips have footage to spare; otherwise it starts or
     ends on the cut. On the first clip's start it fades from black, and on the last clip's
@@ -29,7 +33,8 @@ All notable changes to Tempo are recorded here. The format follows
   - Playback and export both follow the ratios, ease and curve. Sound cross fades and a
     clip's own fades stay straight.
   - Click a clip edge to select the edit point (green bracket). `Up` and `Down` move the
-    selected edit point with the playhead.
+    selected edit point with the playhead. They count from the timeline playhead, also while
+    a source clip is shown in the viewer.
   - `Ctrl+C` on a selected transition copies just the transition, and `Ctrl+V` puts it on the
     selected edit point. So `Up`, `Ctrl+V`, `Up`, `Ctrl+V`… gives every cut the same transition.
   - `Backspace` or `Delete` on a selected transition removes only the transition.
@@ -61,7 +66,8 @@ All notable changes to Tempo are recorded here. The format follows
 - Create New Timeline has **Empty Timeline**. Turn it off to start the timeline with the clip
   selected in the Media Pool.
 - Create New Timeline has **Start Timecode** (01:00:00:00 by default), **Audio Track Type**
-  (Mono or Stereo) and **Use Project Settings**. Turn that off to give the timeline its own
+  (Mono or Stereo), **Use Selected Mark In/Out** (place only the marked part of the clip) and,
+  bottom left next to Cancel and Create as in Resolve, **Use Project Settings**. Turn that off to give the timeline its own
   width, height and frame rate. Timecode, frame steps, snapping, transition limits,
   playback and export of that timeline use its own rate. The ruler, viewer, timecode label,
   marker times and EDL export count from the Start Timecode.
@@ -78,13 +84,16 @@ All notable changes to Tempo are recorded here. The format follows
 - The Inspector's transition page has a **Video** (or **Audio**) header with an on/off
   switch. Off, the transition stays on the timeline (dimmed) but plays and exports as a cut.
 - **Transition Curve graph** in the Inspector: click to add a key, drag a key to move it,
-  each drag is one undo step.
+  each drag is one undo step. The graph draws the curve as played, with dashed Start and End
+  Ratio guides, and the dragged key stays selected.
 - The transition edge tooltip shows how far the dragged edge moved (`+` is right) and then
   the new length, as in Resolve.
 - The drop box is blue with the clip's thumbnail for video and green for audio.
 - **End-to-end tests on Wayland.** `scripts/e2e.sh` runs the real app on a private headless
   mutter with real mouse and keyboard input and screenshots, and never touches your own
-  desktop. Any person or AI can add a scenario; see `docs/TESTING_E2E.md`.
+  desktop. Any person or AI can add a scenario; see `docs/TESTING_E2E.md`. Scenarios also
+  record the app's sound from a private PipeWire and check the Deliver upload fields without
+  uploading anything.
 - Project files now use schema 6.
 - **Edit animations**: trims, deletes and ripples slide clips, transitions, the playhead and
   the view into place over about 120 ms instead of jumping.

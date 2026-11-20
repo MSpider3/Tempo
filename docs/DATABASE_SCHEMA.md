@@ -391,7 +391,8 @@ CREATE TABLE transitions (
     edge            INTEGER NOT NULL,    -- 0=in 1=out
     kind            INTEGER NOT NULL,    -- 0=cut 1=cross_dissolve 2=dip_black 3=dip_white 4=fade_in
                                          -- 5=fade_out 6=plugin 7=fade_from_white 8=fade_to_white
-                                         -- 9=dip_to_color 10=crossfade (audio)
+                                         -- 9=dip_to_color 10=crossfade (audio) 11=additive_dissolve
+                                         -- 12=non_additive_dissolve 13=blur_dissolve
     duration_us     INTEGER NOT NULL,    -- whole frames
     alignment       INTEGER NOT NULL,    -- 0=centered 1=start_at_cut 2=end_at_cut
     plugin_id       TEXT,                -- NULL unless kind=6

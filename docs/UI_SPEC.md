@@ -193,7 +193,7 @@ Two parts side by side, as in Resolve: a short category list at the left (Toolbo
 **Transitions**, **Titles**, **Filters**) and, at the right, a `GtkListView` of that
 category's items in collapsible groups.
 
-- Built in — Transitions: Cross Dissolve, Dip to Colour. Titles: Text, Lower Third.
+- Built in — Transitions (Video Transitions › Dissolve): Additive Dissolve, Blur Dissolve, Cross Dissolve, Dip To Color Dissolve, Non-Additive Dissolve. Titles: Text, Lower Third.
   Filters: none.
 - Fade in and fade out are not list items. They are the fade handles on every clip (§5.6).
 - Plugins add items to these groups (`PLUGIN_SPEC.md`).
