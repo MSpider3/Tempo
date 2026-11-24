@@ -4,16 +4,34 @@ from tempo_e2e import center, expect, expect_eq
 
 
 def grid_label(s, text):
-    """Find a visible label inside the Media Pool grid/list cells (tagged with .tempo-small)."""
+    """Find a visible label inside the Media Pool grid/list cells, scrolling the grid if needed."""
+    def find():
+        return next((w for w in s.widgets(text=text, type="GtkLabel") if "tempo-small" in w["css"]), None)
+
+    hit = find()
+    if hit is not None:
+        return hit
+    views = s.widgets(css="media")
+    if views:
+        vx, vy, vw, vh = views[0]["rect"]
+        for step in (4, 4, 4, -8, -8):
+            s.scroll(vx + vw / 2, vy + vh / 2, step)
+            s.settle(quiet=0.1)
+            hit = find()
+            if hit is not None:
+                return hit
     return next(w for w in s.widgets(text=text, type="GtkLabel") if "tempo-small" in w["css"])
 
 
-def create_bin(s, name):
-    """Create a bin in the current bin via the Media Pool context menu."""
-    pool = s.widget(css="tempo-surface")
-    px, py, pw, ph = pool["rect"]
-    s.right_click(px + pw - 20, py + ph - 20)
-    s.click(*center(s.widget(text="New Bin…")["rect"]))
+def create_bin(s, name, shortcut=False):
+    """Create a bin in the current bin via context menu or Ctrl+Shift+N."""
+    if shortcut:
+        s.key("ctrl+shift+n")
+    else:
+        pool = s.widget(css="tempo-surface")
+        px, py, pw, ph = pool["rect"]
+        s.right_click(px + pw - 20, py + ph - 20)
+        s.click(*center(s.widget(text="New Bin…")["rect"]))
     s.widget(text="New Bin", type="GtkLabel")
     entry = s.widget(type="GtkEntry")
     s.fill(entry, name, enter=True)
@@ -40,10 +58,10 @@ def run(s):
     s.key("ctrl+z")
     s.wait_for(lambda: len(s.widgets(css="media-used-bar")) == 3, "used bar count to restore to 3")
 
-    # 2. Create bins ("Footage" and "Timelines"); bin sidebar auto-reveals.
+    # 2. Create bins ("Footage" via context menu, "Timelines" via Ctrl+Shift+N); bin sidebar auto-reveals.
     create_bin(s, "Footage")
     expect(bool(s.widgets(css="bin-sidebar")), "bin sidebar auto-revealed when first bin was created")
-    create_bin(s, "Timelines")
+    create_bin(s, "Timelines", shortcut=True)
 
     bins = {b["name"]: b["id"] for b in s.state()["project"]["bins"]}
     footage_id = bins["Footage"]
@@ -70,6 +88,27 @@ def run(s):
         "Timeline 1 to move into Timelines bin",
     )
     s.screenshot("1_moved_to_bins")
+
+    # 3b. Open "Timelines" bin via sidebar, press Ctrl+N to verify new timelines inherit current bin.
+    s.click(*center(timelines_row["rect"]))
+    s.wait_for(lambda: not s.widgets(text="red-6s.mp4", type="GtkLabel"), "Timelines bin opened")
+    s.key("ctrl+n")
+    s.widget(text="Create New Timeline", type="GtkLabel")
+    s.click(*center(s.widget(text="Create", type="GtkButton")["rect"]))
+    s.wait_for(
+        lambda: s.state()["project"]["timeline"]["name"] == "Timeline 2"
+        and s.state()["project"]["timeline"].get("bin_id") == timelines_id,
+        "new Ctrl+N timeline placed in active Timelines bin",
+    )
+    # Reopen Master via breadcrumb (and switch back to Timeline 1).
+    bc = s.widget(css="bin-breadcrumb")
+    master_btn = next(
+        btn
+        for btn in s.descendants(bc, "GtkButton")
+        if any(l.get("text") == "Master" for l in s.descendants(btn, "GtkLabel"))
+    )
+    s.click(*center(master_btn["rect"]))
+    s.wait_for(lambda: bool(s.widgets(text="red-6s.mp4", type="GtkLabel")), "returned to Master")
 
     # 4. Double-click "Footage" folder in grid, create nested "Selects" bin, test breadcrumb navigation.
     s.double_click(*center(grid_label(s, "Footage")["rect"]))
