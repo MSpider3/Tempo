@@ -1065,6 +1065,14 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let c = change.clone();
     autosave.connect_selected_notify(move |row| c(&|s| s.autosave_seconds = AUTOSAVE[row.selected() as usize].1));
     general.add(&autosave);
+    let show_splash = adw::SwitchRow::builder()
+        .title("Show startup splash screen")
+        .subtitle("GTA-style behind-the-scenes cards and tips while loading (press any key to skip)")
+        .active(current.show_splash)
+        .build();
+    let c = change.clone();
+    show_splash.connect_active_notify(move |row| c(&|s| s.show_splash = row.is_active()));
+    general.add(&show_splash);
 
     let playback = adw::PreferencesGroup::builder()
         .title("Playback")

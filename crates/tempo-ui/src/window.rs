@@ -58,7 +58,9 @@ pub struct MainWindow {
     /// When the last rolling backup was started, and whether a failure was already reported.
     last_backup: Cell<std::time::Instant>,
     backup_warned: Cell<bool>,
-    loading_status: gtk::Label,
+    splash: Rc<crate::splash::SplashScreen>,
+    splash_skipped: Rc<Cell<bool>>,
+    splash_finish: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl MainWindow {
@@ -208,13 +210,22 @@ impl MainWindow {
         project_view.add_bottom_bar(&page_bar);
 
         // ---- Loading -----------------------------------------------------------
-        let loading_status = label("STARTING UP", &["tempo-small", "tempo-dim"]);
-        loading_status.set_xalign(0.0);
-        let loading = loading_view(&loading_status);
+        let splash_skipped = Rc::new(Cell::new(false));
+        let splash_finish = Rc::new(std::cell::RefCell::new(None::<Rc<dyn Fn()>>));
+        let splash = crate::splash::SplashScreen::new({
+            let skipped = splash_skipped.clone();
+            let finish = splash_finish.clone();
+            move || {
+                skipped.set(true);
+                if let Some(cb) = finish.borrow_mut().take() {
+                    cb();
+                }
+            }
+        });
 
         let root = gtk::Stack::new();
         root.add_named(&gtk::Box::builder().css_classes(["loading"]).build(), Some("blank"));
-        root.add_named(&loading, Some("loading"));
+        root.add_named(&splash.root, Some("loading"));
         root.add_named(&project_view, Some("project"));
 
         let toasts = adw::ToastOverlay::new();
@@ -259,7 +270,9 @@ impl MainWindow {
             full_viewer: Cell::new(false),
             last_backup: Cell::new(std::time::Instant::now()),
             backup_warned: Cell::new(false),
-            loading_status,
+            splash,
+            splash_skipped,
+            splash_finish,
         });
 
         // Project Manager needs callbacks into the window, so it is built last.
@@ -281,6 +294,37 @@ impl MainWindow {
             }
             used
         });
+        let splash_keys = gtk::EventControllerKey::new();
+        splash_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let w = win.clone();
+        splash_keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            let modifier = matches!(
+                key,
+                Key::Shift_L
+                    | Key::Shift_R
+                    | Key::Control_L
+                    | Key::Control_R
+                    | Key::Alt_L
+                    | Key::Alt_R
+                    | Key::Super_L
+                    | Key::Super_R
+                    | Key::Meta_L
+                    | Key::Meta_R
+                    | Key::Caps_Lock
+                    | Key::Num_Lock
+            );
+            if w.root.visible_child_name().as_deref() == Some("loading") && !modifier {
+                w.splash_skipped.set(true);
+                if let Some(cb) = w.splash_finish.borrow_mut().take() {
+                    cb();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        win.window.add_controller(splash_keys);
+
         win.start();
         win
     }
@@ -420,18 +464,35 @@ impl MainWindow {
     // ---- Start-up ----------------------------------------------------------------
 
     fn start(self: &Rc<Self>) {
-        self.root.set_visible_child_name("blank");
-        // Show the loading screen only if start-up is not instant.
-        let w = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(300), move || {
-            if w.root.visible_child_name().as_deref() == Some("blank") {
-                w.root.set_visible_child_name("loading");
-            }
-        });
+        let force_splash = std::env::var_os("TEMPO_SHOW_SPLASH").is_some();
+        let automated = std::env::var_os("TEMPO_SMOKE_TEST").is_some()
+            || std::env::var_os("TEMPO_TEST_CONTROL").is_some()
+            || std::env::var_os("TEMPO_ACTIONS").is_some()
+            || std::env::var_os("TEMPO_SCREENSHOT").is_some()
+            || std::env::var_os("TEMPO_OPEN").is_some();
+        let started_at = std::time::Instant::now();
+
+        if force_splash {
+            self.splash.activate();
+            self.splash.set_progress(0.15);
+            self.splash.set_status("STARTING UP");
+            self.root.set_visible_child_name("loading");
+        } else {
+            self.root.set_visible_child_name("blank");
+            // Show the loading screen only if start-up is not instant.
+            let w = self.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                if w.root.visible_child_name().as_deref() == Some("blank") {
+                    w.splash.activate();
+                    w.root.set_visible_child_name("loading");
+                }
+            });
+        }
 
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
-            w.loading_status.set_text("STARTING MEDIA ENGINE");
+            w.splash.set_status("STARTING MEDIA ENGINE");
+            w.splash.set_progress(0.35);
             let (settings, hardware, turned_off) = gio::spawn_blocking(|| {
                 tempo_media::ensure_ffmpeg_init();
                 let mut settings = crate::settings::Settings::load();
@@ -456,14 +517,48 @@ impl MainWindow {
             }
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
+            let show_splash = force_splash || (!automated && settings.show_splash);
             *w.state.settings.borrow_mut() = settings;
             // The viewer shows the saved preview quality.
             w.state.emit(Change::Options);
             w.plugins.reload();
-            w.loading_status.set_text("OPENING PROJECTS");
-            match std::env::var_os("TEMPO_OPEN").map(PathBuf::from) {
-                Some(path) => w.open_project(path),
-                None => w.show_manager(),
+            w.splash.set_status("OPENING PROJECTS");
+            w.splash.set_progress(0.75);
+
+            let open_target = std::env::var_os("TEMPO_OPEN").map(PathBuf::from);
+            let completed = Rc::new(Cell::new(false));
+            let finish: Rc<dyn Fn()> = {
+                let w = w.clone();
+                let completed = completed.clone();
+                Rc::new(move || {
+                    if completed.replace(true) {
+                        return;
+                    }
+                    *w.splash_finish.borrow_mut() = None;
+                    w.splash.release();
+                    match open_target.as_ref() {
+                        Some(path) => w.open_project(path.clone()),
+                        None => w.show_manager(),
+                    }
+                })
+            };
+
+            if show_splash && !w.splash_skipped.get() {
+                w.splash.set_progress(1.0);
+                w.splash.set_status("READY — CLICK OR PRESS ANY KEY TO CONTINUE");
+                if w.root.visible_child_name().as_deref() != Some("loading") {
+                    w.splash.activate();
+                    w.root.set_visible_child_name("loading");
+                }
+                *w.splash_finish.borrow_mut() = Some(finish.clone());
+                let hold_ms: u64 = if force_splash { 4500 } else { 2400 };
+                let remaining_ms = hold_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
+                let finish_timer = finish;
+                glib::timeout_add_local_once(Duration::from_millis(remaining_ms.max(150)), move || {
+                    finish_timer();
+                });
+            } else {
+                finish();
             }
         });
     }
@@ -1529,48 +1624,4 @@ fn hint_over(state: &Rc<AppState>, widget: &impl IsA<gtk::Widget>, zone: crate::
     let s = state.clone();
     motion.connect_leave(move |_| s.hint(None));
     widget.add_controller(motion);
-}
-
-fn loading_view(status: &gtk::Label) -> gtk::Box {
-    let name = label("Tempo", &["tempo-title"]);
-    name.set_xalign(0.0);
-    let version = label(env!("CARGO_PKG_VERSION"), &["tempo-dim"]);
-    version.set_xalign(0.0);
-    let progress = gtk::ProgressBar::builder().width_request(280).halign(gtk::Align::Start).build();
-    progress.set_pulse_step(0.15);
-    // Animate only while the loading screen is on screen, then stop for good.
-    let pulsing = progress.clone();
-    let was_mapped = Cell::new(false);
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if pulsing.is_mapped() {
-            was_mapped.set(true);
-            pulsing.pulse();
-            glib::ControlFlow::Continue
-        } else if was_mapped.get() || pulsing.root().is_none() {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .valign(gtk::Align::Center)
-        .margin_start(96)
-        .build();
-    let app_icon = gtk::Image::builder()
-        .icon_name("dev.tempo.Tempo")
-        .pixel_size(64)
-        .halign(gtk::Align::Start)
-        .margin_bottom(12)
-        .build();
-    column.append(&app_icon);
-    column.append(&name);
-    column.append(&version);
-    column.append(&gtk::Box::builder().height_request(40).build());
-    column.append(status);
-    column.append(&progress);
-    let view = gtk::Box::builder().css_classes(["loading"]).build();
-    view.append(&column);
-    view
 }

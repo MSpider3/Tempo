@@ -13,6 +13,7 @@ pub mod plugins;
 pub mod project_manager;
 pub mod proxies;
 pub mod settings;
+pub mod splash;
 pub mod state;
 pub mod timeline;
 pub mod util;
