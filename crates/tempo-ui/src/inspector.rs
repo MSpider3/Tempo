@@ -8,8 +8,8 @@ use gtk4 as gtk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use tempo_timeline::{
-    frame_to_us, us_to_frame, Clip, ClipType, Command, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand, SetTransitionCommand,
-    TitleType, TrackKind, Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind,
+    frame_to_us, us_to_frame, Clip, ClipType, Command, CompositeCommand, EditClipCommand, EditKind, PropertyChange, RationalFps, SetClipPropertyCommand,
+    SetTransitionCommand, TitleData, TitleType, TrackKind, Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind,
 };
 use uuid::Uuid;
 
@@ -18,6 +18,11 @@ use crate::util::{label, tool_button};
 
 /// Turns a new field value and the clip as it is now into the command that applies it.
 type MakeCommand = Box<dyn Fn(f64, &Clip) -> Box<dyn Command>>;
+/// Resets one clip's section fields back to defaults.
+type ResetClipFn = Box<dyn Fn(&mut Clip)>;
+
+const DEFAULT_TITLE_BG: [u8; 4] = [0, 0, 0, 170];
+const FONT_PRESETS: [&str; 3] = ["Sans", "Serif", "Monospace"];
 
 pub struct Inspector {
     pub root: gtk::Box,
@@ -27,7 +32,7 @@ pub struct Inspector {
     scroller: gtk::ScrolledWindow,
     /// What the panel shows (a transition, or the selected clips): its scroll position
     /// is kept while this stays the same.
-    shown: Cell<Option<(Option<EditSelection>, Option<Uuid>)>>,
+    shown: RefCell<Option<(Option<EditSelection>, Vec<Uuid>)>>,
     /// Set while an edit from the Inspector itself is applied, so the fields are
     /// not rebuilt under the user's hands.
     busy: Rc<Cell<bool>>,
@@ -43,6 +48,62 @@ fn edit(name: &'static str, change: impl Fn(f64, &mut Clip) + 'static) -> MakeCo
         change(v, &mut edited);
         Box::new(EditClipCommand::new(name, edited))
     })
+}
+
+fn rgba_from_bytes([r, g, b, a]: [u8; 4]) -> gtk::gdk::RGBA {
+    gtk::gdk::RGBA::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, f32::from(a) / 255.0)
+}
+
+fn bytes_from_rgba(c: &gtk::gdk::RGBA) -> [u8; 4] {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [byte(c.red()), byte(c.green()), byte(c.blue()), byte(c.alpha())]
+}
+
+fn is_mixed_f64(clips: &[Clip], get: impl Fn(&Clip) -> f64) -> bool {
+    let Some(first) = clips.first().map(&get) else { return false };
+    clips[1..].iter().any(|c| (get(c) - first).abs() > 1e-3)
+}
+
+fn selected_clips(state: &AppState) -> Vec<Clip> {
+    let ids = state.selected_ids();
+    state
+        .with_timeline(|t| ids.iter().filter_map(|id| t.find_clip(*id).map(|(_, c)| c.clone())).collect())
+        .unwrap_or_default()
+}
+
+fn current_clips_for_edit(state: &AppState, ids: &[Uuid]) -> Vec<Clip> {
+    state
+        .with_timeline(|t| {
+            let found: Vec<(bool, Clip)> = ids.iter().filter_map(|id| t.find_clip(*id).map(|(tr, c)| (tr.locked, c.clone()))).collect();
+            let unlocked: Vec<Clip> = found.iter().filter(|(locked, _)| !*locked).map(|(_, c)| c.clone()).collect();
+            if unlocked.is_empty() {
+                found.into_iter().take(1).map(|(_, c)| c).collect()
+            } else {
+                unlocked
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn build_batch_command(label: &str, clips: &[Clip], make: impl Fn(&Clip) -> Box<dyn Command>) -> Option<Box<dyn Command>> {
+    match clips {
+        [] => None,
+        [one] => Some(make(one)),
+        many => Some(Box::new(CompositeCommand::new(label, many.iter().map(make).collect()))),
+    }
+}
+
+fn mixed_badge_label(tooltip: &str) -> gtk::Label {
+    let badge = label("Mixed", &["tempo-small", "tempo-dim"]);
+    badge.set_tooltip_text(Some(tooltip));
+    badge.set_valign(gtk::Align::Center);
+    badge
+}
+
+fn unfocus_widget(widget: &gtk::Widget) {
+    if let Some(window) = widget.root().and_downcast::<gtk::Window>() {
+        gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+    }
 }
 
 impl Inspector {
@@ -63,13 +124,15 @@ impl Inspector {
         let scroller = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
         root.append(&scroller);
 
-        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, shown: Cell::new(None), busy: Rc::new(Cell::new(false)) });
+        let inspector = Rc::new(Self { root, state: state.clone(), title, body, scroller, shown: RefCell::new(None), busy: Rc::new(Cell::new(false)) });
         let i = inspector.clone();
         state.connect(move |change| {
             if matches!(change, Change::Selection | Change::Timeline | Change::Project) {
                 // Editing keeps the panel where the user is; something else selected starts at the top.
-                let now = Some((i.state.edit_selection.get(), i.state.selected_ids().first().copied()));
-                let at = if i.shown.replace(now) == now { i.scroller.vadjustment().value() } else { 0.0 };
+                let now = Some((i.state.edit_selection.get(), i.state.selected_ids()));
+                let same = *i.shown.borrow() == now;
+                *i.shown.borrow_mut() = now;
+                let at = if same { i.scroller.vadjustment().value() } else { 0.0 };
                 // An edit from the curve graph rebuilds the panel; keep the keyboard on the new graph
                 // so the next Delete removes a key, not the transition.
                 let graph_focused = i.root.root().and_then(|r| r.focus()).is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
@@ -99,59 +162,95 @@ impl Inspector {
                 return;
             }
         }
-        let Some(clip) = self.state.selected_clip() else {
+        let clips = selected_clips(&self.state);
+        if clips.is_empty() {
             self.title.set_text("Inspector");
             let hint = label("Select a clip to see its settings", &["empty-hint"]);
             hint.set_margin_top(32);
             self.body.append(&hint);
             return;
-        };
-        let count = self.state.selected_ids().len();
-        self.title.set_text(&if count > 1 { format!("{} (+{} more)", clip.name, count - 1) } else { clip.name.clone() });
-        match clip.clip_type {
-            ClipType::Audio => self.audio_section(&clip),
-            ClipType::Title => {
-                self.title_section(&clip);
-                self.transform_section(&clip);
-                self.composite_section(&clip);
-            }
-            _ => {
-                self.transform_section(&clip);
-                self.composite_section(&clip);
-            }
         }
-        if !matches!(clip.clip_type, ClipType::Audio | ClipType::Title) {
-            self.filter_sections(&clip);
+        self.title.set_text(&if clips.len() > 1 {
+            format!("{} (+{} more)", clips[0].name, clips.len() - 1)
+        } else {
+            clips[0].name.clone()
+        });
+
+        if clips.len() == 1 {
+            let clip = &clips[0];
+            match clip.clip_type {
+                ClipType::Audio => self.audio_section(&clips),
+                ClipType::Title => {
+                    self.title_section(&clips);
+                    self.transform_section(&clips);
+                    self.composite_section(&clips);
+                }
+                _ => {
+                    self.transform_section(&clips);
+                    self.composite_section(&clips);
+                }
+            }
+            if !matches!(clip.clip_type, ClipType::Audio | ClipType::Title) {
+                self.filter_sections(clip);
+            }
+            self.fade_section(&clips);
+            return;
         }
-        self.fade_section(&clip);
+
+        let title_clips: Vec<Clip> = clips.iter().filter(|c| c.clip_type == ClipType::Title && c.title_data.is_some()).cloned().collect();
+        let visual_clips: Vec<Clip> = clips.iter().filter(|c| c.clip_type != ClipType::Audio).cloned().collect();
+        let audio_clips: Vec<Clip> = clips.iter().filter(|c| c.clip_type == ClipType::Audio).cloned().collect();
+        let picture_clips: Vec<Clip> = clips.iter().filter(|c| !matches!(c.clip_type, ClipType::Audio | ClipType::Title)).cloned().collect();
+
+        if !title_clips.is_empty() && title_clips.len() == clips.len() {
+            self.title_section(&title_clips);
+        }
+        if !visual_clips.is_empty() {
+            self.transform_section(&visual_clips);
+            self.composite_section(&visual_clips);
+        }
+        if !audio_clips.is_empty() {
+            self.audio_section(&audio_clips);
+        }
+        if picture_clips.len() == 1 {
+            self.filter_sections(&picture_clips[0]);
+        }
+        self.fade_section(&clips);
     }
 
-    /// Run a command for the clip without the Inspector rebuilding itself.
-    fn apply(state: &Rc<AppState>, busy: &Cell<bool>, id: uuid::Uuid, make: impl FnOnce(&Clip) -> Box<dyn Command>) {
-        let Some(current) = state.selected_clip().filter(|c| c.id == id) else { return };
+    /// Run a command for `ids` (single command or atomic `CompositeCommand`) without the
+    /// Inspector rebuilding itself.
+    fn apply_clips(state: &Rc<AppState>, busy: &Cell<bool>, ids: &[Uuid], label: &str, make: impl Fn(&Clip) -> Box<dyn Command>) -> bool {
+        let current = current_clips_for_edit(state, ids);
+        let Some(cmd) = build_batch_command(label, &current, make) else { return false };
         busy.set(true);
-        state.execute(make(&current));
+        let ok = state.execute(cmd);
         busy.set(false);
+        ok
     }
 
     /// Section header with a reset button; returns the grid the rows go into.
-    fn section(&self, name: &str, clip: &Clip, reset: Vec<(f64, MakeCommand)>) -> gtk::Grid {
+    fn section(&self, name: &str, clips: &[Clip], reset: Option<(&'static str, ResetClipFn)>) -> gtk::Grid {
         let header = gtk::Box::builder().css_classes(["inspector-section"]).build();
         let title = label(name, &["tempo-heading"]);
         title.set_hexpand(true);
         title.set_xalign(0.0);
         header.append(&title);
-        if !reset.is_empty() {
+        if let Some((cmd_name, reset_fn)) = reset {
             let reset_btn = tool_button("edit-undo-symbolic", &format!("Reset {name}"));
             let state = self.state.clone();
-            let id = clip.id;
-            let reset = RefCell::new(Some(reset));
+            let ids: Vec<Uuid> = clips.iter().map(|c| c.id).collect();
+            let reset_fn = RefCell::new(Some(reset_fn));
             reset_btn.connect_clicked(move |_| {
-                // The rebuild after the first command replaces this button, so take the list once.
-                for (value, make) in reset.borrow_mut().take().into_iter().flatten() {
-                    if let Some(current) = state.selected_clip().filter(|c| c.id == id) {
-                        state.execute(make(value, &current));
-                    }
+                // The rebuild after the command replaces this button, so take the callback once.
+                let Some(reset_fn) = reset_fn.borrow_mut().take() else { return };
+                let current = current_clips_for_edit(&state, &ids);
+                if let Some(cmd) = build_batch_command(cmd_name, &current, |clip| {
+                    let mut edited = clip.clone();
+                    reset_fn(&mut edited);
+                    Box::new(EditClipCommand::new(cmd_name, edited))
+                }) {
+                    state.execute(cmd);
                 }
             });
             header.append(&reset_btn);
@@ -171,72 +270,136 @@ impl Inspector {
         name_label
     }
 
-    /// One number row. Typing or stepping the field is one undo step. Dragging
-    /// left or right on the row's name changes the value live, and the whole
-    /// drag is one undo step.
-    fn number_row(&self, grid: &gtk::Grid, row: i32, name: &str, value: f64, (min, max, step, digits): (f64, f64, f64, u32), clip: &Clip, make: MakeCommand) {
+    /// One number row. Typing or stepping the field is one undo step (across all `clips`).
+    /// Dragging left or right on the row's name changes the value live, and the whole drag
+    /// is one undo step.
+    #[allow(clippy::too_many_arguments)]
+    fn number_row(
+        &self,
+        grid: &gtk::Grid,
+        row: i32,
+        name: &str,
+        clips: &[Clip],
+        get: impl Fn(&Clip) -> f64,
+        (min, max, step, digits): (f64, f64, f64, u32),
+        make: MakeCommand,
+    ) {
         let name_label = Self::row_label(grid, row, name);
         name_label.set_cursor_from_name(Some("ew-resize"));
         name_label.set_tooltip_text(Some("Drag left or right to change"));
+        let first = clips.first().map(&get).unwrap_or(0.0);
+        let mixed = is_mixed_f64(clips, &get);
+        let ids: Rc<Vec<Uuid>> = Rc::new(clips.iter().map(|c| c.id).collect());
         let make = Rc::new(make);
         let dragging = Rc::new(Cell::new(false));
         let spin = gtk::SpinButton::builder()
-            .adjustment(&gtk::Adjustment::new(value, min, max, step, step * 10.0, 0.0))
+            .adjustment(&gtk::Adjustment::new(first, min, max, step, step * 10.0, 0.0))
             .digits(digits)
             .numeric(true)
             .hexpand(true)
             .build();
         spin.update_property(&[gtk::accessible::Property::Label(name)]);
+        let mixed_badge = mixed.then(|| mixed_badge_label("Selected clips have different values"));
+        if let Some(badge) = &mixed_badge {
+            let box_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            box_row.append(&spin);
+            box_row.append(badge);
+            grid.attach(&box_row, 1, row, 1, 1);
+        } else {
+            grid.attach(&spin, 1, row, 1, 1);
+        }
+
         let state = self.state.clone();
         let busy = self.busy.clone();
-        let id = clip.id;
-        let (m, d) = (make.clone(), dragging.clone());
+        let (m, d, i_ids, badge_vc) = (make.clone(), dragging.clone(), ids.clone(), mixed_badge.clone());
+        let name_str = name.to_string();
         spin.connect_value_changed(move |s| {
             // During a drag the value is previewed below, not recorded step by step.
-            if !d.get() {
-                Self::apply(&state, &busy, id, |current| m(s.value(), current));
+            if !d.get() && Self::apply_clips(&state, &busy, &i_ids, &name_str, |current| m(s.value(), current)) {
+                if let Some(b) = &badge_vc {
+                    b.set_visible(false);
+                }
             }
         });
-        grid.attach(&spin, 1, row, 1, 1);
+        // If values were mixed and the user confirms the shown value with Enter, apply it to all clips.
+        if let Some(badge_act) = &mixed_badge {
+            let (state, busy, i_ids, m, badge_act, name_act) = (
+                self.state.clone(),
+                self.busy.clone(),
+                ids.clone(),
+                make.clone(),
+                badge_act.clone(),
+                name.to_string(),
+            );
+            spin.connect_activate(move |s| {
+                if badge_act.is_visible() && Self::apply_clips(&state, &busy, &i_ids, &name_act, |current| m(s.value(), current)) {
+                    badge_act.set_visible(false);
+                }
+            });
+        }
+
         // Enter or Escape finishes typing and hands the keyboard back to the
         // editor, so Space plays and Delete deletes again without a click.
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_released(|controller, key, _, _| {
             if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::Escape) {
-                if let Some(window) = controller.widget().and_then(|w| w.root()).and_downcast::<gtk::Window>() {
-                    gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+                if let Some(widget) = controller.widget() {
+                    unfocus_widget(&widget);
                 }
             }
         });
         spin.add_controller(keys);
 
         let drag = gtk::GestureDrag::new();
-        let start: Rc<RefCell<Option<(f64, Clip)>>> = Rc::new(RefCell::new(None));
-        let (state, busy, sp, st, dr) = (self.state.clone(), self.busy.clone(), spin.clone(), start.clone(), dragging.clone());
+        let start: Rc<RefCell<Option<(f64, Vec<Clip>)>>> = Rc::new(RefCell::new(None));
+        let (state, busy, sp, st, dr, d_ids) = (self.state.clone(), self.busy.clone(), spin.clone(), start.clone(), dragging.clone(), ids.clone());
         drag.connect_drag_begin(move |_, _, _| {
-            if let Some(original) = state.selected_clip().filter(|c| c.id == id) {
-                *st.borrow_mut() = Some((sp.value(), original));
+            let originals = current_clips_for_edit(&state, &d_ids);
+            if !originals.is_empty() {
+                *st.borrow_mut() = Some((sp.value(), originals));
                 dr.set(true);
                 busy.set(true);
             }
         });
-        let (state, sp, st, m) = (self.state.clone(), spin.clone(), start.clone(), make.clone());
+        let (state, sp, st, m, badge_du, name_du) = (self.state.clone(), spin.clone(), start.clone(), make.clone(), mixed_badge.clone(), name.to_string());
         drag.connect_drag_update(move |_, dx, _| {
-            let Some((from, _)) = st.borrow().as_ref().map(|(v, c)| (*v, c.id)) else { return };
+            let borrow = st.borrow();
+            let Some((from, originals)) = borrow.as_ref() else { return };
             // Four pixels per step: fine enough to aim, quick enough to travel.
             let value = (from + (dx / 4.0).round() * step).clamp(min, max);
             if (value - sp.value()).abs() < f64::EPSILON {
                 return;
             }
             sp.set_value(value);
-            if let Some(current) = state.selected_clip().filter(|c| c.id == id) {
-                state.apply_unlogged(m(value, &current));
+            if let Some(cmd) = build_batch_command(&name_du, originals, |orig| m(value, orig)) {
+                state.apply_unlogged(cmd);
+            }
+            if let Some(b) = &badge_du {
+                b.set_visible(false);
             }
         });
-        let (state, busy, name) = (self.state.clone(), self.busy.clone(), name.to_string());
+        let (state, busy, name, m_end) = (self.state.clone(), self.busy.clone(), name.to_string(), make);
         drag.connect_drag_end(move |_, _, _| {
-            if let Some((_, original)) = start.borrow_mut().take() {
-                state.commit_preview(&name, original);
+            if let Some((_, originals)) = start.borrow_mut().take() {
+                let final_val = spin.value();
+                let changed = state
+                    .with_timeline(|t| originals.iter().any(|orig| t.find_clip(orig.id).is_some_and(|(_, now)| now != orig)))
+                    .unwrap_or(false);
+                if changed {
+                    {
+                        let mut project = state.project.borrow_mut();
+                        if let Some(p) = project.as_mut() {
+                            for orig in &originals {
+                                if let Some(slot) = p.timeline.find_clip_mut(orig.id) {
+                                    *slot = orig.clone();
+                                }
+                            }
+                        }
+                    }
+                    if let Some(cmd) = build_batch_command(&name, &originals, |orig| m_end(final_val, orig)) {
+                        state.execute(cmd);
+                    }
+                }
             }
             dragging.set(false);
             busy.set(false);
@@ -244,54 +407,74 @@ impl Inspector {
         name_label.add_controller(drag);
     }
 
-    fn transform_section(&self, clip: &Clip) {
-        let p = &clip.properties;
+    fn transform_section(&self, clips: &[Clip]) {
         let zoom = || property(|v, _| PropertyChange::Scale { x: v as f32, y: v as f32 });
         let pos_x = || property(|v, c| PropertyChange::Position { x: v as f32, y: c.properties.position_y });
         let pos_y = || property(|v, c| PropertyChange::Position { x: c.properties.position_x, y: v as f32 });
         let rotation = || property(|v, _| PropertyChange::Rotation(v as f32));
-        let grid = self.section("Transform", clip, vec![(1.0, zoom()), (0.0, pos_x()), (0.0, pos_y()), (0.0, rotation())]);
-        self.number_row(&grid, 0, "Zoom", p.scale_x as f64, (0.1, 10.0, 0.05, 2), clip, zoom());
-        self.number_row(&grid, 1, "Position X", p.position_x as f64, (-8000.0, 8000.0, 10.0, 0), clip, pos_x());
-        self.number_row(&grid, 2, "Position Y", p.position_y as f64, (-8000.0, 8000.0, 10.0, 0), clip, pos_y());
-        self.number_row(&grid, 3, "Rotation", p.rotation as f64, (-360.0, 360.0, 1.0, 1), clip, rotation());
+        let reset: ResetClipFn = Box::new(|c| {
+            c.properties.scale_x = 1.0;
+            c.properties.scale_y = 1.0;
+            c.properties.position_x = 0.0;
+            c.properties.position_y = 0.0;
+            c.properties.rotation = 0.0;
+        });
+        let grid = self.section("Transform", clips, Some(("Reset Transform", reset)));
+        self.number_row(&grid, 0, "Zoom", clips, |c| c.properties.scale_x as f64, (0.1, 10.0, 0.05, 2), zoom());
+        self.number_row(&grid, 1, "Position X", clips, |c| c.properties.position_x as f64, (-8000.0, 8000.0, 10.0, 0), pos_x());
+        self.number_row(&grid, 2, "Position Y", clips, |c| c.properties.position_y as f64, (-8000.0, 8000.0, 10.0, 0), pos_y());
+        self.number_row(&grid, 3, "Rotation", clips, |c| c.properties.rotation as f64, (-360.0, 360.0, 1.0, 1), rotation());
     }
 
-    fn composite_section(&self, clip: &Clip) {
+    fn composite_section(&self, clips: &[Clip]) {
         let opacity = || property(|v, _| PropertyChange::Opacity(v as f32 / 100.0));
-        let grid = self.section("Composite", clip, vec![(100.0, opacity())]);
-        self.number_row(&grid, 0, "Opacity", clip.properties.opacity as f64 * 100.0, (0.0, 100.0, 5.0, 0), clip, opacity());
+        let reset: ResetClipFn = Box::new(|c| c.properties.opacity = 1.0);
+        let grid = self.section("Composite", clips, Some(("Reset Composite", reset)));
+        self.number_row(&grid, 0, "Opacity", clips, |c| c.properties.opacity as f64 * 100.0, (0.0, 100.0, 5.0, 0), opacity());
     }
 
-    fn audio_section(&self, clip: &Clip) {
-        let p = &clip.properties;
+    fn audio_section(&self, clips: &[Clip]) {
         let volume = || property(|v, _| PropertyChange::Volume(v as f32 / 100.0));
         let pan = || property(|v, _| PropertyChange::Pan(v as f32 / 100.0));
-        let grid = self.section("Audio", clip, vec![(100.0, volume()), (0.0, pan())]);
-        self.number_row(&grid, 0, "Volume %", p.volume as f64 * 100.0, (0.0, 200.0, 5.0, 0), clip, volume());
-        self.number_row(&grid, 1, "Pan", p.pan as f64 * 100.0, (-100.0, 100.0, 10.0, 0), clip, pan());
+        let reset: ResetClipFn = Box::new(|c| {
+            c.properties.volume = 1.0;
+            c.properties.pan = 0.0;
+        });
+        let grid = self.section("Audio", clips, Some(("Reset Audio", reset)));
+        self.number_row(&grid, 0, "Volume %", clips, |c| c.properties.volume as f64 * 100.0, (0.0, 200.0, 5.0, 0), volume());
+        self.number_row(&grid, 1, "Pan", clips, |c| c.properties.pan as f64 * 100.0, (-100.0, 100.0, 10.0, 0), pan());
     }
 
     /// One section per filter on the clip: its settings and a button to take it off.
     fn filter_sections(&self, clip: &Clip) {
+        let single = [clip.clone()];
         for (index, effect) in clip.properties.effects.iter().enumerate() {
-            let reset = effect
-                .params
-                .iter()
-                .enumerate()
-                .map(|(p, param)| (param.default as f64, Self::filter_param(index, p)))
-                .collect();
-            let grid = self.section(&effect.name, clip, reset);
+            let reset: ResetClipFn = Box::new(move |c| {
+                if let Some(eff) = c.properties.effects.get_mut(index) {
+                    for p in &mut eff.params {
+                        p.value = p.default;
+                    }
+                }
+            });
+            let grid = self.section(&effect.name, &single, Some(("Reset Filter", reset)));
             for (p, param) in effect.params.iter().enumerate() {
                 let range = (param.min as f64, param.max as f64, ((param.max - param.min) as f64 / 100.0).max(0.01), 2);
-                self.number_row(&grid, p as i32, &param.name, param.value as f64, range, clip, Self::filter_param(index, p));
+                self.number_row(
+                    &grid,
+                    p as i32,
+                    &param.name,
+                    &single,
+                    move |c| c.properties.effects.get(index).and_then(|e| e.params.get(p)).map_or(0.0, |pm| pm.value as f64),
+                    range,
+                    Self::filter_param(index, p),
+                );
             }
             let remove = gtk::Button::builder().label("Remove Filter").halign(gtk::Align::End).build();
             let state = self.state.clone();
             let id = clip.id;
             let effect_id = effect.id.clone();
             remove.connect_clicked(move |_| {
-                let Some(mut edited) = state.selected_clip().filter(|c| c.id == id) else { return };
+                let Some(mut edited) = state.with_timeline(|t| t.find_clip(id).map(|(_, c)| c.clone())).flatten() else { return };
                 edited.properties.effects.retain(|e| e.id != effect_id);
                 state.execute(Box::new(EditClipCommand::new("Remove Filter", edited)));
             });
@@ -307,15 +490,18 @@ impl Inspector {
         })
     }
 
-    /// Fade lengths in seconds, at the start and end of the clip.
-    fn fade_section(&self, clip: &Clip) {
-        let p = &clip.properties;
+    /// Fade lengths in seconds, at the start and end of the clip(s).
+    fn fade_section(&self, clips: &[Clip]) {
         let fade_in = || edit("Fade In", |v, c| c.properties.fade_in_us = ((v * 1e6) as i64).min(c.duration_us() / 2));
         let fade_out = || edit("Fade Out", |v, c| c.properties.fade_out_us = ((v * 1e6) as i64).min(c.duration_us() / 2));
-        let grid = self.section("Fades", clip, vec![(0.0, fade_in()), (0.0, fade_out())]);
-        let max = clip.duration_us() as f64 / 2e6;
-        self.number_row(&grid, 0, "Fade In s", p.fade_in_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_in());
-        self.number_row(&grid, 1, "Fade Out s", p.fade_out_us as f64 / 1e6, (0.0, max, 0.1, 1), clip, fade_out());
+        let reset: ResetClipFn = Box::new(|c| {
+            c.properties.fade_in_us = 0;
+            c.properties.fade_out_us = 0;
+        });
+        let grid = self.section("Fades", clips, Some(("Reset Fades", reset)));
+        let max = clips.iter().map(|c| c.duration_us()).max().unwrap_or(0).max(0) as f64 / 2e6;
+        self.number_row(&grid, 0, "Fade In s", clips, |c| c.properties.fade_in_us as f64 / 1e6, (0.0, max, 0.1, 1), fade_in());
+        self.number_row(&grid, 1, "Fade Out s", clips, |c| c.properties.fade_out_us as f64 / 1e6, (0.0, max, 0.1, 1), fade_out());
     }
 
     /// Resolve's transition panel for the selected transition. Returns false when the
@@ -557,51 +743,40 @@ impl Inspector {
         grid.attach(&cell, 1, row, 1, 1);
     }
 
-    fn title_section(&self, clip: &Clip) {
-        let Some(title) = clip.title_data.clone() else { return };
-        let grid = self.section("Title", clip, Vec::new());
+    fn title_section(&self, clips: &[Clip]) {
+        let titles: Vec<&TitleData> = clips.iter().filter_map(|c| c.title_data.as_ref()).collect();
+        let Some(&first) = titles.first() else { return };
+        let ids: Rc<Vec<Uuid>> = Rc::new(clips.iter().map(|c| c.id).collect());
+        let text_mixed = titles.len() > 1 && titles[1..].iter().any(|t| t.text != first.text);
+        let place_mixed = titles.len() > 1 && titles[1..].iter().any(|t| t.title_type != first.title_type);
+        let font_mixed = titles.len() > 1 && titles[1..].iter().any(|t| t.font_family != first.font_family);
+        let color_mixed = titles.len() > 1 && titles[1..].iter().any(|t| t.color != first.color);
+        let bg_mixed = titles.len() > 1 && titles[1..].iter().any(|t| t.background_color != first.background_color);
+
+        let grid = self.section("Title", clips, None);
 
         // Text: applied when Enter is pressed or the field loses focus.
         Self::row_label(&grid, 0, "Text");
-        let entry = gtk::Entry::builder().text(&title.text).hexpand(true).build();
-        entry.update_property(&[gtk::accessible::Property::Label("Title text")]);
-        let commit = {
-            let state = self.state.clone();
-            let busy = self.busy.clone();
-            let id = clip.id;
-            move |e: &gtk::Entry| {
-                let text = e.text().to_string();
-                Self::apply(&state, &busy, id, |current| {
-                    let mut edited = current.clone();
-                    if let Some(t) = edited.title_data.as_mut() {
-                        t.text = text.clone();
-                    }
+        let text_entry = gtk::Entry::builder().hexpand(true).build();
+        text_entry.update_property(&[gtk::accessible::Property::Label("Title text")]);
+        {
+            let (state, busy, ids) = (self.state.clone(), self.busy.clone(), ids.clone());
+            bind_title_entry(&text_entry, first.text.clone(), text_mixed, move |text| {
+                apply_title(&state, &busy, &ids, "Title Text", |edited, t| {
+                    t.text = text.clone();
                     edited.name = text.chars().take(40).collect();
-                    Box::new(EditClipCommand::new("Title Text", edited))
-                });
-            }
-        };
-        entry.connect_activate(commit.clone());
-        let focus = gtk::EventControllerFocus::new();
-        let e = entry.clone();
-        let last = RefCell::new(title.text.clone());
-        focus.connect_leave(move |_| {
-            // Only when the text really changed, so leaving the field is not an undo step.
-            if *last.borrow() != e.text().as_str() {
-                *last.borrow_mut() = e.text().to_string();
-                commit(&e);
-            }
-        });
-        entry.add_controller(focus);
-        grid.attach(&entry, 1, 0, 1, 1);
+                })
+            });
+        }
+        grid.attach(&text_entry, 1, 0, 1, 1);
 
         self.number_row(
             &grid,
             1,
             "Size",
-            title.font_size as f64,
+            clips,
+            |c| c.title_data.as_ref().map_or(72.0, |t| t.font_size as f64),
             (8.0, 400.0, 4.0, 0),
-            clip,
             edit("Title Size", |v, c| {
                 if let Some(t) = c.title_data.as_mut() {
                     t.font_size = v as f32;
@@ -611,22 +786,264 @@ impl Inspector {
 
         Self::row_label(&grid, 2, "Place");
         let place = gtk::DropDown::from_strings(&["Centre", "Lower third"]);
-        place.set_selected(if title.title_type == TitleType::LowerThird { 1 } else { 0 });
-        let state = self.state.clone();
-        let busy = self.busy.clone();
-        let id = clip.id;
-        place.connect_selected_notify(move |d| {
-            let kind = if d.selected() == 1 { TitleType::LowerThird } else { TitleType::CenterTitle };
-            Self::apply(&state, &busy, id, |current| {
-                let mut edited = current.clone();
-                if let Some(t) = edited.title_data.as_mut() {
-                    t.title_type = kind;
+        place.set_selected(if first.title_type == TitleType::LowerThird { 1 } else { 0 });
+        let place_badge = place_mixed.then(|| mixed_badge_label("Selected titles have different placement"));
+        if let Some(badge) = &place_badge {
+            let box_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            place.set_hexpand(true);
+            box_row.append(&place);
+            box_row.append(badge);
+            grid.attach(&box_row, 1, 2, 1, 1);
+        } else {
+            grid.attach(&place, 1, 2, 1, 1);
+        }
+        {
+            let (state, busy, ids, badge) = (self.state.clone(), self.busy.clone(), ids.clone(), place_badge);
+            place.connect_selected_notify(move |d| {
+                let kind = if d.selected() == 1 { TitleType::LowerThird } else { TitleType::CenterTitle };
+                if apply_title(&state, &busy, &ids, "Title Place", |_, t| t.title_type = kind) {
+                    if let Some(b) = &badge {
+                        b.set_visible(false);
+                    }
                 }
-                Box::new(EditClipCommand::new("Title Place", edited))
             });
-        });
-        grid.attach(&place, 1, 2, 1, 1);
+        }
+
+        Self::row_label(&grid, 3, "Font");
+        let font_entry = gtk::Entry::builder()
+            .hexpand(true)
+            .tooltip_text("Font family (e.g. Sans, Serif, Monospace)")
+            .build();
+        font_entry.update_property(&[gtk::accessible::Property::Label("Title font family")]);
+        let trigger_font = {
+            let (state, busy, ids) = (self.state.clone(), self.busy.clone(), ids.clone());
+            bind_title_entry(&font_entry, first.font_family.clone(), font_mixed, move |raw| {
+                let trimmed = raw.trim();
+                let family = if trimmed.is_empty() { "Sans".to_string() } else { trimmed.to_string() };
+                apply_title(&state, &busy, &ids, "Title Font", |_, t| t.font_family = family.clone())
+            })
+        };
+        let preset_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(4)
+            .margin_end(4)
+            .build();
+        let preset_popover = gtk::Popover::builder().child(&preset_box).build();
+        for preset in FONT_PRESETS {
+            let btn = gtk::Button::builder().label(preset).css_classes(["tool", "text"]).build();
+            let (pop, entry_w, trigger) = (preset_popover.downgrade(), font_entry.downgrade(), trigger_font.clone());
+            btn.connect_clicked(move |_| {
+                if let Some(p) = pop.upgrade() {
+                    p.popdown();
+                }
+                if let Some(e) = entry_w.upgrade() {
+                    e.set_text(preset);
+                    trigger(&e);
+                }
+            });
+            preset_box.append(&btn);
+        }
+        let preset_btn = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Font presets")
+            .popover(&preset_popover)
+            .css_classes(["tool"])
+            .build();
+        let font_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        font_row.append(&font_entry);
+        font_row.append(&preset_btn);
+        grid.attach(&font_row, 1, 3, 1, 1);
+
+        Self::row_label(&grid, 4, "Color");
+        let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+        color_btn.set_rgba(&rgba_from_bytes(first.color));
+        color_btn.update_property(&[gtk::accessible::Property::Label("Title color")]);
+        let color_badge = color_mixed.then(|| mixed_badge_label("Selected titles have different colors"));
+        if let Some(badge) = &color_badge {
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row_box.append(&color_btn);
+            row_box.append(badge);
+            grid.attach(&row_box, 1, 4, 1, 1);
+        } else {
+            grid.attach(&color_btn, 1, 4, 1, 1);
+        }
+        {
+            let (state, busy, ids) = (self.state.clone(), self.busy.clone(), ids.clone());
+            let last_color = Cell::new(first.color);
+            let is_mixed = Cell::new(color_mixed);
+            color_btn.connect_rgba_notify(move |b| {
+                let next = bytes_from_rgba(&b.rgba());
+                if !is_mixed.get() && last_color.get() == next {
+                    return;
+                }
+                if apply_title(&state, &busy, &ids, "Title Color", |_, t| t.color = next) {
+                    last_color.set(next);
+                    is_mixed.set(false);
+                    if let Some(badge) = &color_badge {
+                        badge.set_visible(false);
+                    }
+                }
+            });
+        }
+
+        Self::row_label(&grid, 5, "Background");
+        let bg_toggle = gtk::CheckButton::builder()
+            .active(first.background_color.is_some())
+            .tooltip_text("Show background box (uncheck for transparent)")
+            .build();
+        bg_toggle.update_property(&[gtk::accessible::Property::Label("Title background box")]);
+        let bg_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+        bg_btn.set_rgba(&rgba_from_bytes(first.background_color.unwrap_or(DEFAULT_TITLE_BG)));
+        bg_btn.set_sensitive(first.background_color.is_some());
+        bg_btn.update_property(&[gtk::accessible::Property::Label("Title background color")]);
+        let bg_badge = bg_mixed.then(|| mixed_badge_label("Selected titles have different backgrounds"));
+        let bg_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bg_row.append(&bg_toggle);
+        bg_row.append(&bg_btn);
+        if let Some(badge) = &bg_badge {
+            bg_row.append(badge);
+        }
+        grid.attach(&bg_row, 1, 5, 1, 1);
+
+        let last_bg: Rc<Cell<Option<[u8; 4]>>> = Rc::new(Cell::new(first.background_color));
+        let is_mixed_bg: Rc<Cell<bool>> = Rc::new(Cell::new(bg_mixed));
+        {
+            let (state, busy, ids, bg_btn_t, last_bg_t, mixed_t, badge_t) = (
+                self.state.clone(),
+                self.busy.clone(),
+                ids.clone(),
+                bg_btn.clone(),
+                last_bg.clone(),
+                is_mixed_bg.clone(),
+                bg_badge.clone(),
+            );
+            bg_toggle.connect_toggled(move |chk| {
+                let on = chk.is_active();
+                bg_btn_t.set_sensitive(on);
+                let next = on.then(|| bytes_from_rgba(&bg_btn_t.rgba()));
+                if !mixed_t.get() && last_bg_t.get() == next {
+                    return;
+                }
+                if apply_title(&state, &busy, &ids, "Title Background", |_, t| t.background_color = next) {
+                    last_bg_t.set(next);
+                    mixed_t.set(false);
+                    if let Some(badge) = &badge_t {
+                        badge.set_visible(false);
+                    }
+                }
+            });
+        }
+        {
+            let (state, busy, ids, bg_toggle_b, last_bg_b, mixed_b, badge_b) = (
+                self.state.clone(),
+                self.busy.clone(),
+                ids,
+                bg_toggle,
+                last_bg,
+                is_mixed_bg,
+                bg_badge,
+            );
+            bg_btn.connect_rgba_notify(move |b| {
+                if !bg_toggle_b.is_active() {
+                    return;
+                }
+                let next = Some(bytes_from_rgba(&b.rgba()));
+                if !mixed_b.get() && last_bg_b.get() == next {
+                    return;
+                }
+                if apply_title(&state, &busy, &ids, "Title Background", |_, t| t.background_color = next) {
+                    last_bg_b.set(next);
+                    mixed_b.set(false);
+                    if let Some(badge) = &badge_b {
+                        badge.set_visible(false);
+                    }
+                }
+            });
+        }
     }
+}
+
+fn apply_title(state: &Rc<AppState>, busy: &Cell<bool>, ids: &[Uuid], label: &'static str, change: impl Fn(&mut Clip, &mut TitleData)) -> bool {
+    Inspector::apply_clips(state, busy, ids, label, |current| {
+        let mut edited = current.clone();
+        if let Some(mut t) = edited.title_data.take() {
+            change(&mut edited, &mut t);
+            edited.title_data = Some(t);
+        }
+        Box::new(EditClipCommand::new(label, edited))
+    })
+}
+
+/// Wire Enter, Escape, and focus-leave on a title `GtkEntry`; returns a trigger
+/// callback that commits the entry's current text if needed.
+fn bind_title_entry(entry: &gtk::Entry, initial: String, mixed: bool, commit: impl Fn(String) -> bool + 'static) -> Rc<dyn Fn(&gtk::Entry)> {
+    if mixed {
+        entry.set_placeholder_text(Some("Mixed"));
+    } else {
+        entry.set_text(&initial);
+    }
+    let last = Rc::new(RefCell::new(if mixed { None } else { Some(initial) }));
+    let dirty = Rc::new(Cell::new(false));
+    {
+        let dirty = dirty.clone();
+        entry.connect_changed(move |_| dirty.set(true));
+    }
+    let commit = Rc::new(commit);
+    let apply_now: Rc<dyn Fn(&gtk::Entry)> = Rc::new({
+        let (last, dirty, commit) = (last.clone(), dirty.clone(), commit);
+        move |e: &gtk::Entry| {
+            let text = e.text().to_string();
+            if !dirty.get() && last.borrow().is_none() {
+                return;
+            }
+            if last.borrow().as_deref() == Some(text.as_str()) {
+                dirty.set(false);
+                return;
+            }
+            if commit(text.clone()) {
+                *last.borrow_mut() = Some(text);
+                dirty.set(false);
+                e.set_placeholder_text(None);
+            }
+        }
+    });
+    {
+        let apply = apply_now.clone();
+        entry.connect_activate(move |e| {
+            apply(e);
+            unfocus_widget(e.upcast_ref());
+        });
+    }
+    {
+        let (last, dirty, entry_w) = (last.clone(), dirty.clone(), entry.downgrade());
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                if let Some(e) = entry_w.upgrade() {
+                    if let Some(prev) = last.borrow().as_ref() {
+                        e.set_text(prev);
+                    } else {
+                        e.set_text("");
+                    }
+                    dirty.set(false);
+                    unfocus_widget(e.upcast_ref());
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(keys);
+    }
+    {
+        let focus = gtk::EventControllerFocus::new();
+        let (e, apply) = (entry.clone(), apply_now.clone());
+        focus.connect_leave(move |_| apply(&e));
+        entry.add_controller(focus);
+    }
+    apply_now
 }
 
 /// The transition being edited and what limits it, read from the project.
@@ -1096,5 +1513,90 @@ mod tests {
         assert!([StartAtCut, Centered, EndAtCut].iter().all(|a| alignment_enabled(EditKind::Cut, *a)));
         assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Head, a)), [true, false, false]);
         assert_eq!([StartAtCut, Centered, EndAtCut].map(|a| alignment_enabled(EditKind::Tail, a)), [false, false, true]);
+    }
+
+    #[test]
+    fn rgba_byte_conversion_round_trips() {
+        for bytes in [[0, 0, 0, 0], [255, 255, 255, 255], [12, 128, 200, 170]] {
+            let rgba = rgba_from_bytes(bytes);
+            assert_eq!(bytes_from_rgba(&rgba), bytes);
+        }
+    }
+
+    #[test]
+    fn mixed_detection_distinguishes_equal_and_differing_clips() {
+        let track_id = Uuid::new_v4();
+        let mut a = Clip::new(track_id, Uuid::nil(), ClipType::Video, "A", 0, 2_000_000, 0, 2_000_000);
+        let b = Clip::new(track_id, Uuid::nil(), ClipType::Video, "B", 2_000_000, 4_000_000, 0, 2_000_000);
+        assert!(!is_mixed_f64(&[a.clone(), b.clone()], |c| c.properties.opacity as f64));
+        a.properties.opacity = 0.5;
+        assert!(is_mixed_f64(&[a, b], |c| c.properties.opacity as f64));
+        assert!(!is_mixed_f64(&[], |c| c.properties.opacity as f64));
+    }
+
+    #[test]
+    fn batch_command_updates_and_undoes_all_selected_clips_atomically() {
+        use tempo_timeline::{CommandLog, Timeline};
+        let mut tl = Timeline::new_default();
+        let v1 = tl.tracks[0].id;
+        let a1 = tl.tracks[2].id;
+        let mut vc1 = Clip::new(v1, Uuid::nil(), ClipType::Video, "V1a", 0, 2_000_000, 0, 2_000_000);
+        vc1.properties.opacity = 0.4;
+        let vc2 = Clip::new(v1, Uuid::nil(), ClipType::Video, "V1b", 2_000_000, 4_000_000, 0, 2_000_000);
+        let ac1 = Clip::new(a1, Uuid::nil(), ClipType::Audio, "A1a", 0, 2_000_000, 0, 2_000_000);
+        let (vc1_id, vc2_id, ac1_id) = (vc1.id, vc2.id, ac1.id);
+        tl.tracks[0].clips.push(vc1.clone());
+        tl.tracks[0].clips.push(vc2.clone());
+        tl.tracks[2].clips.push(ac1.clone());
+
+        let mut log = CommandLog::new();
+        let cmd = build_batch_command("Opacity", &[vc1, vc2], |c| {
+            Box::new(SetClipPropertyCommand::new(c.id, PropertyChange::Opacity(0.75)))
+        })
+        .expect("batch command built");
+        log.execute(cmd, &mut tl).expect("batch execute succeeds");
+
+        assert!((tl.find_clip(vc1_id).expect("vc1").1.properties.opacity - 0.75).abs() < 1e-6);
+        assert!((tl.find_clip(vc2_id).expect("vc2").1.properties.opacity - 0.75).abs() < 1e-6);
+        assert!((tl.find_clip(ac1_id).expect("ac1").1.properties.volume - 1.0).abs() < 1e-6);
+
+        log.undo(&mut tl).expect("single undo restores both clips");
+        assert!((tl.find_clip(vc1_id).expect("vc1").1.properties.opacity - 0.4).abs() < 1e-6);
+        assert!((tl.find_clip(vc2_id).expect("vc2").1.properties.opacity - 1.0).abs() < 1e-6);
+
+        log.redo(&mut tl).expect("single redo restores batch edit");
+        assert!((tl.find_clip(vc1_id).expect("vc1").1.properties.opacity - 0.75).abs() < 1e-6);
+        assert!((tl.find_clip(vc2_id).expect("vc2").1.properties.opacity - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn title_data_font_and_color_edits_undo_and_redo() {
+        use tempo_timeline::{CommandLog, Timeline};
+        let mut tl = Timeline::new_default();
+        let v1 = tl.tracks[0].id;
+        let mut title_clip = Clip::new(v1, Uuid::nil(), ClipType::Title, "Title", 0, 5_000_000, 0, 5_000_000);
+        title_clip.title_data = Some(TitleData::default());
+        let id = title_clip.id;
+        tl.tracks[0].clips.push(title_clip.clone());
+
+        let mut log = CommandLog::new();
+        let mut edited = title_clip;
+        if let Some(t) = edited.title_data.as_mut() {
+            t.font_family = "Monospace".into();
+            t.color = [255, 128, 0, 255];
+            t.background_color = Some([10, 20, 30, 170]);
+        }
+        log.execute(Box::new(EditClipCommand::new("Title Style", edited)), &mut tl).expect("execute title edit");
+
+        let updated = tl.find_clip(id).expect("title clip").1.title_data.as_ref().expect("title data");
+        assert_eq!(updated.font_family, "Monospace");
+        assert_eq!(updated.color, [255, 128, 0, 255]);
+        assert_eq!(updated.background_color, Some([10, 20, 30, 170]));
+
+        log.undo(&mut tl).expect("undo title edit");
+        let reverted = tl.find_clip(id).expect("title clip").1.title_data.as_ref().expect("title data");
+        assert_eq!(reverted.font_family, "Sans");
+        assert_eq!(reverted.color, [255, 255, 255, 255]);
+        assert_eq!(reverted.background_color, None);
     }
 }
