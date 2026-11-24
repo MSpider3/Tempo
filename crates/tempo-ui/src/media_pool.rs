@@ -404,7 +404,8 @@ impl MediaPool {
             if let Some(row) = row {
                 let idx = row.index();
                 if idx >= 0 {
-                    if let Some(&bin_id) = p.sidebar_bins.borrow().get(idx as usize) {
+                    let bin_id = p.sidebar_bins.borrow().get(idx as usize).copied();
+                    if let Some(bin_id) = bin_id {
                         p.navigate_to(bin_id);
                     }
                 }
