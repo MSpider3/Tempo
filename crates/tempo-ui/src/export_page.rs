@@ -158,7 +158,7 @@ impl ExportPage {
         let title = label("Render Settings", &["panel-title"]);
         title.set_xalign(0.0);
 
-        let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).margin_top(8).margin_bottom(4).margin_start(8).margin_end(8).build();
+        let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).margin_top(4).margin_bottom(2).margin_start(8).margin_end(8).build();
         let strip_scroll = gtk::ScrolledWindow::builder().child(&strip).vscrollbar_policy(gtk::PolicyType::Never).build();
 
         let file_name = gtk::Entry::builder().hexpand(true).build();
@@ -185,7 +185,7 @@ impl ExportPage {
         let chapters = gtk::CheckButton::with_label("Chapters from markers");
         chapters.set_active(true);
 
-        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(10).margin_start(12).margin_end(12).build();
+        let grid = gtk::Grid::builder().row_spacing(5).column_spacing(10).margin_top(6).margin_start(12).margin_end(12).build();
         let row = |r: i32, name: &str, w: &gtk::Widget| -> gtk::Label {
             let l = label(name, &["tempo-dim"]);
             l.set_xalign(1.0);
@@ -220,9 +220,9 @@ impl ExportPage {
         let add = pill("Add to Render Queue");
         add.set_tooltip_text(Some("Add to Render Queue (Ctrl+Return)"));
         add.set_halign(gtk::Align::End);
-        add.set_margin_top(16);
+        add.set_margin_top(10);
         add.set_margin_end(12);
-        add.set_margin_bottom(12);
+        add.set_margin_bottom(8);
 
         let upload = UploadForm::new();
         let settings = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1190,7 +1190,7 @@ impl UploadForm {
         let pick = gtk::DropDown::builder().model(&pick_model).visible(false).margin_start(12).margin_end(12).build();
         let title = gtk::Entry::builder().hexpand(true).build();
         let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
-        let description = gtk::ScrolledWindow::builder().child(&text).min_content_height(90).css_classes(["card"]).build();
+        let description = gtk::ScrolledWindow::builder().child(&text).min_content_height(48).css_classes(["card"]).build();
         let thumbnail_on = gtk::CheckButton::with_label("Upload Thumbnail");
         let thumbnail = gtk::Entry::builder().hexpand(true).placeholder_text("Thumbnail path").sensitive(false).build();
         let pick_file = gtk::Button::with_label("…");
@@ -1202,7 +1202,7 @@ impl UploadForm {
         let thumb_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         thumb_row.append(&thumbnail);
         thumb_row.append(&pick_file);
-        let fields = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(8).margin_start(12).margin_end(12).visible(false).build();
+        let fields = gtk::Grid::builder().row_spacing(5).column_spacing(10).margin_top(6).margin_start(12).margin_end(12).visible(false).build();
         let row = |r: i32, name: &str, w: &gtk::Widget| {
             let l = label(name, &["tempo-dim"]);
             l.set_xalign(1.0);
@@ -1217,7 +1217,7 @@ impl UploadForm {
         row(4, "Privacy", privacy.upcast_ref());
         row(5, "Category", category.upcast_ref());
 
-        let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(14).margin_bottom(8).visible(false).build();
+        let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(8).margin_bottom(6).visible(false).build();
         let head = gtk::Box::builder().margin_start(12).margin_end(12).build();
         head.append(&enabled);
         section.append(&head);
