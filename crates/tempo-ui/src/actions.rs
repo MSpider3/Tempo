@@ -882,8 +882,9 @@ pub fn razor(state: &Rc<AppState>) {
     let cuts = split_commands(state, &under, pos);
     if cuts.is_empty() {
         state.message("There is no clip under the playhead to cut.");
-    } else {
-        state.execute(Box::new(CompositeCommand::new("Razor", cuts)));
+    } else if state.execute(Box::new(CompositeCommand::new("Razor", cuts))) {
+        state.checklist_split.set(true);
+        state.emit(Change::Options);
     }
 }
 
@@ -892,8 +893,9 @@ pub fn split_at(state: &Rc<AppState>, clip_id: Uuid, at_us: i64) {
     let mut ids = vec![clip_id];
     ids.extend(state.linked_to(clip_id));
     let cuts = split_commands(state, &ids, at_us);
-    if !cuts.is_empty() {
-        state.execute(Box::new(CompositeCommand::new("Split", cuts)));
+    if !cuts.is_empty() && state.execute(Box::new(CompositeCommand::new("Split", cuts))) {
+        state.checklist_split.set(true);
+        state.emit(Change::Options);
     }
 }
 
@@ -914,8 +916,9 @@ pub fn split_selected(state: &Rc<AppState>) {
         } else {
             "There is no clip under the playhead to cut."
         });
-    } else {
-        state.execute(Box::new(CompositeCommand::new("Split", cuts)));
+    } else if state.execute(Box::new(CompositeCommand::new("Split", cuts))) {
+        state.checklist_split.set(true);
+        state.emit(Change::Options);
     }
 }
 

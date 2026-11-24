@@ -61,6 +61,7 @@ pub struct MainWindow {
     splash: Rc<crate::splash::SplashScreen>,
     splash_skipped: Rc<Cell<bool>>,
     splash_finish: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>>,
+    checklist: Rc<crate::help::FirstEditChecklist>,
 }
 
 impl MainWindow {
@@ -107,13 +108,23 @@ impl MainWindow {
         let plugin_menu = gio::Menu::new();
         menu.append_section(Some("Plugins"), &plugin_menu);
         let help = gio::Menu::new();
+        help.append(Some("How Do I…? Guide"), Some("win.how-do-i"));
+        help.append(Some("First-Edit Checklist"), Some("win.show-checklist"));
+        help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("Plugins…"), Some("win.plugins"));
         help.append(Some("Preferences"), Some("win.preferences"));
-        help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("About Tempo"), Some("win.about"));
         help.append(Some("Quit"), Some("win.quit"));
         menu.append_section(None, &help);
         let menu_btn = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("Menu").menu_model(&menu).css_classes(["tool"]).build();
+        let how_do_i_btn = gtk::Button::builder()
+            .label("?")
+            .tooltip_text("How Do I…? Beginner Guide")
+            .css_classes(["tool", "panel-help-btn"])
+            .build();
+        how_do_i_btn.update_property(&[gtk::accessible::Property::Label("How Do I…? Guide")]);
+        how_do_i_btn.set_action_name(Some("win.how-do-i"));
+        let checklist = crate::help::FirstEditChecklist::new(&state);
 
         // Buttons that only make sense on the Edit page.
         let edit_only = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -123,6 +134,8 @@ impl MainWindow {
         header.pack_start(&media_btn);
         header.pack_start(&effects_btn);
         header.pack_end(&menu_btn);
+        header.pack_end(&how_do_i_btn);
+        header.pack_end(&checklist.button);
         header.pack_end(&edit_only);
 
         // ---- Pages and page bar -----------------------------------------------
@@ -273,6 +286,7 @@ impl MainWindow {
             splash,
             splash_skipped,
             splash_finish,
+            checklist,
         });
 
         // Project Manager needs callbacks into the window, so it is built last.
@@ -449,7 +463,23 @@ impl MainWindow {
         self.plugins.connect_changed(move || w.refresh_plugin_menu());
         self.refresh_plugin_menu();
 
-        for name in ["import-media", "relink-media", "save", "save-as", "project-settings", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
+        for name in [
+            "import-media",
+            "relink-media",
+            "save",
+            "save-as",
+            "project-settings",
+            "undo",
+            "redo",
+            "copy-chapters",
+            "how-do-i",
+            "show-checklist",
+            "plugins",
+            "preferences",
+            "show-shortcuts",
+            "about",
+            "quit",
+        ] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
@@ -1211,6 +1241,20 @@ impl MainWindow {
             }
             "win.show-shortcuts" => {
                 dialogs::shortcuts(&self.window);
+                return;
+            }
+            "win.how-do-i" => {
+                let w = self.clone();
+                let w2 = self.clone();
+                crate::help::show_how_do_i(
+                    &self.window,
+                    move || w.checklist.show(),
+                    move || dialogs::shortcuts(&w2.window),
+                );
+                return;
+            }
+            "win.show-checklist" => {
+                self.checklist.show();
                 return;
             }
             "app.preferences" => {

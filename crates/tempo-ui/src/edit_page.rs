@@ -468,5 +468,16 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
 
     let bar = gtk::CenterBox::builder().css_classes(["timeline-toolbar"]).build();
     bar.set_center_widget(Some(&centre));
+    let timeline_help = crate::help::panel_guide_button(
+        "Timeline",
+        "Edit Page Timeline",
+        "Arrange video and audio tracks horizontally. Every cut, trim, transition, and marker edit is undoable with Ctrl+Z.",
+        &[
+            ("Ctrl+\\", "Split under playhead"),
+            ("Shift+Backspace", "Delete & close gap"),
+            ("V then Ctrl+T", "Add transition to cut"),
+        ],
+    );
+    bar.set_end_widget(Some(&timeline_help));
     (bar, [select, trim, blade], [snap, link])
 }

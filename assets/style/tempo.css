@@ -376,3 +376,50 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .marker-overlay.marker-cocoa { border-left-color: @tempo_marker_cocoa; }
 .marker-overlay.marker-cream { border-left-color: @tempo_marker_cream; }
 .marker-overlay.marker-orange { border-left-color: @tempo_marker_orange; }
+
+/* ---- Beginner Helpers ------------------------------------------------ */
+.tempo button.tool.panel-help-btn,
+.tempo menubutton.panel-help-btn > button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 6px;
+  font-weight: 700;
+  color: @tempo_text_dim;
+  background: none;
+  border: 1px solid @tempo_line_button;
+  border-radius: 9999px;
+}
+.tempo button.tool.panel-help-btn:hover,
+.tempo menubutton.panel-help-btn > button:hover {
+  color: @tempo_text_bright;
+  border-color: @tempo_text_dim;
+  background-color: @tempo_bg_hover;
+}
+.tempo menubutton.checklist-pill > button {
+  min-height: 26px;
+  padding: 0 10px;
+  background-color: @tempo_bg_card;
+  border: 1px solid @tempo_line_button;
+  border-radius: 9999px;
+  color: @tempo_text;
+}
+.tempo menubutton.checklist-pill > button:hover {
+  background-color: @tempo_bg_hover;
+  color: @tempo_text_bright;
+}
+.tempo menubutton.checklist-pill.checklist-done > button {
+  border-color: @tempo_ok;
+}
+.checklist-done { color: @tempo_ok; font-weight: 700; }
+.help-card {
+  background-color: @tempo_bg_card;
+  border: 1px solid @tempo_line;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.help-shortcut-pill {
+  background-color: @tempo_bg_deep;
+  border: 1px solid @tempo_line_button;
+  border-radius: 4px;
+  padding: 2px 7px;
+}

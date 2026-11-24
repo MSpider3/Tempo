@@ -116,10 +116,27 @@ impl Inspector {
             .build();
         let title = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
             .css_classes(["inspector-title"])
             .build();
-        root.append(&title);
+        let inspector_help = crate::help::panel_guide_button(
+            "Inspector",
+            "Inspector",
+            "Adjust Transform, Opacity, Volume, Fades, Titles, or Transitions for the selected clip(s). Ctrl+click clips to batch-edit together.",
+            &[
+                ("Click title/value", "Type exact numbers or drag slider"),
+                ("Reset ↺", "Revert section defaults"),
+                ("Ctrl+Z", "Undo batch edits in one step"),
+            ],
+        );
+        header.append(&title);
+        header.append(&inspector_help);
+        root.append(&header);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let scroller = gtk::ScrolledWindow::builder().child(&body).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
         root.append(&scroller);

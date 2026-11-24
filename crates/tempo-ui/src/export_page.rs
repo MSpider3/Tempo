@@ -155,8 +155,22 @@ pub struct ExportPage {
 impl ExportPage {
     pub fn new(state: &Rc<AppState>) -> Rc<Self> {
         // ---- Left: render settings ------------------------------------------
-        let title = label("Render Settings", &["panel-title"]);
+        let title = label("Render Settings", &[]);
         title.set_xalign(0.0);
+        title.set_hexpand(true);
+        let export_help = crate::help::panel_guide_button(
+            "Render Settings & Queue",
+            "Deliver Page",
+            "Choose a preset (like YouTube 1080p) or pick Custom to change format, codecs, and -14 LUFS loudness normalization.",
+            &[
+                ("Ctrl+Return", "Add job to Render Queue"),
+                ("Click a Job Card", "Switch Render All -> Render 1"),
+                ("Ctrl+Shift+Return", "Start rendering"),
+            ],
+        );
+        let settings_header = gtk::Box::builder().css_classes(["panel-title"]).build();
+        settings_header.append(&title);
+        settings_header.append(&export_help);
 
         let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).margin_top(4).margin_bottom(2).margin_start(8).margin_end(8).build();
         let strip_scroll = gtk::ScrolledWindow::builder().child(&strip).vscrollbar_policy(gtk::PolicyType::Never).build();
@@ -229,7 +243,7 @@ impl ExportPage {
         settings.append(&grid);
         settings.append(&upload.section);
         let left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).width_request(360).css_classes(["tempo-surface", "tempo-sep-right"]).build();
-        left.append(&title);
+        left.append(&settings_header);
         left.append(&strip_scroll);
         left.append(&gtk::ScrolledWindow::builder().child(&settings).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
         left.append(&add);
@@ -691,6 +705,8 @@ impl ExportPage {
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.rebuild_queue();
+        self.state.checklist_queued.set(true);
+        self.state.emit(Change::Options);
         true
     }
 

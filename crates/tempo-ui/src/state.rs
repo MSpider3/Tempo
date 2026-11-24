@@ -121,6 +121,9 @@ pub struct AppState {
     pub scrub_audio: Cell<bool>,
     /// Viewer picture zoom: `None` fits the frame to the viewer, `Some(s)` scales by `s` (1.0 = 100%).
     pub viewer_zoom: Cell<Option<f64>>,
+    /// Session tracking for the beginner First-Edit Checklist (steps 3 & 5).
+    pub checklist_split: Cell<bool>,
+    pub checklist_queued: Cell<bool>,
     /// Filters offered by the enabled plugins, kept current by `Plugins`.
     pub filters: RefCell<Vec<tempo_timeline::ClipEffect>>,
     /// Upload targets offered by the enabled plugins, kept current by `Plugins`.
@@ -167,6 +170,8 @@ impl AppState {
             loop_playback: Cell::new(false),
             scrub_audio: Cell::new(false),
             viewer_zoom: Cell::new(None),
+            checklist_split: Cell::new(false),
+            checklist_queued: Cell::new(false),
             filters: RefCell::new(Vec::new()),
             uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
@@ -323,6 +328,8 @@ impl AppState {
         self.loop_playback.set(false);
         self.scrub_audio.set(false);
         self.viewer_zoom.set(None);
+        self.checklist_split.set(false);
+        self.checklist_queued.set(false);
         self.player.set_looping(false);
         self.player.set_scrub_audio(false);
         self.sync_loop_range();

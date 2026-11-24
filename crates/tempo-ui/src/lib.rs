@@ -5,6 +5,7 @@ pub mod app;
 pub mod dialogs;
 pub mod edit_page;
 pub mod export_page;
+pub mod help;
 pub mod inspector;
 pub mod keybinds;
 pub mod media_pool;

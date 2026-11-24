@@ -196,6 +196,16 @@ impl MediaPool {
         zoom_btn.update_property(&[gtk::accessible::Property::Label("Thumbnail size")]);
 
         let list_toggle = tool_toggle("view-list-symbolic", "Switch between Grid and List view");
+        let panel_help = crate::help::panel_guide_button(
+            "Media Pool",
+            "Media Pool & Bins",
+            "Store project clips and timelines without re-encoding. Organize folders into Bins just like DaVinci Resolve.",
+            &[
+                ("Ctrl+I", "Import clips"),
+                ("Ctrl+Shift+N", "Create a new Bin"),
+                ("Drag", "Drop clips or timelines onto tracks/bins"),
+            ],
+        );
 
         let header_top = gtk::Box::builder()
             .spacing(4)
@@ -209,6 +219,7 @@ impl MediaPool {
         header_top.append(&import);
         header_top.append(&zoom_btn);
         header_top.append(&list_toggle);
+        header_top.append(&panel_help);
 
         let search = gtk::SearchEntry::builder().placeholder_text("Search").hexpand(true).build();
         let sort = gtk::DropDown::from_strings(&["Import Order", "Name", "Duration"]);
