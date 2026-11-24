@@ -33,11 +33,17 @@ pub(crate) fn clips_for_source(state: &AppState, source_id: Uuid, at_us: i64, vi
 
 /// `use_marks` off places the whole source whatever the viewer's marks say.
 fn clips_for_source_marked(state: &AppState, source_id: Uuid, at_us: i64, video_track: Option<Uuid>, audio_track: Option<Uuid>, use_marks: bool) -> Vec<Clip> {
-    let Some((media_type, duration, has_audio, name)) = state
+    let Some((media_type, duration, has_audio, name, conform_speed, ch_map)) = state
         .with_project(|p| {
             p.sources.get(&source_id).map(|s| {
-                let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                (s.media_type, s.duration_us, s.audio_channels.is_some(), name)
+                (
+                    s.media_type,
+                    s.duration_us,
+                    s.audio_channels.is_some(),
+                    s.display_name(),
+                    s.conform_speed(),
+                    s.audio_channel_map,
+                )
             })
         })
         .flatten()
@@ -50,12 +56,24 @@ fn clips_for_source_marked(state: &AppState, source_id: Uuid, at_us: i64, video_
     let full = if media_type == MediaType::Image { STILL_DURATION_US } else { duration.max(1) };
     let src_in = if marked { state.src_in.get().unwrap_or(0).clamp(0, full - 1) } else { 0 };
     let src_out = if marked { state.src_out.get().unwrap_or(full).clamp(src_in + 1, full) } else { full };
-    let len = src_out - src_in;
+    let src_len = src_out - src_in;
+    let timeline_len = if (conform_speed - 1.0).abs() < 1e-9 {
+        src_len
+    } else {
+        tempo_timeline::scale_us(src_len, 1.0 / conform_speed).max(1)
+    };
 
     let mut clips = Vec::new();
     let mut push = |track: Option<Uuid>, kind: ClipType| {
         if let Some(track) = track {
-            clips.push(Clip::new(track, source_id, kind, name.clone(), at_us, at_us + len, src_in, src_out));
+            let mut clip = Clip::new(track, source_id, kind, name.clone(), at_us, at_us + timeline_len, src_in, src_out);
+            if matches!(kind, ClipType::Video | ClipType::Audio) {
+                clip.properties.speed = conform_speed;
+            }
+            if kind == ClipType::Audio {
+                clip.properties.audio_channel_map = ch_map;
+            }
+            clips.push(clip);
         }
     };
     match media_type {
@@ -799,9 +817,7 @@ pub fn replace_selected(state: &Rc<AppState>) {
     };
     let Some((name, duration, media, has_audio)) = state
         .with_project(|p| {
-            p.sources.get(&source).map(|s| {
-                (s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), s.duration_us, s.media_type, s.audio_channels.is_some())
-            })
+            p.sources.get(&source).map(|s| (s.display_name(), s.duration_us, s.media_type, s.audio_channels.is_some()))
         })
         .flatten()
     else {
@@ -2189,5 +2205,33 @@ mod tests {
         assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().enabled), Some(false));
         state.undo();
         assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().enabled), Some(true));
+    }
+
+    #[test]
+    fn clip_attributes_on_source_propagate_to_placed_clips() {
+        let state = AppState::new();
+        let mut project = tempo_timeline::Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        let mut src = MediaSource::new(std::path::PathBuf::from("/tmp/raw.mp4"), MediaType::Video, 4 * S);
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.audio_channels = Some(2);
+        src.display_name = Some("B-Roll Slow".into());
+        src.conform_fps = Some(RationalFps::FPS_30);
+        src.audio_channel_map = tempo_timeline::AudioChannelMap::LeftToBoth;
+        let sid = src.id;
+        project.sources.insert(sid, src);
+        state.set_project(Some(project), None);
+
+        place_source(&state, sid, Place::Insert, Some(0), None, false);
+        state.with_timeline(|t| {
+            let vclip = &t.tracks.iter().find(|tr| tr.kind == TrackKind::Video && tr.kind_index == 1).unwrap().clips[0];
+            assert_eq!(vclip.name, "B-Roll Slow");
+            assert_eq!(vclip.duration_us(), 8 * S);
+            assert!((vclip.properties.speed - 0.5).abs() < 1e-6);
+
+            let aclip = &t.tracks.iter().find(|tr| tr.kind == TrackKind::Audio && tr.kind_index == 1).unwrap().clips[0];
+            assert_eq!(aclip.name, "B-Roll Slow");
+            assert_eq!(aclip.duration_us(), 8 * S);
+            assert_eq!(aclip.properties.audio_channel_map, tempo_timeline::AudioChannelMap::LeftToBoth);
+        });
     }
 }

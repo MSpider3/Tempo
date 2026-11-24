@@ -576,6 +576,7 @@ impl MediaPool {
         }));
         add("remove", Box::new(|p, id| actions::remove_source(&p.state, id)));
         add("new-timeline-with-clip", Box::new(|p, id| p.new_timeline_with_clip_dialog(id)));
+        add("clip-attributes", Box::new(|p, id| crate::dialogs::clip_attributes_source(&p.root, &p.state, id)));
         add("open-timeline", Box::new(|p, id| p.state.open_timeline(id)));
         add("rename-timeline", Box::new(|p, id| p.rename_dialog(id)));
         add("duplicate-timeline", Box::new(|p, id| {
@@ -738,7 +739,7 @@ impl MediaPool {
                     None,
                     &section(&[("Create New Timeline Using Selected Clip…", "pool.new-timeline-with-clip")]),
                 );
-                menu.append_section(None, &section(&[("Open in Viewer", "pool.open"), ("Show in Files", "pool.reveal")]));
+                menu.append_section(None, &section(&[("Open in Viewer", "pool.open"), ("Clip Attributes…", "pool.clip-attributes"), ("Show in Files", "pool.reveal")]));
                 let current_bin = self
                     .state
                     .with_project(|p| p.sources.get(&id).and_then(|s| s.bin_id))
@@ -1445,13 +1446,14 @@ impl MediaPool {
                 .values()
                 .filter(|s| !query.is_empty() || s.bin_id == cur_bin)
                 .filter_map(|s| {
-                    let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let name = s.display_name();
                     if !query.is_empty() && !name.to_lowercase().contains(&query) {
                         return None;
                     }
-                    let detail = match (s.video_width, s.video_height, s.video_fps) {
+                    let detail = match (s.video_width, s.video_height, s.effective_fps()) {
                         (Some(w), Some(h), Some(fps)) => {
-                            format!("{w} × {h}, {:.2} fps, {}", fps.to_f64(), s.video_codec.clone().unwrap_or_default())
+                            let tag = if s.conform_fps.is_some() { " (conformed)" } else { "" };
+                            format!("{w} × {h}, {:.2} fps{tag}, {}", fps.to_f64(), s.video_codec.clone().unwrap_or_default())
                         }
                         _ => s.audio_codec.clone().unwrap_or_default(),
                     };
@@ -1461,7 +1463,7 @@ impl MediaPool {
                         kind: ItemKind::Media,
                         name,
                         detail,
-                        duration_us: s.duration_us,
+                        duration_us: s.effective_duration_us(),
                         import_order: s.import_order,
                         sort_order: 0,
                         media_type: s.media_type,

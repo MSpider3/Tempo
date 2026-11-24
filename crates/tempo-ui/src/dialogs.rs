@@ -7,7 +7,12 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{AudioTrackType, ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
+use tempo_timeline::{
+    scale_us, AudioChannelMap, AudioTrackType, Clip, ClipType, Command, CompositeCommand,
+    EditClipCommand, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED,
+    MIN_SPEED,
+};
+use uuid::Uuid;
 
 use crate::actions;
 use crate::keybinds;
@@ -771,6 +776,391 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         state.execute(Box::new(command()));
     });
     dialog.present(Some(parent));
+}
+
+struct ClipAttributesSpec {
+    subtitle: String,
+    initial_name: String,
+    file_name: String,
+    has_video: bool,
+    video_summary: String,
+    native_fps: Option<RationalFps>,
+    initial_conform_fps: Option<RationalFps>,
+    source_duration_us: i64,
+    preview_fps: RationalFps,
+    has_audio: bool,
+    audio_summary: String,
+    initial_channel_map: AudioChannelMap,
+}
+
+struct ClipAttributesPatch {
+    display_name: String,
+    conform_fps: Option<RationalFps>,
+    fps_changed: bool,
+    channel_map: AudioChannelMap,
+    channel_map_changed: bool,
+}
+
+fn present_clip_attributes_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    spec: ClipAttributesSpec,
+    on_apply: impl FnOnce(ClipAttributesPatch) + 'static,
+) {
+    let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).vhomogeneous(false).build();
+    let switcher = gtk::StackSwitcher::builder().stack(&stack).halign(gtk::Align::Center).build();
+
+    // ---- Video tab
+    let video_grid = form_grid();
+    let src_vid = label(&spec.video_summary, &[]);
+    src_vid.set_xalign(0.0);
+    form_row(&video_grid, 0, "Source", &src_vid);
+
+    let native_label = match spec.native_fps {
+        Some(f) => format!("Native ({:.2} fps)", f.to_f64()),
+        None => "Native".to_string(),
+    };
+    let mut fps_labels = vec![native_label];
+    for (r_label, _) in RATES {
+        fps_labels.push(format!("{r_label} fps"));
+    }
+    let fps_refs: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
+    let fps_drop = gtk::DropDown::from_strings(&fps_refs);
+    let initial_fps_idx = spec
+        .initial_conform_fps
+        .and_then(|cf| RATES.iter().position(|(_, r)| r.num == cf.num && r.den == cf.den))
+        .map(|i| (i + 1) as u32)
+        .unwrap_or(0);
+    fps_drop.set_selected(initial_fps_idx);
+    fps_drop.set_sensitive(spec.has_video && spec.native_fps.is_some());
+    form_row(&video_grid, 1, "Video Frame Rate", &fps_drop);
+
+    let speed_preview = label("", &["tempo-dim"]);
+    speed_preview.set_xalign(0.0);
+    form_row(&video_grid, 2, "Playback", &speed_preview);
+
+    let update_preview = {
+        let (fps_drop, speed_preview) = (fps_drop.clone(), speed_preview.clone());
+        let (native_fps, source_dur, preview_fps, has_video) =
+            (spec.native_fps, spec.source_duration_us, spec.preview_fps, spec.has_video);
+        move || {
+            if !has_video || native_fps.is_none() {
+                speed_preview.set_text("Video frame rate conform applies to video clips.");
+                return;
+            }
+            let sel = fps_drop.selected() as usize;
+            let spd = match (native_fps, sel) {
+                (Some(n), idx) if idx > 0 => RATES
+                    .get(idx - 1)
+                    .map(|(_, t)| (t.to_f64() / n.to_f64().max(1.0)).clamp(MIN_SPEED, MAX_SPEED))
+                    .unwrap_or(1.0),
+                _ => 1.0,
+            };
+            let dur = if (spd - 1.0).abs() < 1e-6 {
+                source_dur
+            } else {
+                scale_us(source_dur, 1.0 / spd).max(1)
+            };
+            speed_preview.set_text(&format!("{spd:.2}× speed · {}", timecode(dur, preview_fps.to_f64())));
+        }
+    };
+    update_preview();
+    let up = update_preview.clone();
+    fps_drop.connect_selected_notify(move |_| up());
+    stack.add_titled(&video_grid, Some("video"), "Video");
+
+    // ---- Audio tab
+    let audio_grid = form_grid();
+    let src_aud = label(&spec.audio_summary, &[]);
+    src_aud.set_xalign(0.0);
+    form_row(&audio_grid, 0, "Source", &src_aud);
+
+    let ch_labels: Vec<&str> = AudioChannelMap::ALL.iter().map(|m| m.label()).collect();
+    let ch_drop = gtk::DropDown::from_strings(&ch_labels);
+    let initial_ch_idx = AudioChannelMap::ALL
+        .iter()
+        .position(|m| *m == spec.initial_channel_map)
+        .unwrap_or(0) as u32;
+    ch_drop.set_selected(initial_ch_idx);
+    ch_drop.set_sensitive(spec.has_audio);
+    form_row(&audio_grid, 1, "Channel Mapping", &ch_drop);
+
+    let audio_hint = label(
+        if spec.has_audio {
+            "Tip: Pick Channel 1 (Left -> Both) if a mic only plays on one side."
+        } else {
+            "This clip has no audio stream."
+        },
+        &["tempo-small", "tempo-dim"],
+    );
+    audio_hint.set_xalign(0.0);
+    audio_hint.set_wrap(true);
+    audio_grid.attach(&audio_hint, 1, 2, 1, 1);
+    stack.add_titled(&audio_grid, Some("audio"), "Audio");
+
+    // ---- Name tab
+    let name_grid = form_grid();
+    let name_entry = gtk::Entry::builder().text(&spec.initial_name).activates_default(true).build();
+    name_entry.update_property(&[gtk::accessible::Property::Label("Clip Name")]);
+    form_row(&name_grid, 0, "Clip Name", &name_entry);
+    let file_lbl = label(&spec.file_name, &["tempo-dim"]);
+    file_lbl.set_xalign(0.0);
+    file_lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    form_row(&name_grid, 1, "Disk File", &file_lbl);
+    let disk_note = label("Renaming here changes project display only, not the file on disk.", &["tempo-small", "tempo-dim"]);
+    disk_note.set_xalign(0.0);
+    disk_note.set_wrap(true);
+    name_grid.attach(&disk_note, 1, 2, 1, 1);
+    stack.add_titled(&name_grid, Some("name"), "Name");
+
+    let body = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).width_request(400).build();
+    body.append(&switcher);
+    body.append(&stack);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Clip Attributes")
+        .body(&spec.subtitle)
+        .extra_child(&body)
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Apply")]);
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let on_apply = std::cell::Cell::new(Some(on_apply));
+    dialog.connect_response(Some("apply"), move |_, _| {
+        let sel_fps = fps_drop.selected();
+        let conform_fps = if sel_fps > 0 {
+            RATES.get((sel_fps - 1) as usize).map(|(_, f)| *f)
+        } else {
+            None
+        };
+        let sel_ch = ch_drop.selected();
+        let channel_map = AudioChannelMap::ALL.get(sel_ch as usize).copied().unwrap_or_default();
+        if let Some(cb) = on_apply.take() {
+            cb(ClipAttributesPatch {
+                display_name: name_entry.text().trim().to_string(),
+                conform_fps,
+                fps_changed: sel_fps != initial_fps_idx,
+                channel_map,
+                channel_map_changed: sel_ch != initial_ch_idx,
+            });
+        }
+    });
+    dialog.present(Some(parent));
+}
+
+/// Resolve-style Clip Attributes for a Media Pool item (Video FPS Conform, Audio Mapping, Clip Name).
+pub fn clip_attributes_source(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, source_id: Uuid) {
+    let Some(spec) = state.with_project(|p| {
+        p.sources.get(&source_id).map(|s| {
+            let file_name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let has_video = s.media_type == tempo_timeline::MediaType::Video;
+            let video_summary = match (s.video_width, s.video_height, s.video_fps) {
+                (Some(w), Some(h), Some(fps)) => format!("{w} × {h}, Native {:.2} fps", fps.to_f64()),
+                _ if s.media_type == tempo_timeline::MediaType::Image => format!(
+                    "{} × {} Still Image",
+                    s.video_width.unwrap_or(0),
+                    s.video_height.unwrap_or(0)
+                ),
+                _ => "Audio only".to_string(),
+            };
+            let has_audio = s.audio_channels.is_some();
+            let audio_summary = match (s.audio_channels, s.audio_sample_rate) {
+                (Some(ch), Some(sr)) => format!("{ch} ch · {sr} Hz"),
+                (Some(ch), None) => format!("{ch} ch"),
+                _ => "No audio stream".to_string(),
+            };
+            ClipAttributesSpec {
+                subtitle: format!("Media Pool · {file_name}"),
+                initial_name: s.display_name(),
+                file_name,
+                has_video,
+                video_summary,
+                native_fps: s.video_fps,
+                initial_conform_fps: s.conform_fps,
+                source_duration_us: s.duration_us,
+                preview_fps: p.timeline_fps(),
+                has_audio,
+                audio_summary,
+                initial_channel_map: s.audio_channel_map,
+            }
+        })
+    }).flatten() else {
+        return;
+    };
+
+    let state = state.clone();
+    present_clip_attributes_dialog(parent, spec, move |patch| {
+        let changed = {
+            let mut guard = state.project.borrow_mut();
+            guard
+                .as_mut()
+                .and_then(|p| p.sources.get_mut(&source_id))
+                .is_some_and(|src| {
+                    let disk_name = src.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let next_name = if patch.display_name.is_empty() || patch.display_name == disk_name {
+                        None
+                    } else {
+                        Some(patch.display_name)
+                    };
+                    if src.display_name == next_name && src.conform_fps == patch.conform_fps && src.audio_channel_map == patch.channel_map {
+                        return false;
+                    }
+                    src.display_name = next_name;
+                    src.conform_fps = patch.conform_fps;
+                    src.audio_channel_map = patch.channel_map;
+                    true
+                })
+        };
+        if changed {
+            state.set_dirty(true);
+            if state.source_clip.get() == Some(source_id) {
+                state.show_source(Some(source_id));
+            }
+            state.emit(crate::state::Change::Media);
+            state.emit(crate::state::Change::Options);
+        }
+    });
+}
+
+/// Resolve-style Clip Attributes for selected Timeline clip(s) (undoable via `CommandLog`).
+pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let selected = state.selected_ids();
+    if selected.is_empty() {
+        state.message("Select a clip on the timeline first, then open Clip Attributes…");
+        return;
+    }
+
+    let Some((clips, spec, timeline_fps, source_limits, lead_fps)) = state.with_project(|p| {
+        let mut collected: Vec<Clip> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in &selected {
+            if let Some((_, clip)) = p.timeline.find_clip(*id) {
+                if seen.insert(clip.id) {
+                    collected.push(clip.clone());
+                }
+                if let Some(link_id) = clip.properties.link {
+                    for t in &p.timeline.tracks {
+                        for c in t.clips.iter().filter(|c| c.properties.link == Some(link_id)) {
+                            if seen.insert(c.id) {
+                                collected.push(c.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let primary = collected.first()?.clone();
+        let src = p.sources.get(&primary.source_id);
+        let native_fps = src.and_then(|s| s.video_fps);
+        let has_video = collected.iter().any(|c| c.clip_type == ClipType::Video);
+        let has_audio = collected.iter().any(|c| c.clip_type == ClipType::Audio);
+        let first_audio = collected.iter().find(|c| c.clip_type == ClipType::Audio);
+        let file_name = src
+            .and_then(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| primary.name.clone());
+        let video_summary = match (src.and_then(|s| s.video_width), src.and_then(|s| s.video_height), native_fps) {
+            (Some(w), Some(h), Some(fps)) => format!("{w} × {h}, Native {:.2} fps", fps.to_f64()),
+            _ if primary.clip_type == ClipType::Title => "Title Overlay".to_string(),
+            _ if primary.clip_type == ClipType::Image => "Still Image".to_string(),
+            _ => "Audio Clip".to_string(),
+        };
+        let audio_summary = match src.and_then(|s| Some((s.audio_channels?, s.audio_sample_rate))) {
+            Some((ch, Some(sr))) => format!("{ch} ch · {sr} Hz"),
+            Some((ch, None)) => format!("{ch} ch"),
+            None if has_audio => "Timeline Audio".to_string(),
+            None => "No audio stream".to_string(),
+        };
+        let initial_conform_fps = native_fps.and_then(|nf| {
+            let eff = nf.to_f64() * primary.properties.speed;
+            RATES
+                .iter()
+                .map(|(_, r)| *r)
+                .find(|r| (r.to_f64() - eff).abs() < 0.05 && (r.to_f64() - nf.to_f64()).abs() >= 0.05)
+        });
+        let subtitle = if collected.len() == 1 {
+            format!("Timeline Clip · {}", primary.name)
+        } else {
+            format!("Timeline Selection · {} clips", collected.len())
+        };
+        let spec = ClipAttributesSpec {
+            subtitle,
+            initial_name: primary.name.clone(),
+            file_name,
+            has_video,
+            video_summary,
+            native_fps,
+            initial_conform_fps,
+            source_duration_us: (primary.source_out - primary.source_in).max(1),
+            preview_fps: p.timeline_fps(),
+            has_audio,
+            audio_summary,
+            initial_channel_map: first_audio.map(|c| c.properties.audio_channel_map).unwrap_or_default(),
+        };
+        let limits = p
+            .sources
+            .iter()
+            .filter(|(_, s)| s.duration_us > 0)
+            .map(|(id, s)| (*id, s.duration_us))
+            .collect::<std::collections::HashMap<_, _>>();
+        Some((collected, spec, p.timeline_fps(), limits, native_fps))
+    }).flatten() else {
+        return;
+    };
+
+    let state = state.clone();
+    let initial_name = spec.initial_name.clone();
+    present_clip_attributes_dialog(parent, spec, move |patch| {
+        let mut cmds: Vec<Box<dyn Command>> = Vec::new();
+        let rename_to = (!patch.display_name.is_empty() && patch.display_name != initial_name).then_some(patch.display_name);
+
+        for clip in &clips {
+            let mut next = clip.clone();
+            let mut edited = false;
+            if let Some(ref new_name) = rename_to {
+                if next.name != *new_name {
+                    next.name = new_name.clone();
+                    edited = true;
+                }
+            }
+            if patch.channel_map_changed && next.clip_type == ClipType::Audio && next.properties.audio_channel_map != patch.channel_map {
+                next.properties.audio_channel_map = patch.channel_map;
+                edited = true;
+            }
+            if edited {
+                cmds.push(Box::new(EditClipCommand::new("Clip Attributes", next)));
+            }
+        }
+
+        if patch.fps_changed {
+            if let Some(native) = lead_fps.filter(|f| f.to_f64() > 0.0) {
+                let target_speed = match patch.conform_fps {
+                    Some(target) => (target.to_f64() / native.to_f64()).clamp(MIN_SPEED, MAX_SPEED),
+                    None => 1.0,
+                };
+                let mut seen_links = std::collections::HashSet::new();
+                for clip in &clips {
+                    if !matches!(clip.clip_type, ClipType::Video | ClipType::Audio) {
+                        continue;
+                    }
+                    let key = clip.properties.link.unwrap_or(clip.id);
+                    if seen_links.insert(key) && (clip.properties.speed - target_speed).abs() > 1e-4 {
+                        cmds.push(Box::new(SetClipSpeedCommand::new(
+                            clip.id,
+                            target_speed,
+                            true,
+                            timeline_fps,
+                            source_limits.clone(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !cmds.is_empty() {
+            state.execute(Box::new(CompositeCommand::new("Clip Attributes", cmds)));
+        }
+    });
 }
 
 /// Ask for the details of an upload, then run the plugin's uploader on a worker.

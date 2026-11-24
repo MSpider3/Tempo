@@ -6,9 +6,10 @@ use uuid::Uuid;
 use tempfile::NamedTempFile;
 
 use tempo_timeline::types::{
-    AudioTrackType, Bin, Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource,
-    MediaType, Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition,
-    TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind, UiState, MASTER_BIN_ID,
+    AudioChannelMap, AudioTrackType, Bin, Clip, ClipProperties, ClipType, Marker, MarkerColor,
+    MediaSource, MediaType, Project, RationalFps, Timeline, TitleData, Track, TrackKind,
+    Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind, UiState,
+    MASTER_BIN_ID,
 };
 
 use crate::db::open_connection;
@@ -109,6 +110,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         };
 
         let (fps_num, fps_den) = source.video_fps.map(|f| (Some(f.num), Some(f.den))).unwrap_or((None, None));
+        let (cfps_num, cfps_den) = source.conform_fps.map(|f| (Some(f.num), Some(f.den))).unwrap_or((None, None));
 
         tx.execute(
             "INSERT INTO media_sources (
@@ -116,8 +118,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 video_width, video_height, video_fps_num, video_fps_den, video_codec,
                 video_color_range, video_color_space, video_bit_depth, video_has_alpha,
                 audio_sample_rate, audio_channels, audio_codec, audio_bit_rate,
-                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data,
+                display_name, conform_fps_num, conform_fps_den, audio_channel_map
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 source.id.to_string(),
                 source.path.to_string_lossy().to_string(),
@@ -143,6 +146,10 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 source.imported_at,
                 source.import_order,
                 source.thumbnail_data,
+                source.display_name,
+                cfps_num,
+                cfps_den,
+                source.audio_channel_map.to_db_str(),
             ],
         )?;
 
@@ -421,7 +428,8 @@ pub fn load_project(path: &Path) -> Result<Project> {
                 video_width, video_height, video_fps_num, video_fps_den, video_codec,
                 video_color_range, video_color_space, video_bit_depth, video_has_alpha,
                 audio_sample_rate, audio_channels, audio_codec, audio_bit_rate,
-                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data
+                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data,
+                display_name, conform_fps_num, conform_fps_den, audio_channel_map
          FROM media_sources ORDER BY import_order ASC",
     )?;
 
@@ -450,6 +458,10 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let imported_at: i64 = row.get(21)?;
         let import_order: u32 = row.get(22)?;
         let thumbnail_data: Option<Vec<u8>> = row.get(23)?;
+        let display_name: Option<String> = row.get(24)?;
+        let conform_fps_num: Option<u32> = row.get(25)?;
+        let conform_fps_den: Option<u32> = row.get(26)?;
+        let audio_channel_map_str: Option<String> = row.get(27)?;
 
         let media_type = match media_type_int {
             0 => MediaType::Video,
@@ -459,6 +471,10 @@ pub fn load_project(path: &Path) -> Result<Project> {
 
         let video_fps = match (video_fps_num, video_fps_den) {
             (Some(num), Some(den)) => Some(RationalFps { num, den }),
+            _ => None,
+        };
+        let conform_fps = match (conform_fps_num, conform_fps_den) {
+            (Some(num), Some(den)) if num > 0 && den > 0 => Some(RationalFps { num, den }),
             _ => None,
         };
 
@@ -488,6 +504,9 @@ pub fn load_project(path: &Path) -> Result<Project> {
             imported_at,
             import_order,
             bin_id: None,
+            display_name,
+            conform_fps,
+            audio_channel_map: audio_channel_map_str.as_deref().map(AudioChannelMap::from_db_str).unwrap_or_default(),
         })
     })?;
 
@@ -1494,6 +1513,8 @@ mod tests {
              ALTER TABLE transitions DROP COLUMN start_ratio; ALTER TABLE transitions DROP COLUMN end_ratio; ALTER TABLE transitions DROP COLUMN curve;
              ALTER TABLE timelines DROP COLUMN fps_num; ALTER TABLE timelines DROP COLUMN fps_den; ALTER TABLE transitions DROP COLUMN enabled;
              ALTER TABLE timelines DROP COLUMN bin_id;
+             ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
              INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2 FROM clips;",
         );
         let loaded = load_project(file.path()).unwrap();
@@ -1514,7 +1535,10 @@ mod tests {
     #[test]
     fn v6_files_upgrade_to_v7_with_bin_id_none() {
         let (file, _) = tampered(
-            "ALTER TABLE timelines DROP COLUMN bin_id; DELETE FROM schema_version WHERE version >= 7;",
+            "ALTER TABLE timelines DROP COLUMN bin_id;
+             ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
+             DELETE FROM schema_version WHERE version >= 7;",
         );
         let loaded = load_project(file.path()).unwrap();
         assert!(loaded.bins.is_empty());
@@ -1598,5 +1622,42 @@ mod tests {
         save_project(&project, file.path()).unwrap();
         let loaded = load_project(file.path()).unwrap();
         assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, TransitionKind::Crossfade);
+    }
+
+    #[test]
+    fn clip_attributes_round_trip_and_v7_upgrade() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Attrs", 1920, 1080, RationalFps::FPS_24);
+        let mut src = MediaSource::new(PathBuf::from("/media/take.mp4"), MediaType::Video, 4_000_000);
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.display_name = Some("Interview Cam A".into());
+        src.conform_fps = Some(RationalFps::FPS_24);
+        src.audio_channel_map = AudioChannelMap::LeftToBoth;
+        let src_id = src.id;
+        project.sources.insert(src_id, src);
+
+        let a_track = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id;
+        let mut a_clip = Clip::new(a_track, src_id, ClipType::Audio, "Interview Cam A", 0, 2_000_000, 0, 2_000_000);
+        a_clip.properties.audio_channel_map = AudioChannelMap::SwapLeftRight;
+        project.timeline.find_track_mut(a_track).unwrap().clips.push(a_clip);
+
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        let ls = &loaded.sources[&src_id];
+        assert_eq!(ls.display_name.as_deref(), Some("Interview Cam A"));
+        assert_eq!(ls.conform_fps, Some(RationalFps::FPS_24));
+        assert_eq!(ls.audio_channel_map, AudioChannelMap::LeftToBoth);
+        assert_eq!(
+            loaded.timeline.find_track(a_track).unwrap().clips[0].properties.audio_channel_map,
+            AudioChannelMap::SwapLeftRight
+        );
+
+        let (v7_file, _) = tampered(
+            "ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
+             DELETE FROM schema_version WHERE version >= 8;",
+        );
+        let upgraded = load_project(v7_file.path()).unwrap();
+        assert!(upgraded.sources.values().all(|s| s.display_name.is_none() && s.conform_fps.is_none() && s.audio_channel_map == AudioChannelMap::Stereo));
     }
 }

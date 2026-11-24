@@ -101,6 +101,87 @@ pub struct Keyframe {
     pub value: f32,
 }
 
+/// How stereo source channels map into the left and right output channels of a clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioChannelMap {
+    #[default]
+    Stereo,
+    MonoMix,
+    LeftToBoth,
+    RightToBoth,
+    SwapLeftRight,
+    Mute,
+}
+
+impl AudioChannelMap {
+    pub const ALL: [Self; 6] = [
+        Self::Stereo,
+        Self::MonoMix,
+        Self::LeftToBoth,
+        Self::RightToBoth,
+        Self::SwapLeftRight,
+        Self::Mute,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo (L / R)",
+            Self::MonoMix => "Mono Mix (L+R -> Both)",
+            Self::LeftToBoth => "Channel 1 (Left -> Both)",
+            Self::RightToBoth => "Channel 2 (Right -> Both)",
+            Self::SwapLeftRight => "Swap Left / Right",
+            Self::Mute => "Mute",
+        }
+    }
+
+    pub fn apply_stereo(self, l: f32, r: f32) -> (f32, f32) {
+        match self {
+            Self::Stereo => (l, r),
+            Self::MonoMix => {
+                let c = (l + r) * 0.5;
+                (c, c)
+            }
+            Self::LeftToBoth => (l, l),
+            Self::RightToBoth => (r, r),
+            Self::SwapLeftRight => (r, l),
+            Self::Mute => (0.0, 0.0),
+        }
+    }
+
+    pub fn ffmpeg_pan_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Stereo => None,
+            Self::MonoMix => Some("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"),
+            Self::LeftToBoth => Some("pan=stereo|c0=c0|c1=c0"),
+            Self::RightToBoth => Some("pan=stereo|c0=c1|c1=c1"),
+            Self::SwapLeftRight => Some("pan=stereo|c0=c1|c1=c0"),
+            Self::Mute => Some("pan=stereo|c0=0*c0|c1=0*c1"),
+        }
+    }
+
+    pub fn to_db_str(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::MonoMix => "mono_mix",
+            Self::LeftToBoth => "left_to_both",
+            Self::RightToBoth => "right_to_both",
+            Self::SwapLeftRight => "swap_lr",
+            Self::Mute => "mute",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "mono_mix" => Self::MonoMix,
+            "left_to_both" => Self::LeftToBoth,
+            "right_to_both" => Self::RightToBoth,
+            "swap_lr" => Self::SwapLeftRight,
+            "mute" => Self::Mute,
+            _ => Self::Stereo,
+        }
+    }
+}
+
 /// Fields missing from saved data take their default value, so older and newer files load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -156,6 +237,9 @@ pub struct ClipProperties {
     /// Playback speed: 1.0 is normal, 0.5 half speed (slow motion), 2.0 double.
     /// Source time = timeline time × speed. Kept within 0.25–4.0 by the commands.
     pub speed: f64,
+    /// Embedded source audio channel routing applied before track mono downmix and pan.
+    #[serde(default)]
+    pub audio_channel_map: AudioChannelMap,
 }
 
 fn enabled_by_default() -> bool {
@@ -189,6 +273,7 @@ impl Default for ClipProperties {
             link: None,
             effects: Vec::new(),
             speed: 1.0,
+            audio_channel_map: AudioChannelMap::Stereo,
         }
     }
 }
@@ -1045,6 +1130,15 @@ pub struct MediaSource {
     /// Media Pool bin containing this source (`None` = Master).
     #[serde(default)]
     pub bin_id: Option<Uuid>,
+    /// Optional Clip Attributes display name (does not rename the file on disk).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Optional Clip Attributes video frame rate conform override.
+    #[serde(default)]
+    pub conform_fps: Option<RationalFps>,
+    /// Clip Attributes default audio channel mapping for clips placed from this source.
+    #[serde(default)]
+    pub audio_channel_map: AudioChannelMap,
 }
 
 impl MediaSource {
@@ -1074,6 +1168,38 @@ impl MediaSource {
             imported_at: 0,
             import_order: 0,
             bin_id: None,
+            display_name: None,
+            conform_fps: None,
+            audio_channel_map: AudioChannelMap::Stereo,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        if let Some(custom) = self.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return custom.to_string();
+        }
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    pub fn effective_fps(&self) -> Option<RationalFps> {
+        self.conform_fps.or(self.video_fps)
+    }
+
+    pub fn conform_speed(&self) -> f64 {
+        match (self.video_fps, self.conform_fps) {
+            (Some(native), Some(target)) if native.to_f64() > 0.0 && target.to_f64() > 0.0 => {
+                (target.to_f64() / native.to_f64()).clamp(crate::MIN_SPEED, crate::MAX_SPEED)
+            }
+            _ => 1.0,
+        }
+    }
+
+    pub fn effective_duration_us(&self) -> i64 {
+        let speed = self.conform_speed();
+        if (speed - 1.0).abs() < 1e-9 {
+            self.duration_us
+        } else {
+            scale_us(self.duration_us, 1.0 / speed).max(1)
         }
     }
 }
@@ -1453,7 +1579,7 @@ impl Project {
 /// The start or end of a clip, where its fade handles sit.
 /// `us × factor`, rounded. Exactly `us` at normal speed (and for a nonsense factor), so
 /// clips that are not retimed keep their exact times.
-fn scale_us(us: i64, factor: f64) -> i64 {
+pub fn scale_us(us: i64, factor: f64) -> i64 {
     if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
         us
     } else {
@@ -2203,5 +2329,38 @@ mod tests {
         assert!(p.delete_bin(b1));
         assert_eq!(p.sources[&su_id].bin_id, None);
         assert_eq!(p.timeline.bin_id, None);
+    }
+
+    #[test]
+    fn clip_attributes_channel_map_and_conform_helpers_behave_as_expected() {
+        assert_eq!(AudioChannelMap::Stereo.ffmpeg_pan_filter(), None);
+        assert_eq!(
+            AudioChannelMap::LeftToBoth.ffmpeg_pan_filter(),
+            Some("pan=stereo|c0=c0|c1=c0")
+        );
+        assert_eq!(AudioChannelMap::LeftToBoth.apply_stereo(0.8, -0.4), (0.8, 0.8));
+        assert_eq!(AudioChannelMap::RightToBoth.apply_stereo(0.8, -0.4), (-0.4, -0.4));
+        assert_eq!(AudioChannelMap::SwapLeftRight.apply_stereo(0.8, -0.4), (-0.4, 0.8));
+        assert_eq!(AudioChannelMap::MonoMix.apply_stereo(0.8, -0.4), (0.2, 0.2));
+        assert_eq!(AudioChannelMap::Mute.apply_stereo(0.8, -0.4), (0.0, 0.0));
+        for map in AudioChannelMap::ALL {
+            assert_eq!(AudioChannelMap::from_db_str(map.to_db_str()), map);
+        }
+
+        let mut src = MediaSource::new(PathBuf::from("/tmp/footage.mp4"), MediaType::Video, 4_000_000);
+        assert_eq!(src.display_name(), "footage.mp4");
+        src.display_name = Some("  Interview A  ".into());
+        assert_eq!(src.display_name(), "Interview A");
+
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.conform_fps = Some(RationalFps::FPS_24);
+        assert_eq!(src.effective_fps(), Some(RationalFps::FPS_24));
+        assert!((src.conform_speed() - 0.4).abs() < 1e-6);
+        assert_eq!(src.effective_duration_us(), 10_000_000);
+
+        src.video_fps = Some(RationalFps::FPS_30);
+        src.conform_fps = Some(RationalFps::FPS_60);
+        assert!((src.conform_speed() - 2.0).abs() < 1e-6);
+        assert_eq!(src.effective_duration_us(), 2_000_000);
     }
 }

@@ -395,7 +395,16 @@ impl Viewer {
                 .with_project(|p| {
                     p.sources.get(&id).map(|s| {
                         let has_video = s.media_type != tempo_timeline::MediaType::Audio;
-                        Snapshot::from_source(id, s.path.clone(), s.duration_us, p.timeline_fps(), has_video, s.audio_channels.is_some())
+                        Snapshot::from_source(
+                            id,
+                            s.path.clone(),
+                            s.duration_us,
+                            p.timeline_fps(),
+                            has_video,
+                            s.audio_channels.is_some(),
+                            s.conform_speed(),
+                            s.audio_channel_map,
+                        )
                     })
                 })
                 .flatten()
@@ -463,7 +472,7 @@ impl Viewer {
             .with_project(|p| {
                 let source = if self.source_only { self.shown_source.get() } else { state.source_clip.get().filter(|_| state.source_mode()) };
                 let title = match source.and_then(|id| p.sources.get(&id)) {
-                    Some(s) => s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    Some(s) => s.display_name(),
                     None if self.source_only => "Source".to_string(),
                     None => p.timeline.name.clone(),
                 };

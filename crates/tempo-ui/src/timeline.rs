@@ -1588,7 +1588,7 @@ impl TimelineCanvas {
                 clip_items.push((if enabled { "Turn Clip Off" } else { "Turn Clip On" }, "win.clip-enable-toggle"));
                 menu.append_section(None, &section(&clip_items));
                 menu.append_section(None, &section(&[("Fade In", "win.fade-in"), ("Fade Out", "win.fade-out"), ("Add Transition", "win.transition-add")]));
-                menu.append_section(None, &section(&[("Change Clip Speed…", "win.clip-speed")]));
+                menu.append_section(None, &section(&[("Change Clip Speed…", "win.clip-speed"), ("Clip Attributes…", "win.clip-attributes")]));
             }
             None => {
                 let gap = self.row_at(y).and_then(|row| actions::gap_at(&state, row.track_id, self.us_at(x)));

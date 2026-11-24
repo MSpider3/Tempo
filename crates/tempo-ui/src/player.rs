@@ -11,7 +11,10 @@ use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tempo_audio::AudioOutput;
 use tempo_media::{AudioReader, FfmpegDecoder, VideoFrame, OUT_CHANNELS, OUT_RATE};
-use tempo_timeline::{frame_to_us, Clip, ClipProperties, ClipType, Project, RationalFps, TitleData, TrackKind};
+use tempo_timeline::{
+    frame_to_us, scale_us, AudioChannelMap, Clip, ClipProperties, ClipType, Project, RationalFps,
+    TitleData, TrackKind,
+};
 use uuid::Uuid;
 
 /// How many container files may be open for decoding at once.
@@ -123,15 +126,39 @@ impl Snapshot {
     }
 
     /// A one-clip snapshot used to preview a Media Pool item.
-    pub fn from_source(id: Uuid, path: PathBuf, duration_us: i64, fps: RationalFps, has_video: bool, has_audio: bool) -> Self {
-        let clip = |kind| Clip::new(Uuid::nil(), id, kind, "", 0, duration_us, 0, duration_us);
+    pub fn from_source(
+        id: Uuid,
+        path: PathBuf,
+        duration_us: i64,
+        fps: RationalFps,
+        has_video: bool,
+        has_audio: bool,
+        speed: f64,
+        audio_channel_map: AudioChannelMap,
+    ) -> Self {
+        let speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+        let tl_dur = if (speed - 1.0).abs() < 1e-9 {
+            duration_us.max(1)
+        } else {
+            scale_us(duration_us.max(1), 1.0 / speed).max(1)
+        };
+        let clip = |kind| {
+            let mut c = Clip::new(Uuid::nil(), id, kind, "", 0, tl_dur, 0, duration_us);
+            if matches!(kind, ClipType::Video | ClipType::Audio) {
+                c.properties.speed = speed;
+            }
+            if kind == ClipType::Audio {
+                c.properties.audio_channel_map = audio_channel_map;
+            }
+            c
+        };
         Self {
             tracks: if has_video { vec![VideoStrip::Clips(vec![clip(ClipType::Video)])] } else { Vec::new() },
             audio: if has_audio { vec![(vec![clip(ClipType::Audio)], 1.0, false)] } else { Vec::new() },
             ramps: HashMap::new(),
             audio_sources: HashMap::from([(id, path.clone())]),
             sources: HashMap::from([(id, path)]),
-            duration_us,
+            duration_us: tl_dur,
             fps,
         }
     }
@@ -966,7 +993,8 @@ fn mix_audio_block(
         let pan = clip.properties.pan.clamp(-1.0, 1.0);
         let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
         for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
-            let (l, r) = if *mono { let c = (p[0] + p[1]) * 0.5; (c, c) } else { (p[0], p[1]) };
+            let (l, r) = clip.properties.audio_channel_map.apply_stereo(p[0], p[1]);
+            let (l, r) = if *mono { let c = (l + r) * 0.5; (c, c) } else { (l, r) };
             m[0] += l * left;
             m[1] += r * right;
         }
@@ -1154,5 +1182,22 @@ mod tests {
         // Every position inside one frame asks for the same time.
         let start = frame_to_us(frame, fps);
         assert_eq!(source_request_us(&c, start + 20_000, fps), start);
+    }
+
+    #[test]
+    fn from_source_preserves_conform_speed_and_channel_map() {
+        let snap = Snapshot::from_source(
+            Uuid::new_v4(),
+            PathBuf::from("clip.mp4"),
+            4_000_000,
+            RationalFps::FPS_30,
+            true,
+            true,
+            0.5,
+            AudioChannelMap::LeftToBoth,
+        );
+        assert_eq!(snap.duration_us, 8_000_000);
+        assert_eq!(snap.audio[0].0[0].properties.audio_channel_map, AudioChannelMap::LeftToBoth);
+        assert!((snap.audio[0].0[0].properties.speed - 0.5).abs() < 1e-6);
     }
 }

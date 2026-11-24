@@ -31,6 +31,7 @@ All notable changes to Tempo are recorded here. The format follows
   - Searchable **How Do I…?** dialog (`?` button in the top bar and Help menu) with step-by-step guides and DaVinci Resolve shortcuts.
   - Auto-tracking **First-Edit Checklist** popover (`First Edit 0/5` -> `5/5 ✓`, dismissible/restorable) updating live across Import, Place, Split, Transition, and Export Queue actions.
   - Per-panel `?` mini-guide popovers on **Media Pool**, **Timeline**, **Inspector**, and **Export** explaining each panel and its DaVinci Resolve equivalent.
+  - Resolve-style **Clip Attributes…** dialog on Media Pool & Timeline clips with **Video Frame Rate Conform**, **Audio Channel Mapping** (`Stereo`, `Mono Mix`, `Channel 1 -> Both`, `Channel 2 -> Both`, `Swap L/R`, `Mute`), and **Clip Display Name** (live playback, FFmpeg export, undo/redo, and SQLite schema **v7 → v8** persistence).
 
 ## [0.3.0] - 2026-11-20
 

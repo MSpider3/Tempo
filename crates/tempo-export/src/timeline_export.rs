@@ -676,10 +676,11 @@ fn build_args(
             let volume = if props.muted { 0.0 } else { props.volume.max(0.0) * track_volume.max(0.0) };
             let (left, right) = (1.0 - props.pan.max(0.0), 1.0 + props.pan.min(0.0));
             let label = format!("ac{ti}_{}", segs.len());
+            let ch_map = props.audio_channel_map.ffmpeg_pan_filter().map(|f| format!(",{f}")).unwrap_or_default();
             // A Mono track plays centred: both sides get the average.
             let centre = if *mono { ",pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1" } else { "" };
             graph.push(format!(
-                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo{centre},atrim=duration={},asetpts=PTS-STARTPTS,\
+                "[{idx}:a]aresample=48000,{retime}aformat=sample_fmts=fltp:channel_layouts=stereo{ch_map}{centre},atrim=duration={},asetpts=PTS-STARTPTS,\
                  volume={volume:.4},pan=stereo|c0={left:.4}*c0|c1={right:.4}*c1{}{}[{label}]",
                 secs(len),
                 audio_fade_filters(p, r0),
@@ -1858,5 +1859,25 @@ mod tests {
         assert!(text.contains("codec_name=flac"), "{text}");
         assert!(text.contains("sample_rate=48000"), "{text}");
         assert!(text.contains("width=320") && text.contains("height=180"), "{text}");
+    }
+
+    #[test]
+    fn audio_channel_map_injects_pan_filter_when_non_stereo() {
+        let media = std::env::temp_dir().join(format!("tempo-chmap-{}.mp4", std::process::id()));
+        std::fs::write(&media, b"").unwrap();
+        let mut project = project_with_clip(media.clone());
+        let (args_default, _, _) = build_args(&project, &settings(media.with_extension("a.mp4")), None, None).unwrap();
+        assert!(!args_default.join(" ").contains("pan=stereo|c0=c0|c1=c0"));
+
+        for track in &mut project.timeline.tracks {
+            for clip in &mut track.clips {
+                if clip.clip_type == ClipType::Audio {
+                    clip.properties.audio_channel_map = tempo_timeline::AudioChannelMap::LeftToBoth;
+                }
+            }
+        }
+        let (args_mapped, _, _) = build_args(&project, &settings(media.with_extension("b.mp4")), None, None).unwrap();
+        let _ = std::fs::remove_file(&media);
+        assert!(args_mapped.join(" ").contains("pan=stereo|c0=c0|c1=c0"), "{}", args_mapped.join(" "));
     }
 }
