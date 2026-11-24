@@ -135,11 +135,19 @@ impl Inspector {
                 let at = if same { i.scroller.vadjustment().value() } else { 0.0 };
                 // An edit from the curve graph rebuilds the panel; keep the keyboard on the new graph
                 // so the next Delete removes a key, not the transition.
-                let graph_focused = i.root.root().and_then(|r| r.focus()).is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
+                let prev_focus = i.root.root().and_then(|r| r.focus());
+                let in_body = prev_focus.as_ref().is_some_and(|f| f.is_ancestor(&i.body));
+                let graph_focused = prev_focus.as_ref().is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
                 i.rebuild();
                 if graph_focused {
                     if let Some(graph) = descendant_with_class(i.body.upcast_ref(), crate::keybinds::OWNS_DELETE_KEYS) {
                         graph.grab_focus();
+                    }
+                } else if in_body {
+                    // Prevent GTK from falling back onto the first text entry when a focused
+                    // toggle/button in the rebuilt body is removed, which would hijack Ctrl+Z.
+                    if let Some(win) = i.root.root().and_downcast::<gtk::Window>() {
+                        gtk::prelude::GtkWindowExt::set_focus(&win, None::<&gtk::Widget>);
                     }
                 }
                 let adjustment = i.scroller.vadjustment();
