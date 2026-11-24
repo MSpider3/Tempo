@@ -230,7 +230,8 @@ impl MainWindow {
             let finish = splash_finish.clone();
             move || {
                 skipped.set(true);
-                if let Some(cb) = finish.borrow_mut().take() {
+                let cb = finish.borrow_mut().take();
+                if let Some(cb) = cb {
                     cb();
                 }
             }
@@ -330,7 +331,8 @@ impl MainWindow {
             );
             if w.root.visible_child_name().as_deref() == Some("loading") && !modifier {
                 w.splash_skipped.set(true);
-                if let Some(cb) = w.splash_finish.borrow_mut().take() {
+                let cb = w.splash_finish.borrow_mut().take();
+                if let Some(cb) = cb {
                     cb();
                 }
                 return glib::Propagation::Stop;
@@ -581,7 +583,13 @@ impl MainWindow {
                     w.root.set_visible_child_name("loading");
                 }
                 *w.splash_finish.borrow_mut() = Some(finish.clone());
-                let hold_ms: u64 = if force_splash { 4500 } else { 2400 };
+                let hold_ms: u64 = if force_splash && automated {
+                    20_000
+                } else if force_splash {
+                    4_500
+                } else {
+                    2_400
+                };
                 let remaining_ms = hold_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
                 let finish_timer = finish;
                 glib::timeout_add_local_once(Duration::from_millis(remaining_ms.max(150)), move || {

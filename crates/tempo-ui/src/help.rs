@@ -211,10 +211,14 @@ pub fn show_how_do_i(
         .build();
 
     let d = dialog.clone();
+    search.connect_stop_search(move |_| {
+        d.close();
+    });
+    let d = dialog.clone();
     let on_checklist = Rc::new(on_show_checklist);
     checklist_btn.connect_clicked(move |_| {
-        on_checklist();
         d.close();
+        on_checklist();
     });
     let d = dialog.clone();
     let on_shortcuts = Rc::new(on_show_shortcuts);
