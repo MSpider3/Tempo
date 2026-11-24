@@ -1,7 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Root Master bin identifier used in SQLite persistence (`bins` and `bin_sources`).
+/// In-memory `Project` fields represent the Master bin as `None`.
+pub const MASTER_BIN_ID: Uuid = Uuid::nil();
+
+/// A folder in the Media Pool that groups media sources, timelines, and nested bins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bin {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    #[serde(default)]
+    pub sort_order: i32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind {
@@ -835,6 +850,9 @@ pub struct Timeline {
     /// The frame rate when "Use Project Settings" was off; `None` uses the project's.
     #[serde(default)]
     pub fps: Option<RationalFps>,
+    /// Media Pool bin containing this timeline (`None` = Master).
+    #[serde(default)]
+    pub bin_id: Option<Uuid>,
 }
 
 /// Resolve's default Start Timecode, 01:00:00:00.
@@ -861,6 +879,7 @@ impl Timeline {
             start_tc_us: 0,
             resolution: None,
             fps: None,
+            bin_id: None,
         }
     }
 
@@ -1023,6 +1042,9 @@ pub struct MediaSource {
     pub thumbnail_data: Option<Vec<u8>>,
     pub imported_at: i64,
     pub import_order: u32,
+    /// Media Pool bin containing this source (`None` = Master).
+    #[serde(default)]
+    pub bin_id: Option<Uuid>,
 }
 
 impl MediaSource {
@@ -1051,6 +1073,7 @@ impl MediaSource {
             thumbnail_data: None,
             imported_at: 0,
             import_order: 0,
+            bin_id: None,
         }
     }
 }
@@ -1097,6 +1120,9 @@ pub struct Project {
     /// The project's other timelines, waiting to be opened.
     #[serde(default)]
     pub timelines: Vec<Timeline>,
+    /// Media Pool bins (excluding Master).
+    #[serde(default)]
+    pub bins: Vec<Bin>,
     pub sources: HashMap<Uuid, MediaSource>,
     pub ui_state: UiState,
 }
@@ -1203,6 +1229,163 @@ impl Project {
         (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n.eq_ignore_ascii_case(c))).unwrap_or_default()
     }
 
+    fn normalize_bin_id(bin_id: Option<Uuid>) -> Option<Uuid> {
+        bin_id.filter(|id| *id != MASTER_BIN_ID)
+    }
+
+    /// "Bin N" with the first N no sibling bin under `parent_id` uses yet.
+    pub fn next_bin_name(&self, parent_id: Option<Uuid>) -> String {
+        let parent_id = Self::normalize_bin_id(parent_id);
+        (1..)
+            .map(|n| format!("Bin {n}"))
+            .find(|c| !self.bins.iter().any(|b| b.parent_id == parent_id && b.name.eq_ignore_ascii_case(c)))
+            .unwrap_or_default()
+    }
+
+    /// Creates a new Media Pool bin under `parent_id` (`None` = Master).
+    /// Returns `None` if `name` is blank, `parent_id` does not exist, or a sibling already uses `name`.
+    pub fn create_bin(&mut self, name: &str, parent_id: Option<Uuid>) -> Option<Uuid> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let parent_id = Self::normalize_bin_id(parent_id);
+        if let Some(pid) = parent_id {
+            if !self.bins.iter().any(|b| b.id == pid) {
+                return None;
+            }
+        }
+        if self.bins.iter().any(|b| b.parent_id == parent_id && b.name.eq_ignore_ascii_case(name)) {
+            return None;
+        }
+        let sort_order = self
+            .bins
+            .iter()
+            .filter(|b| b.parent_id == parent_id)
+            .map(|b| b.sort_order)
+            .max()
+            .map_or(0, |m| m + 1);
+        let id = Uuid::new_v4();
+        self.bins.push(Bin {
+            id,
+            name: name.to_string(),
+            parent_id,
+            sort_order,
+        });
+        Some(id)
+    }
+
+    /// Renames bin `id`. False for Master, unknown id, blank name, or sibling name conflict.
+    pub fn rename_bin(&mut self, id: Uuid, name: &str) -> bool {
+        if id == MASTER_BIN_ID {
+            return false;
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(parent_id) = self.bins.iter().find(|b| b.id == id).map(|b| Self::normalize_bin_id(b.parent_id)) else {
+            return false;
+        };
+        if self.bins.iter().any(|b| b.id != id && Self::normalize_bin_id(b.parent_id) == parent_id && b.name.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        let Some(bin) = self.bins.iter_mut().find(|b| b.id == id) else {
+            return false;
+        };
+        bin.name = name.to_string();
+        true
+    }
+
+    /// Deletes bin `id`, reparenting its child bins, sources, and timelines to its `parent_id`.
+    pub fn delete_bin(&mut self, id: Uuid) -> bool {
+        if id == MASTER_BIN_ID {
+            return false;
+        }
+        let Some(idx) = self.bins.iter().position(|b| b.id == id) else {
+            return false;
+        };
+        let parent_id = Self::normalize_bin_id(self.bins[idx].parent_id);
+        self.bins.remove(idx);
+        for bin in &mut self.bins {
+            if bin.parent_id == Some(id) {
+                bin.parent_id = parent_id;
+            }
+        }
+        for source in self.sources.values_mut() {
+            if source.bin_id == Some(id) {
+                source.bin_id = parent_id;
+            }
+        }
+        for timeline in std::iter::once(&mut self.timeline).chain(&mut self.timelines) {
+            if timeline.bin_id == Some(id) {
+                timeline.bin_id = parent_id;
+            }
+        }
+        true
+    }
+
+    /// Moves `source_id` into `bin_id` (`None` = Master).
+    pub fn move_source_to_bin(&mut self, source_id: Uuid, bin_id: Option<Uuid>) -> bool {
+        let bin_id = Self::normalize_bin_id(bin_id);
+        if let Some(bid) = bin_id {
+            if !self.bins.iter().any(|b| b.id == bid) {
+                return false;
+            }
+        }
+        let Some(source) = self.sources.get_mut(&source_id) else {
+            return false;
+        };
+        source.bin_id = bin_id;
+        true
+    }
+
+    /// Moves `timeline_id` into `bin_id` (`None` = Master).
+    pub fn move_timeline_to_bin(&mut self, timeline_id: Uuid, bin_id: Option<Uuid>) -> bool {
+        let bin_id = Self::normalize_bin_id(bin_id);
+        if let Some(bid) = bin_id {
+            if !self.bins.iter().any(|b| b.id == bid) {
+                return false;
+            }
+        }
+        let Some(timeline) = self.timeline_mut(timeline_id) else {
+            return false;
+        };
+        timeline.bin_id = bin_id;
+        true
+    }
+
+    /// Returns the breadcrumb path from Master to `bin_id`, guard-railed against cycles.
+    pub fn bin_ancestors(&self, bin_id: Option<Uuid>) -> Vec<(Option<Uuid>, String)> {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = Self::normalize_bin_id(bin_id);
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some(bin) = self.bins.iter().find(|b| b.id == id) else {
+                break;
+            };
+            chain.push((Some(bin.id), bin.name.clone()));
+            current = Self::normalize_bin_id(bin.parent_id);
+        }
+        chain.reverse();
+        let mut out = Vec::with_capacity(chain.len() + 1);
+        out.push((None, "Master".to_string()));
+        out.extend(chain);
+        out
+    }
+
+    /// True if `source_id` appears in at least one clip on the currently open timeline.
+    pub fn source_used_in_open_timeline(&self, source_id: Uuid) -> bool {
+        self.timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .any(|c| c.source_id == source_id)
+    }
+
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: RationalFps) -> Self {
         let now = 0; // will be populated with unix us timestamp
         Self {
@@ -1218,6 +1401,7 @@ impl Project {
             proxy_dir: PathBuf::from("/tmp/tempo_proxies"),
             timeline: Timeline::new_default(),
             timelines: Vec::new(),
+            bins: Vec::new(),
             sources: HashMap::new(),
             ui_state: UiState::default(),
         }
@@ -1945,5 +2129,79 @@ mod tests {
             assert_eq!(TransitionKind::from_effect_id(kind.effect_id().unwrap()), Some(kind));
         }
         assert_eq!(TransitionKind::from_effect_id("fade-in"), None);
+    }
+
+    #[test]
+    fn bin_crud_reparenting_ancestors_and_usage() {
+        let mut p = project();
+        assert_eq!(p.next_bin_name(None), "Bin 1");
+        assert_eq!(p.create_bin("   ", None), None);
+        let b1 = p.create_bin("Footage", None).unwrap();
+        assert_eq!(p.create_bin("footage", None), None);
+        assert_eq!(p.create_bin("InvalidParent", Some(Uuid::new_v4())), None);
+
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 1");
+        let b2 = p.create_bin("B-Roll", Some(b1)).unwrap();
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 1");
+        let _b3 = p.create_bin("Bin 1", Some(b1)).unwrap();
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 2");
+
+        // Rename validation
+        assert!(!p.rename_bin(MASTER_BIN_ID, "Root"));
+        assert!(!p.rename_bin(b2, "  "));
+        assert!(!p.rename_bin(b2, "bin 1"));
+        assert!(p.rename_bin(b2, "  Selects  "));
+
+        // Ancestors
+        assert_eq!(p.bin_ancestors(None), vec![(None, "Master".into())]);
+        assert_eq!(p.bin_ancestors(Some(MASTER_BIN_ID)), vec![(None, "Master".into())]);
+        assert_eq!(
+            p.bin_ancestors(Some(b2)),
+            vec![(None, "Master".into()), (Some(b1), "Footage".into()), (Some(b2), "Selects".into())]
+        );
+
+        // Cycle safety in bin_ancestors
+        let ca = Uuid::new_v4();
+        let cb = Uuid::new_v4();
+        p.bins.push(Bin { id: ca, name: "CA".into(), parent_id: Some(cb), sort_order: 0 });
+        p.bins.push(Bin { id: cb, name: "CB".into(), parent_id: Some(ca), sort_order: 0 });
+        assert_eq!(p.bin_ancestors(Some(cb)), vec![(None, "Master".into()), (Some(ca), "CA".into()), (Some(cb), "CB".into())]);
+
+        // Move sources & timelines
+        let s_used = MediaSource::new(PathBuf::from("used.mp4"), MediaType::Video, 2_000_000);
+        let s_unused = MediaSource::new(PathBuf::from("unused.mp4"), MediaType::Video, 2_000_000);
+        let (su_id, sn_id) = (s_used.id, s_unused.id);
+        p.sources.insert(su_id, s_used);
+        p.sources.insert(sn_id, s_unused);
+        let track = p.timeline.tracks[0].id;
+        p.timeline.tracks[0].clips.push(Clip::new(track, su_id, ClipType::Video, "u", 0, 1_000_000, 0, 1_000_000));
+        assert!(p.source_used_in_open_timeline(su_id));
+        assert!(!p.source_used_in_open_timeline(sn_id));
+
+        assert!(p.move_source_to_bin(su_id, Some(b2)));
+        assert!(!p.move_source_to_bin(su_id, Some(Uuid::new_v4())));
+        assert!(!p.move_source_to_bin(Uuid::new_v4(), Some(b2)));
+        assert_eq!(p.sources[&su_id].bin_id, Some(b2));
+
+        let t2 = Timeline::with_tracks("T2", 1, 1);
+        let t2_id = t2.id;
+        p.add_timeline(t2);
+        // After switching to T2, su_id is no longer in the open timeline
+        assert!(!p.source_used_in_open_timeline(su_id));
+        assert!(p.move_timeline_to_bin(t2_id, Some(b2)));
+        let dup_id = p.duplicate_timeline(t2_id).unwrap();
+        assert_eq!(p.timelines.iter().find(|t| t.id == dup_id).unwrap().bin_id, Some(b2));
+
+        // Deleting b2 reparents source and timelines to b1
+        assert!(!p.delete_bin(MASTER_BIN_ID));
+        assert!(p.delete_bin(b2));
+        assert_eq!(p.sources[&su_id].bin_id, Some(b1));
+        assert_eq!(p.timeline.bin_id, Some(b1));
+        assert_eq!(p.timelines.iter().find(|t| t.id == dup_id).unwrap().bin_id, Some(b1));
+
+        // Deleting b1 reparents everything to Master (None)
+        assert!(p.delete_bin(b1));
+        assert_eq!(p.sources[&su_id].bin_id, None);
+        assert_eq!(p.timeline.bin_id, None);
     }
 }
