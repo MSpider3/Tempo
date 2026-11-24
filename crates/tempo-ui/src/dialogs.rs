@@ -560,7 +560,7 @@ fn marks_available(selected: Option<uuid::Uuid>, source: Option<uuid::Uuid>, src
 
 /// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
 /// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
-pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, bin_id: Option<uuid::Uuid>) {
     let Some(default) = state.with_project(|p| p.next_timeline_name()) else { return };
     let name = gtk::Entry::builder().text(&default).activates_default(true).build();
     let tracks = |label| {
@@ -688,7 +688,9 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         let timeline_fps = (!use_project.is_active()).then(|| timeline_fps_choice(RATES[rate.selected() as usize].1, project_fps)).flatten();
         let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
         let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
-        state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps));
+        let mut tl = timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps);
+        tl.bin_id = bin_id;
+        state.add_timeline(tl);
         if !empty.is_active() {
             match state.media_selection.get() {
                 Some(source) => {

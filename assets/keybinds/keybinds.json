@@ -243,6 +243,16 @@
    "resolve": "fileNewTimeline"
   },
   {
+   "group": "File",
+   "action": "win.new-bin",
+   "keys": [
+    "<Primary><Shift>n"
+   ],
+   "alt": [],
+   "label": "New Bin",
+   "resolve": "fileNewFolder"
+  },
+  {
    "group": "Markers",
    "action": "win.marker-add",
    "keys": [

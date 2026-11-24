@@ -1221,7 +1221,11 @@ impl MainWindow {
                 }
             }
 
-            "win.new-timeline" => dialogs::new_timeline(&self.window, state),
+            "win.new-timeline" => dialogs::new_timeline(&self.window, state, self.edit.media_pool.current_bin()),
+            "win.new-bin" => {
+                self.panel_buttons[0].set_active(true);
+                self.edit.media_pool.new_bin_dialog();
+            }
 
             // Markers
             "win.marker-add" => {
