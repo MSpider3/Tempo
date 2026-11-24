@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use tempo_export::{export_timeline, Fit, TimelineExport};
+use tempo_export::{export_timeline, ContainerFormat, TimelineExport};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -16,18 +16,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     let project = tempo_project::load_project(&PathBuf::from(input))?;
+    let output_path = PathBuf::from(output);
+    let container = match output_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("mov") => ContainerFormat::Mov,
+        Some(ext) if ext.eq_ignore_ascii_case("mkv") => ContainerFormat::Mkv,
+        _ => ContainerFormat::Mp4,
+    };
     let settings = TimelineExport {
         width: project.width,
         height: project.height,
-        crf: 23,
-        audio_kbps: 160,
-        fit: Fit::Fit,
         range,
-        chapters: Vec::new(),
-        output: PathBuf::from(output),
+        output: output_path,
         // `TEMPO_HW_EXPORT=1` tries the graphics chip's encoder first, for timing it.
         hardware: std::env::var_os("TEMPO_HW_EXPORT").is_some(),
-        max_video_kbps: None,
+        container,
+        ..TimelineExport::default()
     };
     let started = std::time::Instant::now();
     export_timeline(&project, &settings, &AtomicBool::new(false), |_| {})?;

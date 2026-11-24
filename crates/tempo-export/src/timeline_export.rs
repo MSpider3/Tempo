@@ -12,25 +12,63 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tempo_timeline::{Clip, ColorLayer, ClipProperties, ClipType, MediaType, PictureBlend, Project, TitleData, TitleType, TrackKind};
+use tempo_timeline::{Clip, ClipProperties, ClipType, ColorLayer, MediaType, PictureBlend, Project, RationalFps, TitleData, TitleType, TrackKind};
 
 use crate::chapters::{ffmetadata, Chapter};
 use crate::error::{ExportError, Result};
 
 /// What to do when the output shape differs from the footage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fit {
     /// Keep the whole picture; add black bars.
+    #[default]
     Fit,
     /// Fill the frame; crop the overflow.
     Fill,
+}
+
+/// Container format for the exported file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerFormat {
+    #[default]
+    Mp4,
+    Mov,
+    Mkv,
+}
+
+impl ContainerFormat {
+    /// File extension without a leading dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+            Self::Mkv => "mkv",
+        }
+    }
+}
+
+/// Video encoder family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    H265,
+}
+
+/// Audio encoder family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioCodec {
+    #[default]
+    Aac,
+    Flac,
+    Pcm,
 }
 
 #[derive(Debug, Clone)]
 pub struct TimelineExport {
     pub width: u32,
     pub height: u32,
-    /// Lower is better quality and a larger file (x264 CRF).
+    /// Lower is better quality and a larger file (CRF).
     pub crf: u8,
     pub audio_kbps: u32,
     pub fit: Fit,
@@ -38,12 +76,96 @@ pub struct TimelineExport {
     pub range: Option<(i64, i64)>,
     pub chapters: Vec<Chapter>,
     pub output: PathBuf,
-    /// Try the graphics chip's H.264 encoder (VA-API) first. If it cannot be
+    /// Try the graphics chip's encoder (VA-API) first. If it cannot be
     /// used, the export is done again with the software encoder.
     pub hardware: bool,
     /// Cap the picture at this many kb/s instead of using `crf`, to make a file fit a
     /// size limit (see `bitrate_for_size`). Always encoded on the processor.
     pub max_video_kbps: Option<u32>,
+    pub container: ContainerFormat,
+    pub video_codec: VideoCodec,
+    pub audio_codec: AudioCodec,
+    pub fps: Option<RationalFps>,
+    pub normalize_lufs: Option<f32>,
+}
+
+impl Default for TimelineExport {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            crf: 23,
+            audio_kbps: 160,
+            fit: Fit::Fit,
+            range: None,
+            chapters: Vec::new(),
+            output: PathBuf::new(),
+            hardware: false,
+            max_video_kbps: None,
+            container: ContainerFormat::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
+            fps: None,
+            normalize_lufs: None,
+        }
+    }
+}
+
+fn validate_export(e: &TimelineExport) -> Result<()> {
+    if e.container == ContainerFormat::Mp4 && e.audio_codec == AudioCodec::Pcm {
+        return Err(ExportError::InvalidParameter("PCM audio is not supported in MP4; use MOV or MKV.".into()));
+    }
+    if e.container == ContainerFormat::Mov && e.audio_codec == AudioCodec::Flac {
+        return Err(ExportError::InvalidParameter("FLAC audio is not supported in MOV; use MP4 or MKV.".into()));
+    }
+    if let Some(lufs) = e.normalize_lufs {
+        if !lufs.is_finite() {
+            return Err(ExportError::InvalidParameter("Normalization target LUFS must be a finite number.".into()));
+        }
+    }
+    Ok(())
+}
+
+fn video_codec_args(e: &TimelineExport, w: u32, h: u32, hardware: bool) -> Vec<String> {
+    match (e.video_codec, e.max_video_kbps, hardware) {
+        (VideoCodec::H264, Some(kbps), _) => crate::ffmpeg::h264_capped_args(kbps),
+        // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
+        (VideoCodec::H264, None, true) => vec!["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()],
+        (VideoCodec::H264, None, false) => crate::ffmpeg::h264_args(e.crf, w, h, false),
+        (VideoCodec::H265, Some(kbps), _) => vec![
+            "-c:v".into(),
+            "libx265".into(),
+            "-preset".into(),
+            "veryfast".into(),
+            "-b:v".into(),
+            format!("{kbps}k"),
+            "-maxrate".into(),
+            format!("{kbps}k"),
+            "-bufsize".into(),
+            format!("{}k", kbps * 2),
+        ],
+        (VideoCodec::H265, None, true) => vec!["-c:v".into(), "hevc_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()],
+        (VideoCodec::H265, None, false) => vec!["-c:v".into(), "libx265".into(), "-preset".into(), "veryfast".into(), "-crf".into(), e.crf.min(51).to_string()],
+    }
+}
+
+fn audio_codec_args(codec: AudioCodec, audio_kbps: u32) -> Vec<String> {
+    match codec {
+        AudioCodec::Aac => vec!["-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", audio_kbps.max(64))],
+        AudioCodec::Flac => vec!["-c:a".into(), "flac".into()],
+        AudioCodec::Pcm => vec!["-c:a".into(), "pcm_s16le".into()],
+    }
+}
+
+fn container_args(container: ContainerFormat) -> Vec<String> {
+    match container {
+        ContainerFormat::Mp4 | ContainerFormat::Mov => vec!["-movflags".into(), "+faststart".into()],
+        ContainerFormat::Mkv => Vec::new(),
+    }
+}
+
+fn loudnorm_filter(lufs: f32) -> String {
+    format!("loudnorm=I={lufs}:TP=-1.0:LRA=11")
 }
 
 /// The picture bitrate that keeps `duration_us` of video plus `audio_kbps` of sound
@@ -146,19 +268,19 @@ fn audio_fade_filters(p: &Piece, r0: i64) -> String {
 /// the `frames` output frames from output frame `first`, and the value is set only where it
 /// changes. Same functions as the player uses, so a ranged export shows what the player shows.
 /// Needs rgba input. Empty when the opacity stays 1.
-fn opacity_filters(name: &str, first: i64, frames: i64, r0: i64, project: &Project, opacity_at: impl Fn(i64) -> f32) -> String {
-    per_frame(&format!("colorchannelmixer@{name}"), "aa", 1.0, first, frames, r0, project, |t| opacity_at(t).clamp(0.0, 1.0))
+fn opacity_filters(name: &str, first: i64, frames: i64, r0: i64, fps: RationalFps, opacity_at: impl Fn(i64) -> f32) -> String {
+    per_frame(&format!("colorchannelmixer@{name}"), "aa", 1.0, first, frames, r0, fps, |t| opacity_at(t).clamp(0.0, 1.0))
 }
 
 /// `filter` with its `param` set for each output frame from `value_at` (as `opacity_filters`),
 /// sent only where it changes from `rest`, the value it starts at. Empty when it never does.
 #[allow(clippy::too_many_arguments)]
-fn per_frame(filter: &str, param: &str, rest: f32, first: i64, frames: i64, r0: i64, project: &Project, value_at: impl Fn(i64) -> f32) -> String {
+fn per_frame(filter: &str, param: &str, rest: f32, first: i64, frames: i64, r0: i64, fps: RationalFps, value_at: impl Fn(i64) -> f32) -> String {
     let (mut cmds, mut last) = (String::new(), rest);
     for i in 0..frames {
-        let v = value_at(r0 + frame_time(first + i, project));
+        let v = value_at(r0 + frame_time_at(first + i, fps));
         if (v - last).abs() > 1e-4 {
-            cmds.push_str(&format!("{} {filter} {param} {v:.4};", secs(frame_time(i, project))));
+            cmds.push_str(&format!("{} {filter} {param} {v:.4};", secs(frame_time_at(i, fps))));
             last = v;
         }
     }
@@ -170,11 +292,11 @@ fn per_frame(filter: &str, param: &str, rest: f32, first: i64, frames: i64, r0: 
 
 /// A Blur Dissolve's per-frame blur on a picture, a Gaussian as for the clip's own blur filter
 /// (its 1080-line radius scaled to `height`, as the viewer does). Empty when the clip has none.
-fn transition_blur_filters(name: &str, clip: &Clip, first: i64, frames: i64, r0: i64, project: &Project, height: f32) -> String {
+fn transition_blur_filters(name: &str, clip: &Clip, first: i64, frames: i64, r0: i64, fps: RationalFps, height: f32) -> String {
     if clip.properties.blur_ramps.is_empty() {
         return String::new();
     }
-    per_frame(&format!("gblur@{name}"), "sigma", 0.0, first, frames, r0, project, |t| tempo_timeline::blur_sigma(tempo_timeline::blur_radius_px(clip.transition_blur(t), height)))
+    per_frame(&format!("gblur@{name}"), "sigma", 0.0, first, frames, r0, fps, |t| tempo_timeline::blur_sigma(tempo_timeline::blur_radius_px(clip.transition_blur(t), height)))
 }
 
 /// The FFmpeg `blend` mode for a picture blend; `None` for a plain overlay.
@@ -207,20 +329,20 @@ fn color_strip(
     layer: &ColorLayer,
     (r0, r1): (i64, i64),
     (w, h): (u32, u32),
-    fps: &str,
-    project: &Project,
+    fps_str: &str,
+    fps: RationalFps,
 ) -> Option<String> {
-    let (first, end) = (to_frame(layer.start_us.max(r0) - r0, project), to_frame(layer.end_us.min(r1) - r0, project));
+    let (first, end) = (to_frame_at(layer.start_us.max(r0) - r0, fps), to_frame_at(layer.end_us.min(r1) - r0, fps));
     let frames = end - first;
     if frames <= 0 {
         return None;
     }
     let [r, g, b] = layer.color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-    let fades = opacity_filters(&format!("dip{ti}"), first, frames, r0, project, |t| layer.opacity_at(t));
-    let solid = format!("color=c=0x{r:02x}{g:02x}{b:02x}:s={w}x{h}:r={fps},trim=end_frame={frames},format=rgba{fades}");
+    let fades = opacity_filters(&format!("dip{ti}"), first, frames, r0, fps, |t| layer.opacity_at(t));
+    let solid = format!("color=c=0x{r:02x}{g:02x}{b:02x}:s={w}x{h}:r={fps_str},trim=end_frame={frames},format=rgba{fades}");
     let out = format!("vt{ti}");
     if first > 0 {
-        graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps},trim=end_frame={first},format=rgba[vg{ti}]"));
+        graph.push(format!("color=c=black@0.0:s={w}x{h}:r={fps_str},trim=end_frame={first},format=rgba[vg{ti}]"));
         graph.push(format!("{solid}[vc{ti}]"));
         graph.push(format!("[vg{ti}][vc{ti}]concat=n=2:v=1:a=0[{out}]"));
     } else {
@@ -277,21 +399,40 @@ pub fn build_ffmpeg_args(
 /// The output frame a time falls on, counting from the start of the export.
 /// The picture is laid out in whole frames, so cuts that are not on a frame
 /// never add up to a drift between picture and sound.
-fn to_frame(us: i64, project: &Project) -> i64 {
-    let (num, den) = (project.timeline_fps().num.max(1) as i128, project.timeline_fps().den.max(1) as i128);
+fn to_frame_at(us: i64, fps: RationalFps) -> i64 {
+    let (num, den) = (fps.num.max(1) as i128, fps.den.max(1) as i128);
     ((us as i128 * num + den * 500_000) / (den * 1_000_000)) as i64
 }
 
 /// The time at which an output frame starts.
-fn frame_time(frame: i64, project: &Project) -> i64 {
-    let (num, den) = (project.timeline_fps().num.max(1) as i128, project.timeline_fps().den.max(1) as i128);
+fn frame_time_at(frame: i64, fps: RationalFps) -> i64 {
+    let (num, den) = (fps.num.max(1) as i128, fps.den.max(1) as i128);
     ((frame as i128 * den * 1_000_000 + num / 2) / num) as i64
 }
 
 /// A section's length rounded to whole frames, so its picture and sound are
 /// exactly as long as each other and sections join without a gap.
+fn whole_frames_at(us: i64, fps: RationalFps) -> i64 {
+    frame_time_at(to_frame_at(us, fps).max(1), fps)
+}
+
+#[cfg(test)]
+fn to_frame(us: i64, project: &Project) -> i64 {
+    to_frame_at(us, project.timeline_fps())
+}
+
+#[cfg(test)]
+fn frame_time(frame: i64, project: &Project) -> i64 {
+    frame_time_at(frame, project.timeline_fps())
+}
+
+#[cfg(test)]
 fn whole_frames(us: i64, project: &Project) -> i64 {
-    frame_time(to_frame(us, project).max(1), project)
+    whole_frames_at(us, project.timeline_fps())
+}
+
+fn effective_fps(project: &Project, e: &TimelineExport) -> RationalFps {
+    e.fps.filter(|f| f.num > 0 && f.den > 0).unwrap_or_else(|| project.timeline_fps())
 }
 
 /// `section` is set when this is one part of a longer export: `Some(true)` if
@@ -302,6 +443,9 @@ fn build_args(
     metadata_file: Option<&PathBuf>,
     section: Option<bool>,
 ) -> Result<(Vec<String>, i64, Vec<(PathBuf, String)>)> {
+    if section.is_none() {
+        validate_export(e)?;
+    }
     // A size limit always uses the processor's encoder, which keeps to a bitrate.
     let hardware = e.hardware && e.max_video_kbps.is_none();
     let mut text_files: Vec<(PathBuf, String)> = Vec::new();
@@ -313,10 +457,11 @@ fn build_args(
     if r1 - r0 <= 0 {
         return Err(ExportError::InvalidParameter("There is nothing on the timeline to export.".into()));
     }
-    let total = if section.is_some() { whole_frames(r1 - r0, project) } else { r1 - r0 };
+    let fps_val = effective_fps(project, e);
+    let total = if section.is_some() { whole_frames_at(r1 - r0, fps_val) } else { r1 - r0 };
 
     let (w, h) = ((e.width.max(16) + 1) & !1, (e.height.max(16) + 1) & !1);
-    let fps = format!("{}/{}", project.timeline_fps().num.max(1), project.timeline_fps().den.max(1));
+    let fps = format!("{}/{}", fps_val.num.max(1), fps_val.den.max(1));
     let mut inputs: Vec<String> = Vec::new();
     let mut graph: Vec<String> = Vec::new();
     let mut n_inputs = 0usize;
@@ -361,7 +506,7 @@ fn build_args(
         let (strip, blend) = match strip {
             Strip::Clips(clips, blend) => (clips, *blend),
             Strip::Color(layer) => {
-                if let Some(label) = color_strip(&mut graph, ti, layer, (r0, r1), (w, h), &fps, project) {
+                if let Some(label) = color_strip(&mut graph, ti, layer, (r0, r1), (w, h), &fps, fps_val) {
                     track_labels.push((label, PictureBlend::Normal));
                 }
                 continue;
@@ -376,7 +521,7 @@ fn build_args(
         let mut cursor = 0i64;
         let blank = |frames: i64| format!("color=c=black@0.0:s={w}x{h}:r={fps},trim=end_frame={frames},format=rgba");
         for p in &parts {
-            let (first, end) = (to_frame(p.start, project).max(cursor), to_frame(p.end, project));
+            let (first, end) = (to_frame_at(p.start, fps_val).max(cursor), to_frame_at(p.end, fps_val));
             let frames = end - first;
             if frames <= 0 {
                 // Shorter than a frame: it has no picture of its own.
@@ -388,7 +533,7 @@ fn build_args(
                 segs.push(label);
             }
             let len = p.end - p.start;
-            let fades = opacity_filters(&format!("fd{ti}_{}", segs.len()), first, frames, r0, project, |t| p.clip.fade_factor(t));
+            let fades = opacity_filters(&format!("fd{ti}_{}", segs.len()), first, frames, r0, fps_val, |t| p.clip.fade_factor(t));
             if p.clip.clip_type == ClipType::Title {
                 let Some(title) = &p.clip.title_data else { continue };
                 let file = std::env::temp_dir().join(format!("tempo-title-{}-{}-{}.txt", std::process::id(), r0, text_files.len()));
@@ -404,7 +549,7 @@ fn build_args(
                 inputs.extend(["-loop".into(), "1".into(), "-t".into(), secs(len)]);
             } else {
                 // One frame more than needed, so rounding never leaves the clip short.
-                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len + frame_time(1, project)))]);
+                inputs.extend(["-ss".into(), secs(p.source_in), "-t".into(), secs(p.clip.to_source_us(len + frame_time_at(1, fps_val)))]);
             }
             inputs.extend(["-i".into(), path.to_string_lossy().into_owned()]);
             let idx = n_inputs;
@@ -418,7 +563,7 @@ fn build_args(
             let label = format!("vc{ti}_{}", segs.len());
             // Blur radii are in pixels of a 1080-line picture.
             let effects = effect_filters(props, h as f32);
-            let blur = transition_blur_filters(&format!("bl{ti}_{}", segs.len()), p.clip, first, frames, r0, project, h as f32);
+            let blur = transition_blur_filters(&format!("bl{ti}_{}", segs.len()), p.clip, first, frames, r0, fps_val, h as f32);
             // A retimed clip's pictures are spread out (or packed together) before the
             // frame rate is set, so slow motion repeats frames and fast motion skips them.
             let retime = if props.speed != 1.0 { format!("setpts=(PTS-STARTPTS)/{:.6},", props.speed) } else { String::new() };
@@ -467,7 +612,7 @@ fn build_args(
         track_labels.push((out, blend));
     }
 
-    graph.push(format!("color=c=black:s={w}x{h}:r={fps},trim=end_frame={}[base0]", to_frame(total, project).max(1)));
+    graph.push(format!("color=c=black:s={w}x{h}:r={fps},trim=end_frame={}[base0]", to_frame_at(total, fps_val).max(1)));
     let mut base = "base0".to_string();
     for (i, (label, blend)) in track_labels.iter().enumerate() {
         let next = format!("base{}", i + 1);
@@ -558,7 +703,11 @@ fn build_args(
         graph.push(format!("anullsrc=r=48000:cl=stereo,atrim=duration={}[aout]", secs(total)));
     } else if has_audio {
         let joined: String = audio_labels.iter().map(|s| format!("[{s}]")).collect();
-        graph.push(format!("{joined}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.97,apad[aout]", audio_labels.len()));
+        let norm = match (section.is_none(), e.normalize_lufs) {
+            (true, Some(lufs)) => format!(",{}", loudnorm_filter(lufs)),
+            _ => String::new(),
+        };
+        graph.push(format!("{joined}amix=inputs={}:normalize=0:duration=longest,alimiter=limit=0.97,apad{norm}[aout]", audio_labels.len()));
     }
 
     // ---- Command line.
@@ -575,18 +724,20 @@ fn build_args(
         // Uncompressed in a section, so the joins are exact; encoded once at the end.
         args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "pcm_s16le".into()]);
     } else if has_audio {
-        args.extend(["-map".into(), "[aout]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
+        args.extend(["-map".into(), "[aout]".into()]);
+        if e.normalize_lufs.is_some() {
+            args.extend(["-ar".into(), "48000".into()]);
+        }
+        args.extend(audio_codec_args(e.audio_codec, e.audio_kbps));
     }
-    match (e.max_video_kbps, hardware) {
-        (Some(kbps), _) => args.extend(crate::ffmpeg::h264_capped_args(kbps)),
-        // VA-API has no CRF; a fixed quantiser close to the CRF gives similar quality.
-        (None, true) => args.extend(["-c:v".into(), "h264_vaapi".into(), "-qp".into(), (e.crf.min(51) as u32 + 2).to_string()]),
-        (None, false) => args.extend(crate::ffmpeg::h264_args(e.crf, w, h, false)),
+    args.extend(video_codec_args(e, w, h, hardware));
+    if let Some(fps_override) = e.fps.filter(|f| f.num > 0 && f.den > 0) {
+        args.extend(["-r".into(), format!("{}/{}", fps_override.num, fps_override.den)]);
     }
     if section.is_some() {
         args.extend(["-f".into(), "matroska".into()]);
     } else {
-        args.extend(["-movflags".into(), "+faststart".into()]);
+        args.extend(container_args(e.container));
     }
     args.extend(["-t".into(), secs(total), e.output.to_string_lossy().into_owned()]);
     Ok((args, total, text_files))
@@ -600,7 +751,7 @@ const MAX_INPUTS: usize = 6;
 /// Sections meet at the output frame nearest a clip edge, and never inside a
 /// fade or dissolve, so a join is not visible or audible. One section means
 /// "no need to split".
-fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
+fn plan_sections_at(project: &Project, r0: i64, r1: i64, fps: RationalFps) -> Vec<(i64, i64)> {
     let clips: Vec<&Clip> = project
         .timeline
         .tracks
@@ -636,7 +787,7 @@ fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
     let mut edges: Vec<i64> = clips
         .iter()
         .flat_map(|c| [c.timeline_in, c.timeline_out])
-        .map(|t| r0 + frame_time(to_frame(t - r0, project), project))
+        .map(|t| r0 + frame_time_at(to_frame_at(t - r0, fps), fps))
         .filter(|t| *t > r0 && *t < r1 && !busy.iter().any(|(a, b)| t > a && t < b))
         .collect();
     edges.sort_unstable();
@@ -657,6 +808,11 @@ fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
     sections
 }
 
+#[cfg(test)]
+fn plan_sections(project: &Project, r0: i64, r1: i64) -> Vec<(i64, i64)> {
+    plan_sections_at(project, r0, r1, project.timeline_fps())
+}
+
 /// Run the export. `progress` receives 0.0–1.0. Setting `cancel` stops FFmpeg
 /// and removes the partial file. Blocking: call from a worker thread.
 pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<()> {
@@ -675,6 +831,7 @@ pub fn export_timeline(project: &Project, e: &TimelineExport, cancel: &AtomicBoo
 }
 
 fn run_ffmpeg(project: &Project, e: &TimelineExport, cancel: &AtomicBool, progress: &mut dyn FnMut(f32)) -> Result<()> {
+    validate_export(e)?;
     if let Some(dir) = e.output.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -691,7 +848,7 @@ fn run_ffmpeg(project: &Project, e: &TimelineExport, cancel: &AtomicBool, progre
         Some(path)
     };
     let (r0, r1) = e.range.map(|(a, b)| (a.max(0), b.min(timeline_end))).unwrap_or((0, timeline_end));
-    let sections = plan_sections(project, r0, r1);
+    let sections = plan_sections_at(project, r0, r1, effective_fps(project, e));
     let result = if sections.len() > 1 {
         run_sections(project, e, &sections, metadata_file.as_ref(), cancel, progress)
     } else {
@@ -769,9 +926,14 @@ fn render_and_join(
     }
     args.extend(["-map".into(), "0:v:0".into(), "-c:v".into(), "copy".into()]);
     if has_audio {
-        args.extend(["-map".into(), "0:a:0".into(), "-c:a".into(), "aac".into(), "-b:a".into(), format!("{}k", e.audio_kbps.max(64))]);
+        args.extend(["-map".into(), "0:a:0".into()]);
+        if let Some(lufs) = e.normalize_lufs {
+            args.extend(["-af".into(), loudnorm_filter(lufs), "-ar".into(), "48000".into()]);
+        }
+        args.extend(audio_codec_args(e.audio_codec, e.audio_kbps));
     }
-    args.extend(["-movflags".into(), "+faststart".into(), e.output.to_string_lossy().into_owned()]);
+    args.extend(container_args(e.container));
+    args.push(e.output.to_string_lossy().into_owned());
     run_one(&args, r1 - r0, &[], cancel, &mut |f| progress(0.98 + f * 0.02))
 }
 
@@ -865,7 +1027,7 @@ mod tests {
     }
 
     fn settings(output: PathBuf) -> TimelineExport {
-        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, fit: Fit::Fit, range: None, chapters: Vec::new(), output, hardware: false, max_video_kbps: None }
+        TimelineExport { width: 640, height: 360, crf: 30, audio_kbps: 96, output, ..TimelineExport::default() }
     }
 
     #[test]
@@ -1575,5 +1737,126 @@ mod tests {
         let cancel = AtomicBool::new(true);
         assert!(export_timeline(&project, &settings(out.clone()), &cancel, |_| {}).is_err());
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn container_and_codec_enums_have_expected_defaults_and_extensions() {
+        assert_eq!(ContainerFormat::default(), ContainerFormat::Mp4);
+        assert_eq!(ContainerFormat::Mp4.extension(), "mp4");
+        assert_eq!(ContainerFormat::Mov.extension(), "mov");
+        assert_eq!(ContainerFormat::Mkv.extension(), "mkv");
+        assert_eq!(VideoCodec::default(), VideoCodec::H264);
+        assert_eq!(AudioCodec::default(), AudioCodec::Aac);
+        let d = TimelineExport::default();
+        assert_eq!(d.container, ContainerFormat::Mp4);
+        assert_eq!(d.video_codec, VideoCodec::H264);
+        assert_eq!(d.audio_codec, AudioCodec::Aac);
+        assert_eq!(d.fps, None);
+        assert_eq!(d.normalize_lufs, None);
+    }
+
+    #[test]
+    fn build_ffmpeg_args_handles_codecs_containers_fps_and_loudnorm() {
+        let media = std::env::temp_dir().join(format!("tempo-opts-{}.mp4", std::process::id()));
+        std::fs::write(&media, b"").unwrap();
+        let project = project_with_clip(media.clone());
+
+        let mkv_cfg = TimelineExport {
+            container: ContainerFormat::Mkv,
+            video_codec: VideoCodec::H265,
+            audio_codec: AudioCodec::Flac,
+            fps: Some(RationalFps::FPS_24),
+            normalize_lufs: Some(-14.0),
+            ..settings(media.with_extension("out.mkv"))
+        };
+        let (args, _, _) = build_ffmpeg_args(&project, &mkv_cfg, None).unwrap();
+        let joined = args.join(" ");
+        assert!(args.windows(2).any(|w| w == ["-c:v", "libx265"]), "{joined}");
+        assert!(args.windows(2).any(|w| w == ["-c:a", "flac"]), "{joined}");
+        assert!(args.windows(2).any(|w| w == ["-r", "24/1"]), "{joined}");
+        assert!(args.windows(2).any(|w| w == ["-ar", "48000"]), "{joined}");
+        assert!(!args.iter().any(|a| a == "-movflags" || a == "+faststart"), "{joined}");
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains(",loudnorm=I=-14:TP=-1.0:LRA=11[aout]"), "{graph}");
+
+        let mov_pcm = TimelineExport {
+            container: ContainerFormat::Mov,
+            audio_codec: AudioCodec::Pcm,
+            ..settings(media.with_extension("out.mov"))
+        };
+        let (mov_args, _, _) = build_ffmpeg_args(&project, &mov_pcm, None).unwrap();
+        assert!(mov_args.windows(2).any(|w| w == ["-c:a", "pcm_s16le"]));
+        assert!(mov_args.windows(2).any(|w| w == ["-movflags", "+faststart"]));
+
+        let hw_hevc = TimelineExport {
+            video_codec: VideoCodec::H265,
+            hardware: true,
+            ..settings(media.with_extension("out.mp4"))
+        };
+        let (hw_args, _, _) = build_ffmpeg_args(&project, &hw_hevc, None).unwrap();
+        assert!(hw_args.windows(2).any(|w| w == ["-c:v", "hevc_vaapi"]));
+
+        let bad_mp4_pcm = TimelineExport {
+            container: ContainerFormat::Mp4,
+            audio_codec: AudioCodec::Pcm,
+            ..settings(media.with_extension("bad.mp4"))
+        };
+        assert!(matches!(build_ffmpeg_args(&project, &bad_mp4_pcm, None), Err(ExportError::InvalidParameter(_))));
+
+        let bad_mov_flac = TimelineExport {
+            container: ContainerFormat::Mov,
+            audio_codec: AudioCodec::Flac,
+            ..settings(media.with_extension("bad.mov"))
+        };
+        assert!(matches!(build_ffmpeg_args(&project, &bad_mov_flac, None), Err(ExportError::InvalidParameter(_))));
+
+        let _ = std::fs::remove_file(&media);
+    }
+
+    #[test]
+    fn exports_short_mkv_with_loudnorm() {
+        if !has_ffmpeg() {
+            return;
+        }
+        let dir = scratch("mkv-loudnorm");
+        let Some(clip_path) = solid_clip(&dir, "tone.mp4", "blue", 440) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let mut project = Project::new("t", 640, 360, RationalFps::FPS_30);
+        let mut source = MediaSource::new(clip_path, MediaType::Video, 4_000_000);
+        source.audio_channels = Some(2);
+        let v = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id).unwrap();
+        let a = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id).unwrap();
+        for (track, kind) in [(v, ClipType::Video), (a, ClipType::Audio)] {
+            project.timeline.find_track_mut(track).unwrap().clips.push(Clip::new(track, source.id, kind, "c", 0, 1_500_000, 0, 1_500_000));
+        }
+        project.sources.insert(source.id, source);
+
+        let out = dir.join("out.mkv");
+        let cfg = TimelineExport {
+            width: 320,
+            height: 180,
+            container: ContainerFormat::Mkv,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Flac,
+            normalize_lufs: Some(-14.0),
+            output: out.clone(),
+            ..TimelineExport::default()
+        };
+        export_timeline(&project, &cfg, &AtomicBool::new(false), |_| {}).unwrap();
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=format_name,duration:stream=codec_name,sample_rate,width,height", "-of", "default=nw=1"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(text.contains("format_name=matroska"), "{text}");
+        assert!(text.contains("codec_name=h264"), "{text}");
+        assert!(text.contains("codec_name=flac"), "{text}");
+        assert!(text.contains("sample_rate=48000"), "{text}");
+        assert!(text.contains("width=320") && text.contains("height=180"), "{text}");
     }
 }
