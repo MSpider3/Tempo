@@ -11,8 +11,9 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gio, graphene, gsk, pango};
 use tempo_timeline::{
-    AddTrackCommand, ClipType, Command, CompositeCommand, EditClipCommand, InsertClipCommand, MediaType, FadeEdge, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, Track, TrackFlag, TrackKind,
-    Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
+    AddTrackCommand, AudioTrackType, Clip, ClipEffect, ClipType, Command, CompositeCommand, DeleteTrackCommand, EditClipCommand,
+    FadeEdge, InsertClipCommand, MediaType, MoveClipCommand, SetTrackFlagCommand, SetTransitionCommand, Timeline, TitleData,
+    TitleType, Track, TrackFlag, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimEdge,
 };
 use uuid::Uuid;
 
@@ -36,7 +37,17 @@ pub const RULER_H: f32 = 48.0;
 const GHOST_BAND_H: f32 = VIDEO_H;
 const VIDEO_H: f32 = 60.0;
 const AUDIO_H: f32 = 54.0;
+const MIN_TRACK_H: f32 = 36.0;
+const MAX_TRACK_H: f32 = 140.0;
 const DIVIDER_H: f32 = 2.0;
+
+thread_local! {
+    static TRACK_HEIGHTS: Cell<(f32, f32)> = const { Cell::new((VIDEO_H, AUDIO_H)) };
+}
+
+fn adjust_track_height(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(MIN_TRACK_H, MAX_TRACK_H)
+}
 const NAME_BAR_H: f32 = 22.0;
 const EDGE_GRAB_PX: f64 = 6.0;
 /// A press becomes a drag only after the pointer has travelled this far.
@@ -100,6 +111,7 @@ pub fn draw_count() -> u64 {
 
 /// Video tracks stack upward and audio tracks downward from the divider, as in Resolve.
 pub fn rows(timeline: &Timeline) -> Vec<Row> {
+    let (video_h, audio_h) = TRACK_HEIGHTS.with(|c| c.get());
     let mut video: Vec<_> = timeline.tracks.iter().filter(|t| t.kind == TrackKind::Video).collect();
     video.sort_by_key(|t| std::cmp::Reverse(t.kind_index));
     let mut audio: Vec<_> = timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();
@@ -107,12 +119,12 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
 
     let mut out = Vec::new();
     let mut y = RULER_H + GHOST_BAND_H;
-    for (list, h) in [(video, VIDEO_H), (audio, AUDIO_H)] {
+    for (list, h, is_video) in [(video, video_h, true), (audio, audio_h, false)] {
         for t in list {
             out.push(Row { track_id: t.id, kind: t.kind, index: t.kind_index, y, h, locked: t.locked, enabled: t.enabled, solo: t.solo });
             y += h;
         }
-        if h == VIDEO_H {
+        if is_video {
             y += DIVIDER_H;
         }
     }
@@ -190,7 +202,7 @@ enum Drag {
     Scrub,
     /// A marker dragged along the ruler: where it was and where it would land.
     Marker { id: Uuid, from: i64, to: i64 },
-    Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid },
+    Move { clip: Uuid, from_track: Uuid, kind: TrackKind, orig_in: i64, len: i64, new_in: i64, to_track: Uuid, duplicate: bool },
     /// `roll` moves the cut between two touching clips (Shift in Trim mode).
     Trim { clip: Uuid, edge: TrimEdge, delta: i64, roll: bool },
     /// Dragging a fade handle: the fade length at the start of the drag and now.
@@ -209,12 +221,16 @@ mod imp {
         pub pps: Cell<f64>,
         pub scroll: Cell<f64>,
         pub playhead: Cell<i64>,
+        pub video_h: Cell<f32>,
+        pub audio_h: Cell<f32>,
+        pub heights_cb: RefCell<Option<Rc<dyn Fn()>>>,
         pub(super) drag: RefCell<Option<Drag>>,
         pub press: Cell<(f64, f64)>,
         /// True once the pointer has moved far enough for the press to be a drag.
         pub dragging: Cell<bool>,
-        /// Modifier keys held when the pointer went down.
+        /// Modifier keys held when the pointer went down and when released.
         pub press_mods: Cell<gdk::ModifierType>,
+        pub release_mods: Cell<gdk::ModifierType>,
         pub pointer_x: Cell<f64>,
         /// The clip under the pointer, which shows its fade handles.
         pub hover: Cell<Option<Uuid>>,
@@ -266,10 +282,14 @@ mod imp {
                 pps: Cell::new(20.0),
                 scroll: Cell::new(0.0),
                 playhead: Cell::new(0),
+                video_h: Cell::new(VIDEO_H),
+                audio_h: Cell::new(AUDIO_H),
+                heights_cb: RefCell::new(None),
                 drag: RefCell::new(None),
                 press: Cell::new((0.0, 0.0)),
                 dragging: Cell::new(false),
                 press_mods: Cell::new(gdk::ModifierType::empty()),
+                release_mods: Cell::new(gdk::ModifierType::empty()),
                 pointer_x: Cell::new(0.0),
                 hover: Cell::new(None),
                 drop_at: Cell::new(None),
@@ -340,6 +360,7 @@ glib::wrapper! {
 
 impl TimelineCanvas {
     pub fn new(state: &Rc<AppState>, viewer: &Rc<Viewer>) -> Self {
+        TRACK_HEIGHTS.with(|c| c.set((VIDEO_H, AUDIO_H)));
         let obj: Self = glib::Object::builder().build();
         obj.set_hexpand(true);
         obj.set_vexpand(true);
@@ -470,6 +491,48 @@ impl TimelineCanvas {
         } else {
             imp.tween_e.set(1.0);
         }
+        // Keep destination track indices pointing at an existing track after deletions/undos.
+        if let Some((v_fix, a_fix)) = state.with_timeline(|t| {
+            let fix = |kind: TrackKind, cur: u32| {
+                if t.tracks.iter().any(|tr| tr.kind == kind && tr.kind_index == cur) {
+                    None
+                } else {
+                    Some(t.tracks.iter().filter(|tr| tr.kind == kind).map(|tr| tr.kind_index).max().unwrap_or(1))
+                }
+            };
+            (fix(TrackKind::Video, state.dest_video.get()), fix(TrackKind::Audio, state.dest_audio.get()))
+        }) {
+            if let Some(v) = v_fix {
+                state.dest_video.set(v);
+            }
+            if let Some(a) = a_fix {
+                state.dest_audio.set(a);
+            }
+            if v_fix.is_some() || a_fix.is_some() {
+                state.emit(Change::Options);
+            }
+        }
+        self.redraw();
+    }
+
+    pub fn connect_heights(&self, f: impl Fn() + 'static) {
+        *self.imp().heights_cb.borrow_mut() = Some(Rc::new(f));
+    }
+
+    pub fn adjust_track_heights(&self, delta_px: f32) {
+        let imp = self.imp();
+        let vh = adjust_track_height(imp.video_h.get(), delta_px);
+        let ah = adjust_track_height(imp.audio_h.get(), delta_px);
+        if (vh - imp.video_h.get()).abs() < f32::EPSILON && (ah - imp.audio_h.get()).abs() < f32::EPSILON {
+            return;
+        }
+        imp.video_h.set(vh);
+        imp.audio_h.set(ah);
+        TRACK_HEIGHTS.with(|c| c.set((vh, ah)));
+        if let Some(cb) = imp.heights_cb.borrow().as_ref() {
+            cb();
+        }
+        self.queue_resize();
         self.redraw();
     }
 
@@ -711,6 +774,7 @@ impl TimelineCanvas {
 
     pub fn simulate_drag(&self, from: (f64, f64), to: (f64, f64), mods: gdk::ModifierType) {
         self.imp().press_mods.set(mods);
+        self.imp().release_mods.set(mods);
         self.on_press(from.0, from.1);
         if from != to {
             // A few intermediate points, as a real drag would produce.
@@ -762,21 +826,29 @@ impl TimelineCanvas {
     }
 
     /// What dropping `kind` from the Effects panel at a point would do, or why it cannot.
-    /// A transition goes on the edit nearest the pointer on a video track (see
+    /// A transition goes on the edit nearest the pointer on its matching track kind (see
     /// `actions::fit_transition`); a fade on the clip under the pointer.
     fn plan_drop(&self, kind: &str, x: f64, y: f64) -> Result<DropPlan, &'static str> {
         const WHERE: &str = "Drop a transition on a cut, or on the start or end of a clip.";
         let row = self.row_at(y).ok_or(WHERE)?;
-        if row.kind == TrackKind::Audio {
-            return Err("Video transitions go on video tracks.");
-        }
         if row.locked {
             return Err("That track is locked. Click its lock in the track header to edit it.");
         }
         let kind = match kind {
-            "fade-in" | "fade-out" | "fade-in-out" => return self.hit(x, y).map(|(row, id, _)| DropPlan::Fade(row, id)).ok_or("Drop a fade on a clip."),
+            "fade-in" | "fade-out" | "fade-in-out" => {
+                if row.kind == TrackKind::Audio {
+                    return Err("Video transitions go on video tracks.");
+                }
+                return self.hit(x, y).map(|(row, id, _)| DropPlan::Fade(row, id)).ok_or("Drop a fade on a clip.");
+            }
+            "crossfade" => TransitionKind::Crossfade,
             id => TransitionKind::from_effect_id(id).ok_or("Tempo does not know that transition.")?,
         };
+        match (kind == TransitionKind::Crossfade, row.kind) {
+            (true, TrackKind::Video) => return Err("Audio transitions go on audio tracks."),
+            (false, TrackKind::Audio) => return Err("Video transitions go on video tracks."),
+            _ => {}
+        }
         let reach = (3.0 * EDGE_GRAB_PX / self.pps() * 1_000_000.0) as i64;
         let template = Transition::new(Uuid::nil(), TransitionEdge::In, kind, self.state().standard_transition_us(), TransitionAlignment::Centered);
         let at = self.us_at(x);
@@ -788,6 +860,136 @@ impl TimelineCanvas {
             })
             .unwrap_or(Err(WHERE))
             .map(|t| DropPlan::Transition(row, t))
+    }
+
+    fn plan_filter_drop(&self, filter_id: &str, x: f64, y: f64) -> Result<(Uuid, Uuid, i64, i64, ClipEffect), &'static str> {
+        let state = self.state();
+        let filter = state
+            .filters
+            .borrow()
+            .iter()
+            .find(|f| f.id == filter_id)
+            .cloned()
+            .ok_or("Unknown filter.")?;
+        let (row, clip_id, _) = self.hit(x, y).ok_or("Drop a filter onto a video clip.")?;
+        if row.locked {
+            return Err("That track is locked. Click its lock in the track header to edit it.");
+        }
+        state
+            .with_timeline(|t| {
+                let (_, clip) = t.find_clip(clip_id)?;
+                if matches!(clip.clip_type, ClipType::Audio | ClipType::Title) {
+                    return Some(Err("Filters go on video or image clips."));
+                }
+                if clip.properties.effects.iter().any(|e| e.id == filter.id) {
+                    return Some(Err("That clip already has this filter."));
+                }
+                Some(Ok((row.track_id, clip_id, clip.timeline_in, clip.timeline_out, filter)))
+            })
+            .flatten()
+            .unwrap_or(Err("Drop a filter onto a video clip."))
+    }
+
+    fn drop_filter(&self, filter_id: &str, x: f64, y: f64) -> bool {
+        let state = self.state();
+        match self.plan_filter_drop(filter_id, x, y) {
+            Err(why) => {
+                state.message(why);
+                false
+            }
+            Ok((_, clip_id, _, _, filter)) => {
+                let edited = state
+                    .with_timeline(|t| {
+                        t.find_clip(clip_id).map(|(_, clip)| {
+                            let mut c = clip.clone();
+                            c.properties.effects.push(filter);
+                            c
+                        })
+                    })
+                    .flatten();
+                let Some(edited) = edited else { return false };
+                let done = state.execute(Box::new(EditClipCommand::new("Add Filter", edited)));
+                if done {
+                    state.select(Some(clip_id));
+                }
+                done
+            }
+        }
+    }
+
+    fn plan_title_drop(&self, kind: &str, x: f64, y: f64) -> Result<(Uuid, i64, i64, bool), &'static str> {
+        const LENGTH_US: i64 = 5_000_000;
+        let lower_third = match kind {
+            "text" => false,
+            "lower_third" => true,
+            _ => return Err("Unknown title type."),
+        };
+        let state = self.state();
+        let (snapped, _) = self.snap(self.us_at(x), &[]);
+        let at = state.frame_floor(snapped.max(0));
+        let dropped_video = self.row_at(y).filter(|r| r.kind == TrackKind::Video && !r.locked).map(|r| r.track_id);
+        let free = state
+            .with_timeline(|t| {
+                let mut tracks: Vec<_> = t.tracks.iter().filter(|tr| tr.kind == TrackKind::Video && !tr.locked).collect();
+                tracks.sort_by_key(|tr| (Some(tr.id) != dropped_video, tr.kind_index));
+                tracks.into_iter().find_map(|tr| {
+                    if tr.clip_at(at).is_some() {
+                        return None;
+                    }
+                    let room = tr.clips.iter().map(|c| c.timeline_in).filter(|start| *start > at).min().map_or(LENGTH_US, |next| next - at);
+                    (room >= 1_000_000).then(|| (tr.id, room.min(LENGTH_US)))
+                })
+            })
+            .flatten();
+        let (track_id, len) = free.ok_or("No free video track there for a title.")?;
+        Ok((track_id, at, at + len, lower_third))
+    }
+
+    fn drop_title(&self, kind: &str, x: f64, y: f64) -> bool {
+        let state = self.state();
+        let (track, start, end, lower_third) = match self.plan_title_drop(kind, x, y) {
+            Ok(plan) => plan,
+            Err(why) => {
+                state.message(why);
+                return false;
+            }
+        };
+        let length = end - start;
+        let mut clip = Clip::new(
+            track,
+            Uuid::nil(),
+            ClipType::Title,
+            if lower_third { "Lower Third" } else { "Title" },
+            start,
+            end,
+            0,
+            length,
+        );
+        clip.title_data = Some(if lower_third {
+            TitleData {
+                title_type: TitleType::LowerThird,
+                text: "Name".into(),
+                font_size: 48.0,
+                background_color: Some([0, 0, 0, 170]),
+                ..Default::default()
+            }
+        } else {
+            TitleData::default()
+        });
+        let id = clip.id;
+        let done = state.execute(Box::new(InsertClipCommand::new(clip)));
+        if done {
+            state.select(Some(id));
+        }
+        done
+    }
+
+    fn clear_drop_preview(&self) {
+        self.set_ghost(None);
+        self.imp().drop_source.set(None);
+        if self.imp().preview.take().is_some() {
+            self.redraw();
+        }
     }
 
     /// Where a drop would land: track and span. A fade shows its whole clip.
@@ -851,8 +1053,9 @@ impl TimelineCanvas {
             }
         });
         let c = self.downgrade();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |gesture, _, _| {
             if let Some(c) = c.upgrade() {
+                c.imp().release_mods.set(gesture.current_event_state());
                 c.on_release();
             }
         });
@@ -932,12 +1135,18 @@ impl TimelineCanvas {
         });
         self.add_controller(motion);
 
-        // Alt+scroll zooms, anything else scrolls sideways.
+        // Shift+scroll resizes track heights, Alt+scroll zooms, anything else scrolls sideways.
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         let c = self.downgrade();
         scroll.connect_scroll(move |ctl, dx, dy| {
             let Some(c) = c.upgrade() else { return glib::Propagation::Proceed };
-            if ctl.current_event_state().contains(gdk::ModifierType::ALT_MASK) {
+            let mods = ctl.current_event_state();
+            if mods.contains(gdk::ModifierType::SHIFT_MASK) {
+                let raw = if dy.abs() >= dx.abs() { dy } else { dx };
+                if raw != 0.0 {
+                    c.adjust_track_heights((-raw as f32) * 8.0);
+                }
+            } else if mods.contains(gdk::ModifierType::ALT_MASK) {
                 let factor = if dy < 0.0 { 1.2 } else { 1.0 / 1.2 };
                 c.set_pps(c.pps() * factor, Some(c.imp().pointer_x.get()));
             } else {
@@ -948,41 +1157,81 @@ impl TimelineCanvas {
         self.add_controller(scroll);
 
         // Clips dragged in from the Media Pool carry the source id as text,
-        // transitions from the Effects panel TRANSITION_PREFIX and their kind.
+        // transitions from the Effects panel TRANSITION_PREFIX and their kind,
+        // filters FILTER:<id>, and titles TITLE:<kind>.
         let drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
         drop.set_preload(true);
         let c = self.downgrade();
         drop.connect_motion(move |target, x, y| {
             let Some(c) = c.upgrade() else { return gdk::DragAction::COPY };
             let text = target.value().and_then(|v| v.get::<String>().ok());
-            let kind = text.as_deref().and_then(|s| s.strip_prefix(TRANSITION_PREFIX));
-            // Show where the transition would land; where it cannot go, refuse it
-            // (Resolve's no-entry sign, over audio tracks for instance).
-            let ghost = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
-                (None, Some(id)) => c.ghost_for(id, y),
-                _ => None,
-            };
-            c.set_ghost(ghost);
-            // On Wayland the dragged value can arrive a motion or two late: keep the last source
-            // until it does, so the landing box never loses its thumbnail and name meanwhile.
-            if let Some(id) = text.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
-                c.imp().drop_source.set(Some(id));
-            }
-            let preview = match (kind, text.as_deref().and_then(|s| Uuid::parse_str(s).ok())) {
-                (None, Some(id)) => c.preview_for(id, x, y),
-                _ => None,
-            };
-            if c.imp().preview.replace(preview) != preview {
-                c.redraw();
-            }
-            let plan = kind.map(|kind| c.plan_drop(kind, x, y));
-            let at = plan.as_ref().and_then(|p| p.as_ref().ok()).and_then(|p| c.drop_span(p));
-            if c.imp().drop_at.replace(at) != at {
-                c.redraw();
-            }
-            match plan {
-                Some(Err(_)) => gdk::DragAction::empty(),
-                _ => gdk::DragAction::COPY,
+            match text.as_deref() {
+                Some(s) if s.starts_with("timeline:") => {
+                    c.clear_drop_preview();
+                    if c.imp().drop_at.take().is_some() {
+                        c.redraw();
+                    }
+                    gdk::DragAction::empty()
+                }
+                Some(s) if s.starts_with(TRANSITION_PREFIX) => {
+                    c.clear_drop_preview();
+                    let kind = &s[TRANSITION_PREFIX.len()..];
+                    let plan = c.plan_drop(kind, x, y);
+                    let at = plan.as_ref().ok().and_then(|p| c.drop_span(p));
+                    if c.imp().drop_at.replace(at) != at {
+                        c.redraw();
+                    }
+                    if plan.is_err() { gdk::DragAction::empty() } else { gdk::DragAction::COPY }
+                }
+                Some(s) if s.starts_with("FILTER:") => {
+                    c.clear_drop_preview();
+                    let filter_id = &s["FILTER:".len()..];
+                    let plan = c.plan_filter_drop(filter_id, x, y);
+                    let at = plan.as_ref().ok().map(|&(track_id, _, tin, tout, _)| (track_id, tin, tout));
+                    if c.imp().drop_at.replace(at) != at {
+                        c.redraw();
+                    }
+                    if plan.is_err() { gdk::DragAction::empty() } else { gdk::DragAction::COPY }
+                }
+                Some(s) if s.starts_with("TITLE:") => {
+                    c.clear_drop_preview();
+                    let title_kind = &s["TITLE:".len()..];
+                    let plan = c.plan_title_drop(title_kind, x, y);
+                    let at = plan.as_ref().ok().map(|&(track_id, tin, tout, _)| (track_id, tin, tout));
+                    if c.imp().drop_at.replace(at) != at {
+                        c.redraw();
+                    }
+                    if plan.is_err() { gdk::DragAction::empty() } else { gdk::DragAction::COPY }
+                }
+                Some(s) => {
+                    let id = Uuid::parse_str(s).ok();
+                    let ghost = id.and_then(|id| c.ghost_for(id, y));
+                    c.set_ghost(ghost);
+                    if let Some(id) = id {
+                        c.imp().drop_source.set(Some(id));
+                    }
+                    let preview = id.and_then(|id| c.preview_for(id, x, y));
+                    if c.imp().preview.replace(preview) != preview {
+                        c.redraw();
+                    }
+                    if c.imp().drop_at.take().is_some() {
+                        c.redraw();
+                    }
+                    if id.is_some() { gdk::DragAction::COPY } else { gdk::DragAction::empty() }
+                }
+                None => {
+                    // On Wayland the dragged value can arrive a motion or two late: keep the last source
+                    // until it does, so the landing box never loses its thumbnail and name meanwhile.
+                    if let Some(id) = c.imp().drop_source.get() {
+                        let ghost = c.ghost_for(id, y);
+                        c.set_ghost(ghost);
+                        let preview = c.preview_for(id, x, y);
+                        if c.imp().preview.replace(preview) != preview {
+                            c.redraw();
+                        }
+                    }
+                    gdk::DragAction::COPY
+                }
             }
         });
         let c = self.downgrade();
@@ -1003,8 +1252,17 @@ impl TimelineCanvas {
             c.set_ghost(None);
             c.imp().preview.set(None);
             let Ok(text) = value.get::<String>() else { return false };
+            if text.starts_with("timeline:") {
+                return false;
+            }
             if let Some(kind) = text.strip_prefix(TRANSITION_PREFIX) {
                 return c.drop_transition(kind, x, y);
+            }
+            if let Some(filter_id) = text.strip_prefix("FILTER:") {
+                return c.drop_filter(filter_id, x, y);
+            }
+            if let Some(title_kind) = text.strip_prefix("TITLE:") {
+                return c.drop_title(title_kind, x, y);
             }
             let Ok(id) = Uuid::parse_str(&text) else { return false };
             let (at, _) = c.snap(c.us_at(x), &[]);
@@ -1062,7 +1320,7 @@ impl TimelineCanvas {
                 lanes.push((RULER_H, GHOST_BAND_H, true));
             }
             if audio {
-                lanes.push((audio_y, AUDIO_H, false));
+                lanes.push((audio_y, self.imp().audio_h.get(), false));
             }
         } else if let Some(row) = rows.iter().find(|r| y >= r.y as f64 && y < (r.y + r.h) as f64) {
             lanes.push((row.y, row.h, row.kind == TrackKind::Video));
@@ -1176,7 +1434,7 @@ impl TimelineCanvas {
             lane(RULER_H, GHOST_BAND_H, format!("V{v}  Video {v}"));
         }
         if sound {
-            lane(audio_y, AUDIO_H, format!("A{a}  Audio {a}"));
+            lane(audio_y, self.imp().audio_h.get(), format!("A{a}  Audio {a}"));
         }
     }
 
@@ -1270,6 +1528,7 @@ impl TimelineCanvas {
                     len: clip.duration_us(),
                     new_in: clip.timeline_in,
                     to_track: row.track_id,
+                    duplicate: mods.contains(gdk::ModifierType::ALT_MASK),
                 });
             }
             // Empty space: a gap that could be closed is selected, anything else clears the selection.
@@ -1418,9 +1677,9 @@ impl TimelineCanvas {
                 *to = even_steps(*from, actions::dragged_length(*from, delta_us, *left, *both, *max, fps), *both, state.frame_us()).min(*max);
                 *imp.tip.borrow_mut() = Some((x, y, length_tip(*from, *to, *left, *both, state.fps())));
             }
-            Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, .. }) => {
+            Some(Drag::Move { clip, kind, orig_in, len, new_in, to_track, duplicate, .. }) => {
                 let raw = (*orig_in + delta_us).max(0);
-                let moving = self.moving_with(*clip);
+                let moving = if *duplicate { Vec::new() } else { self.moving_with(*clip) };
                 // Snap whichever end is closer to something.
                 let (s_in, hit_in) = self.snap(raw, &moving);
                 let (s_out, hit_out) = self.snap(raw + *len, &moving);
@@ -1491,6 +1750,7 @@ impl TimelineCanvas {
         let imp = self.imp();
         imp.snap_line.set(None);
         imp.tip.take();
+        let release_mods = imp.release_mods.replace(gdk::ModifierType::empty());
         let drag = imp.drag.borrow_mut().take();
         imp.no_tween_until.set(glib::monotonic_time() + 100_000);
         let state = self.state();
@@ -1502,8 +1762,13 @@ impl TimelineCanvas {
                     actions::update_marker(&state, marker);
                 }
             }
-            Some(Drag::Move { clip, from_track, orig_in, new_in, to_track, .. }) => {
-                if state.selected_ids().len() > 1 {
+            Some(Drag::Move { clip, from_track, orig_in, new_in, to_track, duplicate, .. }) => {
+                let dup = duplicate || release_mods.contains(gdk::ModifierType::ALT_MASK);
+                if dup {
+                    if new_in != orig_in || to_track != from_track {
+                        self.duplicate_dragged(&state, clip, from_track, to_track, new_in - orig_in);
+                    }
+                } else if state.selected_ids().len() > 1 {
                     // Several clips (or a clip and its sound) move together in time.
                     // Dragging to another row takes the clips of that kind with it.
                     let rows = state.with_timeline(rows).unwrap_or_default();
@@ -1546,6 +1811,90 @@ impl TimelineCanvas {
             _ => {}
         }
         self.redraw();
+    }
+
+    fn duplicate_dragged(&self, state: &Rc<AppState>, primary: Uuid, from_track: Uuid, to_track: Uuid, delta_us: i64) {
+        let ids = if state.is_selected(primary) {
+            state.selected_ids()
+        } else {
+            std::iter::once(primary).chain(state.linked_to(primary)).collect()
+        };
+        let clips: Vec<(Uuid, Clip)> = state
+            .with_timeline(|t| {
+                ids.iter()
+                    .filter_map(|id| t.find_clip(*id))
+                    .filter(|(tr, _)| !tr.locked)
+                    .map(|(tr, c)| (tr.id, c.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if clips.is_empty() {
+            return;
+        }
+        let earliest = clips.iter().map(|(_, c)| c.timeline_in).min().unwrap_or(0);
+        let delta = delta_us.max(-earliest);
+        let rows = state.with_timeline(rows).unwrap_or_default();
+        let index = |id: Uuid| rows.iter().find(|r| r.track_id == id).map(|r| (r.kind, r.index as i32));
+        let shift = match (index(from_track), index(to_track)) {
+            (Some((kind, from)), Some((_, to))) if from != to => Some((kind, to - from)),
+            _ => None,
+        };
+        if delta == 0 && shift.is_none() {
+            return;
+        }
+        let targets: Option<Vec<Uuid>> = state
+            .with_timeline(|t| {
+                clips
+                    .iter()
+                    .map(|(track, _)| {
+                        let from = t.find_track(*track)?;
+                        match shift.filter(|(kind, _)| *kind == from.kind) {
+                            Some((kind, row_delta)) => {
+                                let want = from.kind_index as i32 + row_delta;
+                                t.tracks.iter().find(|tr| tr.kind == kind && tr.kind_index as i32 == want && !tr.locked).map(|tr| tr.id)
+                            }
+                            None => Some(*track),
+                        }
+                    })
+                    .collect()
+            })
+            .flatten();
+        let Some(targets) = targets else {
+            state.message("There is no free track there for every selected clip.");
+            return;
+        };
+        let mut link_counts: HashMap<Uuid, usize> = HashMap::new();
+        for (_, c) in &clips {
+            if let Some(l) = c.properties.link {
+                *link_counts.entry(l).or_insert(0) += 1;
+            }
+        }
+        let mut new_links: HashMap<Uuid, Uuid> = HashMap::new();
+        let mut new_ids = Vec::with_capacity(clips.len());
+        let mut commands: Vec<Box<dyn Command>> = Vec::with_capacity(clips.len());
+        for ((_, orig), target_track) in clips.iter().zip(targets) {
+            let mut copy = orig.clone();
+            copy.id = Uuid::new_v4();
+            copy.track_id = target_track;
+            copy.timeline_in = orig.timeline_in + delta;
+            copy.timeline_out = copy.timeline_in + orig.duration_us();
+            copy.properties.link = orig.properties.link.and_then(|old| {
+                if link_counts.get(&old).copied().unwrap_or(0) > 1 {
+                    Some(*new_links.entry(old).or_insert_with(Uuid::new_v4))
+                } else {
+                    None
+                }
+            });
+            new_ids.push(copy.id);
+            commands.push(Box::new(InsertClipCommand::new(copy)) as Box<dyn Command>);
+        }
+        if !commands.is_empty() && state.execute(Box::new(CompositeCommand::new("Duplicate clip", commands))) {
+            if let Some(first) = new_ids.first().copied() {
+                state.selection.set(Some(first));
+                *state.extra_selection.borrow_mut() = new_ids.into_iter().skip(1).collect();
+                state.emit(Change::Selection);
+            }
+        }
     }
 
     // ---- Drawing -------------------------------------------------------------
@@ -1650,13 +1999,13 @@ impl TimelineCanvas {
         let dragging = imp.drag.borrow().clone();
         // While several clips are dragged, how far they have moved.
         let multi_move = match &dragging {
-            Some(Drag::Move { orig_in, new_in, .. }) if state.selected_ids().len() > 1 => Some(*new_in - *orig_in),
+            Some(Drag::Move { orig_in, new_in, duplicate: false, .. }) if state.selected_ids().len() > 1 => Some(*new_in - *orig_in),
             _ => None,
         };
         let rows = rows(timeline);
         // While several clips are dragged to another row: which kind, and how many rows.
         let row_shift = match &dragging {
-            Some(Drag::Move { from_track, to_track, kind, .. }) if multi_move.is_some() => {
+            Some(Drag::Move { from_track, to_track, kind, duplicate: false, .. }) if multi_move.is_some() => {
                 let index = |id: &Uuid| rows.iter().find(|r| r.track_id == *id).map(|r| r.index as i32);
                 index(from_track).zip(index(to_track)).map(|(from, to)| (*kind, to - from)).filter(|(_, by)| *by != 0)
             }
@@ -1681,7 +2030,7 @@ impl TimelineCanvas {
                 let (mut tin, mut tout, mut y) = (clip.timeline_in, clip.timeline_out, row.y);
                 (tin, tout) = self.tweened(clip.id, tin, tout);
                 match &dragging {
-                    Some(Drag::Move { clip: id, new_in, len, to_track, .. }) if *id == clip.id => {
+                    Some(Drag::Move { clip: id, new_in, len, to_track, duplicate: false, .. }) if *id == clip.id => {
                         tin = *new_in;
                         tout = *new_in + *len;
                         if let Some(r) = rows.iter().find(|r| r.track_id == *to_track) {
@@ -1689,7 +2038,7 @@ impl TimelineCanvas {
                         }
                     }
                     // The other selected clips follow the dragged one.
-                    Some(Drag::Move { .. }) if multi_move.is_some() && state.is_selected(clip.id) => {
+                    Some(Drag::Move { duplicate: false, .. }) if multi_move.is_some() && state.is_selected(clip.id) => {
                         let delta = multi_move.unwrap_or(0);
                         tin += delta;
                         tout += delta;
@@ -1820,6 +2169,42 @@ impl TimelineCanvas {
         }
         if let Some(lanes) = imp.ghost.get() {
             self.draw_ghost_lanes(s, &rows, lanes, w);
+        }
+        if let Some(Drag::Move { clip, from_track, orig_in, new_in, to_track, duplicate: true, .. }) = &dragging {
+            if *new_in != *orig_in || *to_track != *from_track {
+                let delta = *new_in - *orig_in;
+                let row_delta = rows
+                    .iter()
+                    .find(|r| r.track_id == *from_track)
+                    .zip(rows.iter().find(|r| r.track_id == *to_track))
+                    .map_or(0, |(f, t)| t.index as i32 - f.index as i32);
+                let moving = self.moving_with(*clip);
+                for r in &rows {
+                    let Some(tr) = timeline.find_track(r.track_id) else { continue };
+                    for c in &tr.clips {
+                        if !moving.contains(&c.id) {
+                            continue;
+                        }
+                        let target_row = if r.track_id == *from_track {
+                            rows.iter().find(|dst| dst.track_id == *to_track)
+                        } else if r.kind == rows.iter().find(|f| f.track_id == *from_track).map(|f| f.kind).unwrap_or(r.kind) && row_delta != 0 {
+                            rows.iter().find(|dst| dst.kind == r.kind && dst.index as i32 == r.index as i32 + row_delta)
+                        } else {
+                            Some(r)
+                        };
+                        let Some(dst) = target_row else { continue };
+                        let (x0, x1) = (self.x_of((c.timeline_in + delta).max(0)) as f32, self.x_of((c.timeline_out + delta).max(0)) as f32);
+                        let area = rect(x0.max(-8.0), dst.y + 1.0, (x1.min(w + 8.0) - x0.max(-8.0)).max(2.0), dst.h - 3.0);
+                        let fill = css_color(self, match c.clip_type {
+                            ClipType::Audio => "tempo_clip_audio",
+                            ClipType::Title => "tempo_clip_title",
+                            _ => "tempo_clip_video",
+                        });
+                        s.append_color(&gdk::RGBA::new(fill.red(), fill.green(), fill.blue(), 0.55), &area);
+                        s.append_border(&gsk::RoundedRect::from_rect(area, 3.0), &[2.0; 4], &[accent; 4]);
+                    }
+                }
+            }
         }
         if let Some(p) = imp.preview.get() {
             self.draw_drop_preview(s, &rows, p, w);
@@ -2041,7 +2426,7 @@ impl TimelineArea {
         timecode_box.append(&timecode_label);
         timecode_box.set_height_request(RULER_H as i32);
 
-        let header_rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).vexpand(true).build();
         let headers = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .width_request(150)
@@ -2050,6 +2435,50 @@ impl TimelineArea {
             .build();
         headers.append(&timecode_box);
         headers.append(&header_rows);
+
+        let header_menu: Rc<RefCell<Option<gtk::PopoverMenu>>> = Rc::new(RefCell::new(None));
+        let m = header_menu.clone();
+        headers.connect_unrealize(move |_| {
+            if let Some(old) = m.take() {
+                old.unparent();
+            }
+        });
+
+        // Track header context-menu actions.
+        let group = gio::SimpleActionGroup::new();
+        let add_video = gio::SimpleAction::new("add-video", None);
+        let s = state.clone();
+        add_video.connect_activate(move |_, _| {
+            let next = s
+                .with_timeline(|t| t.tracks.iter().filter(|tr| tr.kind == TrackKind::Video).map(|tr| tr.kind_index).max().unwrap_or(0) + 1)
+                .unwrap_or(1);
+            s.execute(Box::new(AddTrackCommand::new(Track::new(TrackKind::Video, next, format!("Video {next}"), 0))));
+        });
+        group.add_action(&add_video);
+
+        for (action_name, audio_type) in [("add-audio-stereo", AudioTrackType::Stereo), ("add-audio-mono", AudioTrackType::Mono)] {
+            let act = gio::SimpleAction::new(action_name, None);
+            let s = state.clone();
+            act.connect_activate(move |_, _| {
+                let next = s
+                    .with_timeline(|t| t.tracks.iter().filter(|tr| tr.kind == TrackKind::Audio).map(|tr| tr.kind_index).max().unwrap_or(0) + 1)
+                    .unwrap_or(1);
+                let mut track = Track::new(TrackKind::Audio, next, format!("Audio {next}"), 0);
+                track.audio_type = audio_type;
+                s.execute(Box::new(AddTrackCommand::new(track)));
+            });
+            group.add_action(&act);
+        }
+
+        let delete_track = gio::SimpleAction::new("delete", Some(glib::VariantTy::STRING));
+        let s = state.clone();
+        delete_track.connect_activate(move |_, target| {
+            if let Some(id) = target.and_then(|v| v.str()).and_then(|txt| Uuid::parse_str(txt).ok()) {
+                s.execute(Box::new(DeleteTrackCommand::new(id)));
+            }
+        });
+        group.add_action(&delete_track);
+        headers.insert_action_group("track", Some(&group));
 
         // The big timecode is the timeline's, also while a source clip is in the viewer.
         let s = state.clone();
@@ -2066,20 +2495,108 @@ impl TimelineArea {
         root.append(&right);
         root.append(&audio_meter(state));
 
+        let header_track_map: Rc<RefCell<Vec<(gtk::Box, Uuid)>>> = Rc::new(RefCell::new(Vec::new()));
         let s = state.clone();
         let rows_box = header_rows.clone();
-        let rebuild = move || build_headers(&s, &rows_box);
+        let rows_map = header_track_map.clone();
+        let rebuild = Rc::new(move || build_headers(&s, &rows_box, &rows_map));
         rebuild();
+        let rebuild_ev = rebuild.clone();
         let s = state.clone();
         state.connect(move |change| {
             if matches!(change, Change::Project | Change::Timeline | Change::Options) {
-                rebuild();
+                rebuild_ev();
             }
             // Switching timelines can leave the playhead at 0 -> 0, so no position event comes.
             if matches!(change, Change::Project | Change::Timeline) {
                 tc_on_switch.set_text(&s.position_tc(s.playhead_us()));
             }
         });
+        let rebuild_h = rebuild;
+        let rows_for_h = header_rows.clone();
+        canvas.connect_heights(move || {
+            rebuild_h();
+            rows_for_h.queue_resize();
+        });
+
+        // Shift+scroll on track headers adjusts track heights too.
+        let h_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let c_scroll = canvas.clone();
+        h_scroll.connect_scroll(move |ctl, dx, dy| {
+            if ctl.current_event_state().contains(gdk::ModifierType::SHIFT_MASK) {
+                let raw = if dy.abs() >= dx.abs() { dy } else { dx };
+                if raw != 0.0 {
+                    c_scroll.adjust_track_heights((-raw as f32) * 8.0);
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        header_rows.add_controller(h_scroll);
+
+        // Right-click on track headers / header column opens the track context menu.
+        let click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        let s = state.clone();
+        let h_rows = header_rows.clone();
+        let hdrs = headers.clone();
+        let rows_map = header_track_map;
+        let h_menu = header_menu;
+        let del_act = delete_track;
+        click.connect_pressed(move |gesture, _, x, y| {
+            if s.project.borrow().is_none() {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let pt_rows = graphene::Point::new(x as f32, y as f32);
+            let track_id = rows_map.borrow().iter().find_map(|(box_w, id)| {
+                box_w
+                    .compute_bounds(&h_rows)
+                    .filter(|b| {
+                        pt_rows.x() >= b.x()
+                            && pt_rows.x() < b.x() + b.width()
+                            && pt_rows.y() >= b.y()
+                            && pt_rows.y() < b.y() + b.height()
+                    })
+                    .map(|_| *id)
+            });
+            let can_delete = track_id
+                .and_then(|id| {
+                    s.with_timeline(|t| {
+                        t.find_track(id)
+                            .is_some_and(|tr| t.tracks.iter().filter(|o| o.kind == tr.kind).count() > 1)
+                    })
+                })
+                .unwrap_or(false);
+            del_act.set_enabled(can_delete);
+
+            let menu = gio::Menu::new();
+            let add_sec = gio::Menu::new();
+            add_sec.append(Some("Add Video Track"), Some("track.add-video"));
+            add_sec.append(Some("Add Audio Track (Stereo)"), Some("track.add-audio-stereo"));
+            add_sec.append(Some("Add Audio Track (Mono)"), Some("track.add-audio-mono"));
+            menu.append_section(None, &add_sec);
+
+            let del_sec = gio::Menu::new();
+            let del_item = gio::MenuItem::new(Some("Delete Track"), None);
+            let target_id = track_id.unwrap_or(Uuid::nil());
+            del_item.set_action_and_target_value(Some("track.delete"), Some(&target_id.to_string().to_variant()));
+            del_sec.append_item(&del_item);
+            menu.append_section(None, &del_sec);
+
+            if let Some(old) = h_menu.take() {
+                old.unparent();
+            }
+            let pt = h_rows.compute_point(&hdrs, &pt_rows).unwrap_or(pt_rows);
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&hdrs);
+            popover.set_has_arrow(false);
+            popover.set_halign(gtk::Align::Start);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(pt.x() as i32, pt.y() as i32, 1, 1)));
+            *h_menu.borrow_mut() = Some(popover.clone());
+            popover.popup();
+        });
+        header_rows.add_controller(click);
+
         // Ghost tracks get a header too while a clip is dragged toward them.
         canvas.connect_ghost(move |ghost| {
             let (video, audio) = ghost.unwrap_or_default();
@@ -2095,11 +2612,13 @@ impl TimelineArea {
     }
 }
 
-fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
+fn build_headers(state: &Rc<AppState>, container: &gtk::Box, track_map: &RefCell<Vec<(gtk::Box, Uuid)>>) {
+    track_map.borrow_mut().clear();
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
     let rows = state.with_timeline(rows).unwrap_or_default();
+    let audio_h = TRACK_HEIGHTS.with(|c| c.get().1);
     let next = |kind: TrackKind| rows.iter().filter(|r| r.kind == kind).map(|r| r.index).max().unwrap_or(0) + 1;
     let channels = state.with_timeline(|t| t.tracks.iter().find(|tr| tr.kind == TrackKind::Audio).map(|tr| tr.audio_type.label())).flatten().unwrap_or("2.0");
     let ghost_header = |class: &str, h: i32, text: String, extra: Option<&str>| {
@@ -2205,9 +2724,10 @@ fn build_headers(state: &Rc<AppState>, container: &gtk::Box) {
         // Controls sit left, as in Resolve, so Lock lines up on every row.
         header.append(&gtk::Box::builder().hexpand(true).build());
 
+        track_map.borrow_mut().push((header.clone(), row.track_id));
         container.append(&header);
     }
-    container.append(&ghost_header("audio", AUDIO_H as i32, format!("A{ghost_audio_n}"), Some(channels)));
+    container.append(&ghost_header("audio", audio_h as i32, format!("A{ghost_audio_n}"), Some(channels)));
 }
 
 /// Two bars showing the output level, left and right. Redrawn only when the level changes.
@@ -2340,5 +2860,19 @@ mod tests {
     fn marker_tip_has_timecode_over_name() {
         assert_eq!(marker_tip("00:00:01:00", "Intro"), "00:00:01:00\nIntro");
         assert_eq!(marker_tip("00:00:01:00", ""), "00:00:01:00");
+    }
+
+    #[test]
+    fn track_heights_clamp_and_update_rows() {
+        assert_eq!(adjust_track_height(60.0, -50.0), MIN_TRACK_H);
+        assert_eq!(adjust_track_height(60.0, 200.0), MAX_TRACK_H);
+        assert_eq!(adjust_track_height(60.0, 16.0), 76.0);
+
+        TRACK_HEIGHTS.with(|c| c.set((90.0, 80.0)));
+        let tl = Timeline::with_tracks("T", 1, 1);
+        let r = rows(&tl);
+        assert_eq!(r[0].h, 90.0);
+        assert_eq!(r[1].h, 80.0);
+        TRACK_HEIGHTS.with(|c| c.set((VIDEO_H, AUDIO_H)));
     }
 }
