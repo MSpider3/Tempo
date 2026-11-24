@@ -85,44 +85,337 @@ fn stored_marker_duration_us(typed_us: i64, floored_us: i64, fps: RationalFps) -
     if frame_count(typed_us, fps) <= 1 { 0 } else { floored_us }
 }
 
-pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject) + 'static) {
-    let name = gtk::Entry::builder().text("Untitled Project").activates_default(true).build();
+fn default_project_dir() -> PathBuf {
+    glib::user_special_dir(glib::UserDirectory::Videos)
+        .unwrap_or_else(|| glib::home_dir().join("Videos"))
+        .join("Tempo")
+}
+
+fn project_has_clips(project: &tempo_timeline::Project) -> bool {
+    std::iter::once(&project.timeline)
+        .chain(&project.timelines)
+        .any(|t| t.tracks.iter().any(|tr| !tr.clips.is_empty()))
+}
+
+fn shape_size_match(width: u32, height: u32) -> Option<(usize, usize)> {
+    for (si, &(_, (rw, rh))) in SHAPES.iter().enumerate() {
+        for (zi, &(_, short)) in SIZES.iter().enumerate() {
+            let expected = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
+            if expected == (width, height) {
+                return Some((si, zi));
+            }
+        }
+    }
+    None
+}
+
+pub fn new_project(parent: &impl IsA<gtk::Widget>, existing_names: Vec<String>, on_create: impl Fn(NewProject) + 'static) {
+    let default_name = crate::project_manager::next_default_project_name(&existing_names);
+    let name = gtk::Entry::builder().text(&default_name).activates_default(true).build();
     let shape = gtk::DropDown::from_strings(&SHAPES.map(|s| s.0));
     let size = gtk::DropDown::from_strings(&SIZES.map(|s| s.0));
     size.set_selected(1);
     let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
     rate.set_selected(rate_index(RationalFps::FPS_30));
 
+    let location = gtk::Entry::builder()
+        .text(&*default_project_dir().to_string_lossy())
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let browse = gtk::Button::with_label("Browse…");
+    let loc_entry = location.clone();
+    browse.connect_clicked(move |b| {
+        let chooser = gtk::FileDialog::builder().title("Project Location").modal(true).build();
+        let current = PathBuf::from(loc_entry.text().trim());
+        if !current.as_os_str().is_empty() {
+            chooser.set_initial_folder(Some(&gtk::gio::File::for_path(&current)));
+        }
+        let entry = loc_entry.clone();
+        chooser.select_folder(b.root().and_downcast::<gtk::Window>().as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let loc_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    loc_row.append(&location);
+    loc_row.append(&browse);
+
     let grid = form_grid();
     form_row(&grid, 0, "Name", &name);
     form_row(&grid, 1, "Shape", &shape);
     form_row(&grid, 2, "Resolution", &size);
     form_row(&grid, 3, "Frame rate", &rate);
+    form_row(&grid, 4, "Location", &loc_row);
+    grid.set_margin_start(24);
+    grid.set_margin_end(24);
+    grid.set_margin_top(12);
+    grid.set_margin_bottom(12);
 
-    let dialog = adw::AlertDialog::builder().heading("New Project").extra_child(&grid).build();
-    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-    dialog.set_default_response(Some("create"));
-    dialog.set_close_response("cancel");
-    dialog.connect_response(None, move |_, response| {
-        if response != "create" {
+    let cancel = gtk::Button::with_label("Cancel");
+    let create = gtk::Button::with_label("Create");
+    create.add_css_class("suggested-action");
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    let bar = gtk::Box::builder().spacing(8).margin_start(24).margin_end(24).margin_top(8).margin_bottom(12).build();
+    bar.append(&spacer);
+    bar.append(&cancel);
+    bar.append(&create);
+
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&grid));
+    view.add_bottom_bar(&bar);
+    let dialog = adw::Dialog::builder().title("New Project").child(&view).build();
+    dialog.set_default_widget(Some(&create));
+
+    let closer = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(d) = closer.upgrade() {
+            d.close();
+        }
+    });
+
+    let dialog_ref = dialog.downgrade();
+    let name_ref = name.clone();
+    create.connect_clicked(move |_| {
+        let typed = name_ref.text().trim().to_string();
+        let title = if typed.is_empty() { default_name.clone() } else { typed };
+        if crate::project_manager::is_duplicate_name(&existing_names, &title) {
+            let alert = adw::AlertDialog::builder()
+                .heading("Name Already Exists")
+                .body("A project with the same name is already in use.")
+                .build();
+            alert.add_responses(&[("ok", "OK")]);
+            alert.set_default_response(Some("ok"));
+            alert.set_close_response("ok");
+            let n = name_ref.clone();
+            alert.connect_response(None, move |_, _| {
+                n.grab_focus();
+                n.select_region(0, -1);
+            });
+            if let Some(d) = dialog_ref.upgrade() {
+                alert.present(Some(&d));
+            }
             return;
         }
-        let title = name.text().trim().to_string();
-        let title = if title.is_empty() { "Untitled Project".to_string() } else { title };
-        let (rw, rh) = SHAPES[shape.selected() as usize].1;
-        let short = SIZES[size.selected() as usize].1;
+        let (rw, rh) = SHAPES.get(shape.selected() as usize).unwrap_or(&SHAPES[0]).1;
+        let short = SIZES.get(size.selected() as usize).unwrap_or(&SIZES[1]).1;
         // The chosen size is the short side; the long side follows the shape.
         let (width, height) = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
-        let dir = glib::user_special_dir(glib::UserDirectory::Videos).unwrap_or_else(glib::home_dir).join("Tempo");
+        let loc_text = location.text().trim().to_string();
+        let dir = if loc_text.is_empty() { default_project_dir() } else { PathBuf::from(loc_text) };
         let safe: String = title.chars().map(|c| if c == '/' || c == '\0' { '_' } else { c }).collect();
-        // Never overwrite an existing project of the same name.
-        let mut path = dir.join(format!("{safe}.tempo"));
-        let mut n = 2;
-        while path.exists() {
-            path = dir.join(format!("{safe} {n}.tempo"));
-            n += 1;
+        let path = dir.join(format!("{safe}.tempo"));
+        let fps = RATES.get(rate.selected() as usize).unwrap_or(&RATES[4]).1;
+        if let Some(d) = dialog_ref.upgrade() {
+            d.close();
         }
-        on_create(NewProject { name: title, width, height, fps: RATES[rate.selected() as usize].1, path });
+        on_create(NewProject { name: title, width, height, fps, path });
+    });
+
+    dialog.present(Some(parent));
+    name.grab_focus();
+    name.select_region(0, -1);
+}
+
+/// Choose a new `.tempo` path for Save Project As.
+pub fn save_project_as(
+    parent: &impl IsA<gtk::Window>,
+    current_path: Option<&std::path::Path>,
+    current_name: &str,
+    on_choose: impl Fn(PathBuf) + 'static,
+) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Tempo projects"));
+    filter.add_pattern("*.tempo");
+    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    let safe_stem: String = current_name.chars().map(|c| if c == '/' || c == '\0' { '_' } else { c }).collect();
+    let initial_name = if safe_stem.trim().is_empty() {
+        "Untitled Project.tempo".to_string()
+    } else {
+        format!("{safe_stem}.tempo")
+    };
+    let mut builder = gtk::FileDialog::builder()
+        .title("Save Project As")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&filter)
+        .initial_name(&initial_name);
+    if let Some(dir) = current_path.and_then(|p| p.parent()) {
+        builder = builder.initial_folder(&gtk::gio::File::for_path(dir));
+    }
+    let dialog = builder.build();
+    dialog.save(Some(parent.as_ref()), gtk::gio::Cancellable::NONE, move |result| {
+        if let Some(mut path) = result.ok().and_then(|f| f.path()) {
+            if path.extension().is_none() {
+                path.set_extension("tempo");
+            }
+            on_choose(path);
+        }
+    });
+}
+
+/// Project Settings (Shift+9): resolution, frame rate (locked when clips exist), proxy folder.
+pub fn project_settings(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let Some((cur_w, cur_h, cur_fps, cur_proxy_dir, has_clips)) =
+        state.with_project(|p| (p.width, p.height, p.fps, p.proxy_dir.clone(), project_has_clips(p)))
+    else {
+        return;
+    };
+
+    let shape = gtk::DropDown::from_strings(&["Landscape 16:9", "Vertical 9:16", "Square 1:1", "Custom"]);
+    let size = gtk::DropDown::from_strings(&SIZES.map(|s| s.0));
+    let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    width.set_value(cur_w as f64);
+    let height = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    height.set_value(cur_h as f64);
+
+    if let Some((si, zi)) = shape_size_match(cur_w, cur_h) {
+        shape.set_selected(si as u32);
+        size.set_selected(zi as u32);
+    } else {
+        shape.set_selected(3);
+        size.set_selected(1);
+        size.set_sensitive(false);
+    }
+
+    let syncing = Rc::new(std::cell::Cell::new(false));
+    let apply_preset = {
+        let (shape, size, width, height, syncing) = (shape.clone(), size.clone(), width.clone(), height.clone(), syncing.clone());
+        move || {
+            if syncing.get() {
+                return;
+            }
+            let si = shape.selected() as usize;
+            let custom = si >= SHAPES.len();
+            size.set_sensitive(!custom);
+            if custom {
+                return;
+            }
+            let (rw, rh) = SHAPES[si].1;
+            let short = SIZES.get(size.selected() as usize).unwrap_or(&SIZES[1]).1;
+            let (w, h) = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
+            syncing.set(true);
+            width.set_value(w as f64);
+            height.set_value(h as f64);
+            syncing.set(false);
+        }
+    };
+    let ap = apply_preset.clone();
+    shape.connect_selected_notify(move |_| ap());
+    let ap = apply_preset.clone();
+    size.connect_selected_notify(move |_| ap());
+
+    let on_dim = {
+        let (shape, size, width, height, syncing) = (shape.clone(), size.clone(), width.clone(), height.clone(), syncing.clone());
+        move || {
+            if syncing.get() {
+                return;
+            }
+            syncing.set(true);
+            let (w, h) = (width.value_as_int().max(16) as u32, height.value_as_int().max(16) as u32);
+            if let Some((si, zi)) = shape_size_match(w, h) {
+                shape.set_selected(si as u32);
+                size.set_selected(zi as u32);
+                size.set_sensitive(true);
+            } else {
+                shape.set_selected(3);
+                size.set_sensitive(false);
+            }
+            syncing.set(false);
+        }
+    };
+    let od = on_dim.clone();
+    width.connect_value_changed(move |_| od());
+    height.connect_value_changed(move |_| on_dim());
+
+    let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
+    rate.set_selected(rate_index(cur_fps));
+    if has_clips {
+        rate.set_sensitive(false);
+    }
+
+    let proxy_entry = gtk::Entry::builder()
+        .text(&*cur_proxy_dir.to_string_lossy())
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let browse = gtk::Button::with_label("Browse…");
+    let pe = proxy_entry.clone();
+    browse.connect_clicked(move |b| {
+        let chooser = gtk::FileDialog::builder().title("Proxy Folder").modal(true).build();
+        let current = PathBuf::from(pe.text().trim());
+        if !current.as_os_str().is_empty() {
+            chooser.set_initial_folder(Some(&gtk::gio::File::for_path(&current)));
+        }
+        let entry = pe.clone();
+        chooser.select_folder(b.root().and_downcast::<gtk::Window>().as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let proxy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    proxy_row.append(&proxy_entry);
+    proxy_row.append(&browse);
+
+    let grid = form_grid();
+    let mut row = 0;
+    form_row(&grid, row, "Shape", &shape);
+    row += 1;
+    form_row(&grid, row, "Resolution", &size);
+    row += 1;
+    form_row(&grid, row, "Width", &width);
+    row += 1;
+    form_row(&grid, row, "Height", &height);
+    row += 1;
+    form_row(&grid, row, "Frame rate", &rate);
+    row += 1;
+    if has_clips {
+        let note = label("Cannot be changed once clips are on the timeline", &["tempo-dim", "tempo-small"]);
+        note.set_xalign(0.0);
+        grid.attach(&note, 1, row, 1, 1);
+        row += 1;
+    }
+    form_row(&grid, row, "Proxy folder", &proxy_row);
+
+    let dialog = adw::AlertDialog::builder().heading("Project Settings").extra_child(&grid).build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Apply")]);
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let state = state.clone();
+    dialog.connect_response(Some("apply"), move |_, _| {
+        let w = (width.value_as_int().max(16) as u32) & !1;
+        let h = (height.value_as_int().max(16) as u32) & !1;
+        let chosen_fps = RATES.get(rate.selected() as usize).unwrap_or(&RATES[4]).1;
+        let proxy_text = proxy_entry.text().trim().to_string();
+        let updated = if let Some(p) = state.project.borrow_mut().as_mut() {
+            let locked = project_has_clips(p);
+            let new_proxy = if proxy_text.is_empty() {
+                p.proxy_dir.clone()
+            } else {
+                PathBuf::from(proxy_text)
+            };
+            let changed = (p.width, p.height) != (w, h) || (!locked && p.fps != chosen_fps) || p.proxy_dir != new_proxy;
+            p.width = w;
+            p.height = h;
+            if !locked {
+                p.fps = chosen_fps;
+            }
+            p.proxy_dir = new_proxy;
+            changed
+        } else {
+            false
+        };
+        if updated {
+            state.sync_player();
+            state.set_dirty(true);
+            state.emit(crate::state::Change::Project);
+        }
     });
     dialog.present(Some(parent));
 }

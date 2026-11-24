@@ -92,6 +92,8 @@ impl MainWindow {
         file.append(Some("Import Media…"), Some("win.import-media"));
         file.append(Some("Relink Missing Media…"), Some("win.relink-media"));
         file.append(Some("Save"), Some("win.save"));
+        file.append(Some("Save As…"), Some("win.save-as"));
+        file.append(Some("Project Settings…"), Some("win.project-settings"));
         menu.append_section(None, &file);
         let edit_menu = gio::Menu::new();
         edit_menu.append(Some("Undo"), Some("win.undo"));
@@ -151,7 +153,8 @@ impl MainWindow {
         left.append(&logo_box);
         left.append(&activity);
         let home = tool_button("go-home-symbolic", "Project Manager (Shift+1)");
-        home.set_margin_end(8);
+        let settings_btn = tool_button("emblem-system-symbolic", "Project Settings (Shift+9)");
+        settings_btn.set_margin_end(8);
         // Shortcut hints for what is under the pointer, from the keybind table.
         let hint = label("", &["tempo-small", "tempo-dim"]);
         hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -159,9 +162,10 @@ impl MainWindow {
         // Takes the free space beside the page switcher without pushing it off centre.
         hint.set_max_width_chars(8);
         hint.set_hexpand(true);
-        let right = gtk::Box::builder().spacing(14).margin_start(24).build();
+        let right = gtk::Box::builder().spacing(6).margin_start(24).build();
         right.append(&hint);
         right.append(&home);
+        right.append(&settings_btn);
         let binds = crate::keybinds::load();
         let shown = Cell::new(None);
         *state.show_hint.borrow_mut() = Some(Rc::new(move |zone| {
@@ -263,7 +267,7 @@ impl MainWindow {
         win.root.add_named(&manager.root, Some("projects"));
         *win.manager.borrow_mut() = Some(manager);
 
-        win.connect_signals(&home, &quick_export);
+        win.connect_signals(&home, &settings_btn, &quick_export);
         win.install_actions();
         let w = win.clone();
         keybinds::install(&win.window, move |action| {
@@ -279,7 +283,7 @@ impl MainWindow {
         win
     }
 
-    fn connect_signals(self: &Rc<Self>, home: &gtk::Button, quick_export: &gtk::Button) {
+    fn connect_signals(self: &Rc<Self>, home: &gtk::Button, settings_btn: &gtk::Button, quick_export: &gtk::Button) {
         let w = self.clone();
         self.panel_buttons[0].connect_toggled(move |b| w.edit.set_media_pool_open(b.is_active()));
         let w = self.clone();
@@ -302,6 +306,8 @@ impl MainWindow {
 
         let w = self.clone();
         home.connect_clicked(move |_| w.run_action("app.project-manager"));
+        let w = self.clone();
+        settings_btn.connect_clicked(move |_| w.run_action("win.project-settings"));
         let w = self.clone();
         quick_export.connect_clicked(move |_| w.run_action("win.quick-export"));
 
@@ -397,11 +403,11 @@ impl MainWindow {
         self.plugins.connect_changed(move || w.refresh_plugin_menu());
         self.refresh_plugin_menu();
 
-        for name in ["import-media", "relink-media", "save", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
+        for name in ["import-media", "relink-media", "save", "save-as", "project-settings", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
-                "save" | "quit" | "preferences" => format!("app.{name}"),
+                "save" | "save-as" | "quit" | "preferences" => format!("app.{name}"),
                 _ => format!("win.{name}"),
             };
             action.connect_activate(move |_, _| w.run_action(&full));
@@ -472,26 +478,46 @@ impl MainWindow {
 
     fn new_project(self: &Rc<Self>) {
         let w = self.clone();
-        dialogs::new_project(&self.window, move |np| {
-            let w = w.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let path = np.path.clone();
-                let created = gio::spawn_blocking(move || -> Result<Project, String> {
-                    if let Some(dir) = np.path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        glib::MainContext::default().spawn_local(async move {
+            let existing_names = gio::spawn_blocking(|| {
+                project_manager::load_list().into_iter().map(|e| e.name).collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let w2 = w.clone();
+            dialogs::new_project(&w.window, existing_names, move |np| {
+                let w = w2.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let created = gio::spawn_blocking(move || -> Result<(Project, PathBuf), String> {
+                        let mut target_path = np.path.clone();
+                        if let Some(dir) = target_path.parent().map(std::path::Path::to_path_buf) {
+                            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                            if target_path.exists() {
+                                let stem = target_path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "Project".into());
+                                let mut n = 2;
+                                while target_path.exists() {
+                                    target_path = dir.join(format!("{stem} {n}.tempo"));
+                                    n += 1;
+                                }
+                            }
+                        }
+                        let mut project =
+                            tempo_project::create_new_project(&np.name, np.width, np.height, np.fps, &target_path)
+                                .map_err(|e| e.to_string())?;
+                        project.proxy_dir = glib::user_cache_dir().join("tempo").join("proxies");
+                        project_manager::remember(&project.name, &target_path);
+                        Ok((project, target_path))
+                    })
+                    .await;
+                    match created {
+                        Ok(Ok((project, path))) => w.enter_project(project, path),
+                        Ok(Err(e)) => w.state.message(format!("Could not create the project: {e}")),
+                        Err(_) => w.state.message("Could not create the project."),
                     }
-                    let mut project =
-                        tempo_project::create_new_project(&np.name, np.width, np.height, np.fps, &np.path).map_err(|e| e.to_string())?;
-                    project.proxy_dir = glib::user_cache_dir().join("tempo").join("proxies");
-                    project_manager::remember(&project.name, &np.path);
-                    Ok(project)
-                })
-                .await;
-                match created {
-                    Ok(Ok(project)) => w.enter_project(project, path),
-                    Ok(Err(e)) => w.state.message(format!("Could not create the project: {e}")),
-                    Err(_) => w.state.message("Could not create the project."),
-                }
+                });
             });
         });
     }
@@ -596,6 +622,50 @@ impl MainWindow {
         self.save_then(false, then);
     }
 
+    /// Save the open project to a chosen path (`Ctrl+Shift+S`).
+    fn save_as(self: &Rc<Self>) {
+        let current_path = self.state.path.borrow().clone();
+        let Some(current_name) = self.state.with_project(|p| p.name.clone()) else { return };
+        let w = self.clone();
+        dialogs::save_project_as(&self.window, current_path.as_deref(), &current_name, move |new_path| {
+            let Some(mut project) = w.state.project.borrow().clone() else { return };
+            if let Some(stem) = new_path.file_stem().map(|s| s.to_string_lossy().trim().to_string()).filter(|s| !s.is_empty()) {
+                if stem != project.name {
+                    project.name = stem;
+                }
+            }
+            let saved_name = project.name.clone();
+            let w2 = w.clone();
+            let path_for_state = new_path.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let res = gio::spawn_blocking(move || -> Result<(), String> {
+                    if let Some(dir) = new_path.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    }
+                    tempo_project::save_project(&project, &new_path).map_err(|e| e.to_string())?;
+                    tempo_project::remove_autosave(&new_path);
+                    project_manager::remember(&project.name, &new_path);
+                    project_manager::save_project_thumbnail(&project);
+                    Ok(())
+                })
+                .await;
+                match res {
+                    Ok(Ok(())) => {
+                        *w2.state.path.borrow_mut() = Some(path_for_state);
+                        if let Some(p) = w2.state.project.borrow_mut().as_mut() {
+                            p.name = saved_name;
+                        }
+                        w2.state.set_dirty(false);
+                        w2.state.emit(Change::Project);
+                        w2.flash_activity("Saved");
+                    }
+                    Ok(Err(e)) => w2.state.message(format!("Could not save: {e}")),
+                    Err(_) => w2.state.message("Could not save: the save stopped unexpectedly"),
+                }
+            });
+        });
+    }
+
     /// Save, then do `then`. With `leaving` (closing the window or the project),
     /// a failed save asks whether to leave anyway instead of trapping the user
     /// in a project that cannot be written.
@@ -610,6 +680,7 @@ impl MainWindow {
                 let saved = tempo_project::save_project(&project, &path);
                 if saved.is_ok() {
                     tempo_project::remove_autosave(&path);
+                    project_manager::save_project_thumbnail(&project);
                 }
                 saved
             })
@@ -1184,7 +1255,9 @@ impl MainWindow {
             }
             "win.page-edit" => self.page_buttons[0].set_active(true),
             "win.page-export" => self.page_buttons[1].set_active(true),
+            "win.project-settings" => dialogs::project_settings(&self.window, state),
             "app.save" => self.save(|| {}),
+            "app.save-as" => self.save_as(),
             // Only where the timeline can be seen: an undo nobody sees is a surprise later.
             "win.undo" if on_edit => state.undo(),
             "win.redo" if on_edit => state.redo(),

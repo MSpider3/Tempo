@@ -855,6 +855,18 @@
    "resolve": "workspacePrimaryWorkspaceDeliver"
   },
   {
+   "group": "Pages",
+   "action": "win.project-settings",
+   "keys": [
+    "<Shift>9"
+   ],
+   "alt": [
+    "parenleft"
+   ],
+   "label": "Project Settings",
+   "resolve": "fileProjectSettings"
+  },
+  {
    "group": "File",
    "action": "app.save",
    "keys": [
@@ -863,6 +875,16 @@
    "alt": [],
    "label": "Save Project",
    "resolve": "fileSaveProject"
+  },
+  {
+   "group": "File",
+   "action": "app.save-as",
+   "keys": [
+    "<Primary><Shift>s"
+   ],
+   "alt": [],
+   "label": "Save Project As",
+   "resolve": "fileSaveProjectAs"
   },
   {
    "group": "File",
