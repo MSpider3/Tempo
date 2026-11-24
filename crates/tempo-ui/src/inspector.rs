@@ -143,9 +143,9 @@ impl Inspector {
                     if let Some(graph) = descendant_with_class(i.body.upcast_ref(), crate::keybinds::OWNS_DELETE_KEYS) {
                         graph.grab_focus();
                     }
-                } else if in_body {
+                } else if in_body || prev_focus.is_none() {
                     // Prevent GTK from falling back onto the first text entry when a focused
-                    // toggle/button in the rebuilt body is removed, which would hijack Ctrl+Z.
+                    // widget in the rebuilt body is removed (or when focus was unset), which would hijack Ctrl+Z.
                     if let Some(win) = i.root.root().and_downcast::<gtk::Window>() {
                         gtk::prelude::GtkWindowExt::set_focus(&win, None::<&gtk::Widget>);
                     }
