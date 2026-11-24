@@ -144,7 +144,11 @@ enum Cmd {
     /// Move the timeline playhead, even while a source clip is being shown.
     SeekTimeline(i64),
     Play(f64),
+    PlayRange { speed: f64, start_us: i64, end_us: i64 },
     Pause,
+    SetLoop(bool),
+    SetLoopRange(Option<i64>, Option<i64>),
+    SetScrubAudio(bool),
     MaxHeight(u32),
     Quit,
 }
@@ -157,6 +161,8 @@ struct Shared {
     /// Where the timeline playhead is. Differs from `position_us` while a
     /// source clip is shown, which has a position of its own.
     timeline_position_us: AtomicI64,
+    /// Position where the last playback started, for Play Again (Alt+L).
+    last_play_start_us: AtomicI64,
     showing_source: AtomicBool,
     duration_us: AtomicI64,
     playing: AtomicBool,
@@ -239,6 +245,32 @@ impl Player {
         self.send(Cmd::Play(speed));
     }
 
+    pub fn play_range(&self, speed: f64, start_us: i64, end_us: i64) {
+        self.send(Cmd::PlayRange { speed, start_us, end_us });
+    }
+
+    pub fn last_play_start_us(&self) -> i64 {
+        self.shared.last_play_start_us.load(Ordering::Acquire)
+    }
+
+    pub fn play_again(&self) {
+        let start = self.last_play_start_us().max(0);
+        self.seek(start, true);
+        self.play(1.0);
+    }
+
+    pub fn set_looping(&self, on: bool) {
+        self.send(Cmd::SetLoop(on));
+    }
+
+    pub fn set_loop_range(&self, in_us: Option<i64>, out_us: Option<i64>) {
+        self.send(Cmd::SetLoopRange(in_us, out_us));
+    }
+
+    pub fn set_scrub_audio(&self, on: bool) {
+        self.send(Cmd::SetScrubAudio(on));
+    }
+
     pub fn pause(&self) {
         self.send(Cmd::Pause);
     }
@@ -301,6 +333,10 @@ struct Worker {
     max_height: u32,
     playing: bool,
     speed: f64,
+    looping: bool,
+    loop_range: (Option<i64>, Option<i64>),
+    play_range: Option<(i64, i64)>,
+    scrub_audio: bool,
     clock_start: Instant,
     clock_base_us: i64,
     pos_us: i64,
@@ -376,6 +412,10 @@ impl Worker {
             max_height: 540,
             playing: false,
             speed: 1.0,
+            looping: false,
+            loop_range: (None, None),
+            play_range: None,
+            scrub_audio: false,
             clock_start: Instant::now(),
             clock_base_us: 0,
             pos_us: 0,
@@ -482,6 +522,8 @@ impl Worker {
                 }
                 self.pos_us = if s.is_some() { 0 } else { self.timeline_pos };
                 self.source = s;
+                self.play_range = None;
+                self.shared.last_play_start_us.store(self.pos_us, Ordering::Release);
                 self.set_playing(false);
                 self.sync_audio();
                 self.exact = true;
@@ -492,15 +534,21 @@ impl Worker {
                 if exact {
                     self.set_degraded(false);
                 }
+                let prev = self.pos_us;
+                self.play_range = None;
                 self.pos_us = us;
                 self.exact = exact;
                 self.dirty = true;
                 self.sync_audio();
+                if !self.playing && self.scrub_audio && us != prev && self.audio.is_some() {
+                    let _ = self.feeder.send(Feed::Scrub { snapshot: self.active(), pos_us: us });
+                }
             }
             Cmd::SeekTimeline(us) => {
                 if self.source.is_some() {
                     self.timeline_pos = us;
                 } else {
+                    self.play_range = None;
                     self.pos_us = us;
                     self.exact = true;
                     self.dirty = true;
@@ -508,16 +556,48 @@ impl Worker {
                 }
             }
             Cmd::Play(speed) => {
+                if !self.playing {
+                    self.shared.last_play_start_us.store(self.pos_us, Ordering::Release);
+                }
+                self.play_range = None;
                 self.speed = speed;
                 self.exact = speed > 0.0 && speed <= 2.0;
                 self.set_playing(true);
                 self.sync_audio();
             }
+            Cmd::PlayRange { speed, start_us, end_us } => {
+                let dur = self.active().duration_us.max(0);
+                let start = start_us.clamp(0, dur);
+                let end = end_us.clamp(0, dur);
+                if end > start {
+                    self.shared.last_play_start_us.store(start, Ordering::Release);
+                    self.pos_us = start;
+                    self.shared.position_us.store(start, Ordering::Release);
+                    if self.source.is_none() {
+                        self.shared.timeline_position_us.store(start, Ordering::Release);
+                    }
+                    self.play_range = Some((start, end));
+                    self.speed = speed;
+                    self.exact = speed > 0.0 && speed <= 2.0;
+                    self.set_playing(true);
+                    self.sync_audio();
+                }
+            }
             Cmd::Pause => {
+                self.play_range = None;
                 self.set_playing(false);
                 self.sync_audio();
                 self.exact = true;
                 self.dirty = true;
+            }
+            Cmd::SetLoop(on) => {
+                self.looping = on;
+            }
+            Cmd::SetLoopRange(in_us, out_us) => {
+                self.loop_range = (in_us, out_us);
+            }
+            Cmd::SetScrubAudio(on) => {
+                self.scrub_audio = on;
             }
             Cmd::MaxHeight(h) => {
                 self.max_height = h;
@@ -588,13 +668,22 @@ impl Worker {
                         self.clock_base_us + (elapsed * self.speed) as i64
                     }
                 };
-                // Stop at the end going forward, or at the start going backward.
-                let ended = (self.speed > 0.0 && pos >= snap.duration_us) || (self.speed < 0.0 && pos <= 0);
+                // Loop or stop at the active bounds (In..Out or PlayRange, else 0..duration).
+                let (lo, hi) = playback_bounds(snap.duration_us, self.looping, self.loop_range, self.play_range);
+                let ended = (self.speed > 0.0 && pos >= hi) || (self.speed < 0.0 && pos <= lo);
                 if ended {
-                    self.pos_us = pos.clamp(0, snap.duration_us.max(0));
-                    self.set_playing(false);
-                    self.sync_audio();
-                    self.exact = true;
+                    if self.looping && hi > lo {
+                        self.pos_us = if self.speed > 0.0 { lo } else { hi };
+                        self.restart_clock();
+                        self.sync_audio();
+                        self.dirty = true;
+                    } else {
+                        self.pos_us = pos.clamp(lo, hi.max(lo));
+                        self.play_range = None;
+                        self.set_playing(false);
+                        self.sync_audio();
+                        self.exact = true;
+                    }
                 } else {
                     self.pos_us = pos;
                 }
@@ -723,8 +812,31 @@ impl Worker {
 
 // ---- Sound --------------------------------------------------------------------
 
+/// Active playback bounds `(start_us, end_us)` for looping or ranged playback.
+fn playback_bounds(duration_us: i64, looping: bool, loop_range: (Option<i64>, Option<i64>), play_range: Option<(i64, i64)>) -> (i64, i64) {
+    let dur = duration_us.max(0);
+    if let Some((a, b)) = play_range {
+        let lo = a.clamp(0, dur);
+        let hi = b.clamp(0, dur);
+        if hi > lo {
+            return (lo, hi);
+        }
+    }
+    if looping {
+        if let (Some(a), Some(b)) = loop_range {
+            let lo = a.clamp(0, dur);
+            let hi = b.clamp(0, dur);
+            if hi > lo {
+                return (lo, hi);
+            }
+        }
+    }
+    (0, dur)
+}
+
 enum Feed {
     Start { snapshot: Arc<Snapshot>, pos_us: i64 },
+    Scrub { snapshot: Arc<Snapshot>, pos_us: i64 },
     Stop,
     Quit,
 }
@@ -794,6 +906,17 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
                 job = Some((snapshot, pos_us));
                 continue;
             }
+            Some(Feed::Scrub { snapshot, mut pos_us }) => {
+                readers.retain(|(id, path, _)| snapshot.sources.get(id) == Some(path) || snapshot.audio_sources.get(id) == Some(path));
+                if !out.clear_pending() && out.queued_frames() < FEED_FRAMES * 4 {
+                    for _ in 0..3 {
+                        mix_audio_block(&snapshot, &mut readers, pos_us, &mut mix, &mut part, &mut source);
+                        out.push(&mix);
+                        pos_us += (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+                    }
+                }
+                continue;
+            }
             Some(Feed::Stop) => {
                 job = None;
                 continue;
@@ -807,38 +930,49 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             continue;
         }
 
-        mix.fill(0.0);
-        for (clips, track_volume, mono) in &snapshot.audio {
-            let Some(clip) = clips.iter().find(|c| c.contains_point(*pos_us)) else { continue };
-            if clip.properties.muted || !clip.properties.enabled {
-                continue;
-            }
-            let original = snapshot.audio_sources.get(&clip.source_id);
-            let Some(preferred) = snapshot.sources.get(&clip.source_id).or(original) else { continue };
-            let Some(reader) = reader_for(&mut readers, clip.source_id, preferred, original) else { continue };
-            let speed = clip.properties.speed;
-            if speed == 1.0 {
-                reader.read(clip.source_offset_at(*pos_us), &mut part);
-            } else {
-                let frames = source_frames(clip, *pos_us).min(source.len() / OUT_CHANNELS);
-                let block = &mut source[..frames * OUT_CHANNELS];
-                reader.read(clip.source_offset_at(*pos_us), block);
-                stretch(block, &mut part);
-            }
-            let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(*pos_us) * tempo_export::audio_mix::AudioStrips::gain(&snapshot.ramps, clip, *pos_us);
-            let pan = clip.properties.pan.clamp(-1.0, 1.0);
-            let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
-            for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
-                let (l, r) = if *mono { let c = (p[0] + p[1]) * 0.5; (c, c) } else { (p[0], p[1]) };
-                m[0] += l * left;
-                m[1] += r * right;
-            }
-        }
-        for sample in &mut mix {
-            *sample = sample.clamp(-1.0, 1.0);
-        }
+        mix_audio_block(snapshot, &mut readers, *pos_us, &mut mix, &mut part, &mut source);
         out.push(&mix);
         *pos_us += (FEED_FRAMES as i64 * 1_000_000) / OUT_RATE as i64;
+    }
+}
+
+fn mix_audio_block(
+    snapshot: &Snapshot,
+    readers: &mut Vec<(Uuid, PathBuf, AudioReader)>,
+    pos_us: i64,
+    mix: &mut [f32],
+    part: &mut [f32],
+    source: &mut [f32],
+) {
+    mix.fill(0.0);
+    for (clips, track_volume, mono) in &snapshot.audio {
+        let Some(clip) = clips.iter().find(|c| c.contains_point(pos_us)) else { continue };
+        if clip.properties.muted || !clip.properties.enabled {
+            continue;
+        }
+        let original = snapshot.audio_sources.get(&clip.source_id);
+        let Some(preferred) = snapshot.sources.get(&clip.source_id).or(original) else { continue };
+        let Some(reader) = reader_for(readers, clip.source_id, preferred, original) else { continue };
+        let speed = clip.properties.speed;
+        if speed == 1.0 {
+            reader.read(clip.source_offset_at(pos_us), part);
+        } else {
+            let frames = source_frames(clip, pos_us).min(source.len() / OUT_CHANNELS);
+            let block = &mut source[..frames * OUT_CHANNELS];
+            reader.read(clip.source_offset_at(pos_us), block);
+            stretch(block, part);
+        }
+        let volume = clip.properties.volume.max(0.0) * track_volume.max(0.0) * clip.fade_factor(pos_us) * tempo_export::audio_mix::AudioStrips::gain(&snapshot.ramps, clip, pos_us);
+        let pan = clip.properties.pan.clamp(-1.0, 1.0);
+        let (left, right) = (volume * (1.0 - pan.max(0.0)), volume * (1.0 + pan.min(0.0)));
+        for (m, p) in mix.chunks_exact_mut(2).zip(part.chunks_exact(2)) {
+            let (l, r) = if *mono { let c = (p[0] + p[1]) * 0.5; (c, c) } else { (p[0], p[1]) };
+            m[0] += l * left;
+            m[1] += r * right;
+        }
+    }
+    for sample in mix.iter_mut() {
+        *sample = sample.clamp(-1.0, 1.0);
     }
 }
 
@@ -993,6 +1127,21 @@ mod tests {
         for fps in [RationalFps::FPS_24, RationalFps::FPS_30, RationalFps::FPS_60] {
             assert_eq!(source_request_us(&c, 110_000, fps), 2_000_000);
         }
+    }
+
+    #[test]
+    fn playback_bounds_respects_play_range_and_loop_in_out() {
+        let s = 1_000_000;
+        // Normal playback runs 0..dur even with marks set.
+        assert_eq!(playback_bounds(10 * s, false, (Some(2 * s), Some(5 * s)), None), (0, 10 * s));
+        // Loop with both In and Out loops In..Out.
+        assert_eq!(playback_bounds(10 * s, true, (Some(2 * s), Some(5 * s)), None), (2 * s, 5 * s));
+        // Loop with only one mark or invalid Out <= In falls back to 0..dur.
+        assert_eq!(playback_bounds(10 * s, true, (Some(2 * s), None), None), (0, 10 * s));
+        assert_eq!(playback_bounds(10 * s, true, (Some(5 * s), Some(2 * s)), None), (0, 10 * s));
+        // PlayRange overrides both looping and non-looping bounds.
+        assert_eq!(playback_bounds(10 * s, false, (None, None), Some((3 * s, 7 * s))), (3 * s, 7 * s));
+        assert_eq!(playback_bounds(10 * s, true, (Some(s), Some(2 * s)), Some((3 * s, 7 * s))), (3 * s, 7 * s));
     }
 
     #[test]

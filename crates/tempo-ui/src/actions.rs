@@ -7,9 +7,9 @@ use std::rc::Rc;
 use tempo_timeline::{
     frame_to_us, us_to_frame, AddMarkerCommand, Clip, ClipType, Command, CompositeCommand, DeleteClipCommand, DeleteMarkerCommand,
     ClipEffect, EditClipCommand, EditKind, EditTarget, InsertClipCommand, Marker, MarkerColor, MediaSource, MediaType, MoveClipCommand,
-    OverwriteClipCommand, PropertyChange, RationalFps, ReplaceClipCommand, SetClipPropertyCommand, SetTransitionCommand, SplitClipCommand,
-    TitleData, TitleType, Timeline, Track, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind, TrimClipCommand,
-    TrimEdge, RippleTrimCommand,
+    OverwriteClipCommand, PropertyChange, RationalFps, ReplaceClipCommand, SetClipPropertyCommand, SetTrackFlagCommand, SetTransitionCommand,
+    SplitClipCommand, TitleData, TitleType, Timeline, Track, TrackFlag, TrackKind, Transition, TransitionAlignment, TransitionEdge, TransitionKind,
+    TrimClipCommand, TrimEdge, RippleTrimCommand,
 };
 use uuid::Uuid;
 
@@ -612,6 +612,14 @@ fn add_transitions(state: &Rc<AppState>, video: Option<TransitionKind>, audio: b
             kind.map(|k| (track_id, position, k))
         })
         .collect();
+    if wanted.is_empty() {
+        state.message(if audio && video.is_none() {
+            "Audio transitions go on audio tracks."
+        } else {
+            "Video transitions go on video tracks."
+        });
+        return;
+    }
     let length = state.standard_transition_us();
     let Some((placed, why)) = state.with_project(|p| fill_edits(&p.timeline, &p.sources, p.timeline_fps(), &wanted, length)) else { return };
     if placed.is_empty() {
@@ -687,23 +695,17 @@ pub fn copy_selected(state: &Rc<AppState>, cut: bool) {
     }
 }
 
-/// Paste the copied clips at the playhead. One clip goes to the destination
-/// track of its kind; several keep their own tracks and their spacing, and a
-/// picture stays linked to its sound.
-pub fn paste(state: &Rc<AppState>) {
-    let copied = state.clipboard.borrow().clone();
-    if copied.is_empty() {
-        state.message("Nothing to paste: copy a clip first (Ctrl+C).");
-        return;
-    }
-    let at = state.frame_floor(state.playhead_us());
+/// Build pasted copies of `copied` starting at `at`, keeping multi-track offsets or
+/// routing single / linked clips to the current destination tracks.
+fn prepare_pasted_clips(state: &AppState, copied: &[Clip], at: i64) -> Vec<Clip> {
     let earliest = copied.iter().map(|c| c.timeline_in).min().unwrap_or(0);
     let kinds: std::collections::HashSet<bool> = copied.iter().map(|c| c.clip_type == ClipType::Audio).collect();
     // A picture with its sound, or a single clip, follows the destination tracks.
     let to_destination = copied.len() == 1 || (copied.len() == 2 && kinds.len() == 2);
     let mut links: std::collections::HashMap<Uuid, Uuid> = Default::default();
     let mut pasted = Vec::new();
-    for mut clip in copied {
+    for clip in copied {
+        let mut clip = clip.clone();
         let kind = if clip.clip_type == ClipType::Audio { TrackKind::Audio } else { TrackKind::Video };
         let own_track = state.with_timeline(|t| t.find_track(clip.track_id).is_some_and(|tr| !tr.locked)).unwrap_or(false);
         let track = if to_destination || !own_track { state.dest_track(kind) } else { Some(clip.track_id) };
@@ -717,6 +719,20 @@ pub fn paste(state: &Rc<AppState>) {
         clip.properties.link = clip.properties.link.map(|old| *links.entry(old).or_insert_with(Uuid::new_v4));
         pasted.push(clip);
     }
+    pasted
+}
+
+/// Paste the copied clips at the playhead. One clip goes to the destination
+/// track of its kind; several keep their own tracks and their spacing, and a
+/// picture stays linked to its sound.
+pub fn paste(state: &Rc<AppState>) {
+    let copied = state.clipboard.borrow().clone();
+    if copied.is_empty() {
+        state.message("Nothing to paste: copy a clip first (Ctrl+C).");
+        return;
+    }
+    let at = state.frame_floor(state.playhead_us());
+    let pasted = prepare_pasted_clips(state, &copied, at);
     let Some(first) = pasted.first().map(|c| c.id) else { return };
     let end = pasted.iter().map(|c| c.timeline_out).max().unwrap_or(at);
     let commands: Vec<Box<dyn Command>> = pasted.into_iter().map(|c| Box::new(OverwriteClipCommand::new(c)) as Box<dyn Command>).collect();
@@ -724,6 +740,54 @@ pub fn paste(state: &Rc<AppState>) {
         state.select(Some(first));
         state.player.seek_timeline(end);
     }
+}
+
+/// Paste Insert (Ctrl+Shift+V): make room at the playhead across all unlocked tracks,
+/// splitting clips that cross it, then insert the copied clips there.
+pub fn paste_insert(state: &Rc<AppState>) {
+    let copied = state.clipboard.borrow().clone();
+    if copied.is_empty() {
+        state.message("Nothing to paste: copy a clip first (Ctrl+C).");
+        return;
+    }
+    let at = state.frame_floor(state.playhead_us());
+    let pasted = prepare_pasted_clips(state, &copied, at);
+    let Some(first) = pasted.first().map(|c| c.id) else { return };
+    let end = pasted.iter().map(|c| c.timeline_out).max().unwrap_or(at);
+    let len = end - at;
+    if len <= 0 {
+        return;
+    }
+    let mut commands = ripple_open_commands(state, at, len);
+    commands.extend(pasted.into_iter().map(|c| Box::new(InsertClipCommand::new(c)) as Box<dyn Command>));
+    if state.execute(Box::new(CompositeCommand::new("Paste Insert", commands))) {
+        state.select(Some(first));
+        state.player.seek_timeline(end);
+    }
+}
+
+/// Commands that open a gap of `len` microseconds at `at` across all unlocked tracks.
+fn ripple_open_commands(state: &AppState, at: i64, len: i64) -> Vec<Box<dyn Command>> {
+    let (across, mut later) = state
+        .with_timeline(|t| {
+            let unlocked = || t.tracks.iter().filter(|tr| !tr.locked);
+            let across: Vec<Uuid> =
+                unlocked().flat_map(|tr| tr.clips.iter()).filter(|c| c.timeline_in < at && c.timeline_out > at).map(|c| c.id).collect();
+            let later: Vec<(Uuid, Uuid, i64)> =
+                unlocked().flat_map(|tr| tr.clips.iter().filter(|c| c.timeline_in >= at).map(|c| (tr.id, c.id, c.timeline_in))).collect();
+            (across, later)
+        })
+        .unwrap_or_default();
+    let mut commands: Vec<Box<dyn Command>> = Vec::new();
+    for (track, split) in split_plan(state, &across, at) {
+        later.push((track, split.second_clip_id(), at));
+        commands.push(Box::new(split));
+    }
+    later.sort_by_key(|m| std::cmp::Reverse(m.2));
+    for (track, id, from) in later {
+        commands.push(Box::new(MoveClipCommand::new(id, track, track, from, from + len)));
+    }
+    commands
 }
 
 /// Replace the selected timeline clips with the current Media Pool clip, keeping
@@ -833,18 +897,330 @@ pub fn split_at(state: &Rc<AppState>, clip_id: Uuid, at_us: i64) {
     }
 }
 
-/// Cut the selected clips at the playhead.
+/// Cut the selected clips at the playhead, or unlocked clips under the playhead when nothing is selected.
 pub fn split_selected(state: &Rc<AppState>) {
+    let pos = state.playhead_us();
     let ids = state.selected_ids();
-    if ids.is_empty() {
-        state.message("Select a clip first, or press Ctrl+B to cut every track at the playhead.");
-        return;
-    }
-    let cuts = split_commands(state, &ids, state.playhead_us());
+    let had_selection = !ids.is_empty();
+    let targets = if had_selection {
+        ids
+    } else {
+        state.with_timeline(|t| clips_under(t, pos).into_iter().map(|(_, c)| c.id).collect()).unwrap_or_default()
+    };
+    let cuts = split_commands(state, &targets, pos);
     if cuts.is_empty() {
-        state.message("Move the playhead inside the selected clip first.");
+        state.message(if had_selection {
+            "Move the playhead inside the selected clip first."
+        } else {
+            "There is no clip under the playhead to cut."
+        });
     } else {
         state.execute(Box::new(CompositeCommand::new("Split", cuts)));
+    }
+}
+
+fn can_join(left: &Clip, right: &Clip) -> bool {
+    left.timeline_out == right.timeline_in
+        && left.source_id == right.source_id
+        && left.clip_type == right.clip_type
+        && (left.properties.speed - right.properties.speed).abs() < 1e-6
+        && (matches!(left.clip_type, ClipType::Image | ClipType::Title) || (left.source_out - right.source_in).abs() <= 1)
+        && left.title_data == right.title_data
+}
+
+/// Join adjacent continuous same-source clips on the same track (Resolve's Alt+\).
+pub fn join_clip(state: &Rc<AppState>) {
+    let pos = state.playhead_us();
+    let frame = state.frame_us();
+    let selected = state.selected_ids();
+    let edit_sel = state.edit_selection.get();
+    let linked = state.linked_selection.get();
+
+    let commands: Vec<Box<dyn Command>> = state
+        .with_timeline(|t| {
+            let mut per_track: HashMap<Uuid, Vec<usize>> = HashMap::new();
+            let push_pair = |map: &mut HashMap<Uuid, Vec<usize>>, tid: Uuid, idx: usize| {
+                let list = map.entry(tid).or_default();
+                if !list.contains(&idx) {
+                    list.push(idx);
+                }
+            };
+
+            if let Some(EditSelection::Edit { track_id, position_us }) = edit_sel {
+                for (tid, _) in edit_group(t, track_id, position_us, linked) {
+                    let Some(tr) = t.find_track(tid).filter(|tr| !tr.locked) else { continue };
+                    for (i, w) in tr.clips.windows(2).enumerate() {
+                        if w[0].timeline_out == position_us && can_join(&w[0], &w[1]) {
+                            push_pair(&mut per_track, tid, i);
+                        }
+                    }
+                }
+            } else if !selected.is_empty() {
+                for tr in t.tracks.iter().filter(|tr| !tr.locked) {
+                    for (i, w) in tr.clips.windows(2).enumerate() {
+                        if selected.contains(&w[0].id) && selected.contains(&w[1].id) && can_join(&w[0], &w[1]) {
+                            push_pair(&mut per_track, tr.id, i);
+                        }
+                    }
+                }
+                if per_track.is_empty() {
+                    let collect_near = |tol: i64, map: &mut HashMap<Uuid, Vec<usize>>| {
+                        for tr in t.tracks.iter().filter(|tr| !tr.locked) {
+                            for (i, w) in tr.clips.windows(2).enumerate() {
+                                if (selected.contains(&w[0].id) || selected.contains(&w[1].id))
+                                    && (w[0].timeline_out - pos).abs() <= tol
+                                    && can_join(&w[0], &w[1])
+                                {
+                                    push_pair(map, tr.id, i);
+                                }
+                            }
+                        }
+                    };
+                    collect_near(0, &mut per_track);
+                    if per_track.is_empty() {
+                        collect_near(frame, &mut per_track);
+                    }
+                }
+            } else {
+                let collect_at = |tol: i64, map: &mut HashMap<Uuid, Vec<usize>>| {
+                    for tr in t.tracks.iter().filter(|tr| !tr.locked) {
+                        for (i, w) in tr.clips.windows(2).enumerate() {
+                            if (w[0].timeline_out - pos).abs() <= tol && can_join(&w[0], &w[1]) {
+                                push_pair(map, tr.id, i);
+                            }
+                        }
+                    }
+                };
+                collect_at(0, &mut per_track);
+                if per_track.is_empty() {
+                    collect_at(frame, &mut per_track);
+                }
+            }
+
+            let mut cmds: Vec<Box<dyn Command>> = Vec::new();
+            for tr in &t.tracks {
+                let Some(mut idxs) = per_track.remove(&tr.id) else { continue };
+                idxs.sort_unstable();
+                idxs.dedup();
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for idx in idxs {
+                    match runs.last_mut() {
+                        Some((_, end)) if idx == *end => *end = idx + 1,
+                        _ => runs.push((idx, idx + 1)),
+                    }
+                }
+                for (start, end) in runs.into_iter().rev() {
+                    let first = &tr.clips[start];
+                    let last = &tr.clips[end];
+                    let moved_tail = tr.transition_at_edit(last.id, TransitionEdge::Out).cloned().map(|mut trans| {
+                        trans.clip_id = first.id;
+                        trans
+                    });
+                    for k in (start + 1..=end).rev() {
+                        cmds.push(Box::new(DeleteClipCommand::new(tr.id, tr.clips[k].id)));
+                    }
+                    let mut joined = first.clone();
+                    joined.timeline_out = last.timeline_out;
+                    joined.source_out = last.source_out;
+                    joined.properties.fade_out_us = last.properties.fade_out_us;
+                    cmds.push(Box::new(EditClipCommand::new("Join Clip", joined)));
+                    if let Some(tail) = moved_tail {
+                        cmds.push(Box::new(SetTransitionCommand::set(tr.id, tail)));
+                    }
+                }
+            }
+            cmds
+        })
+        .unwrap_or_default();
+
+    if commands.is_empty() {
+        state.message("No adjacent continuous clips to join here.");
+    } else {
+        state.execute(Box::new(CompositeCommand::new("Join Clip", commands)));
+    }
+}
+
+/// Ripple Overwrite (Shift+F10): replace the selected clip (or clip under the playhead)
+/// with the current source clip and shift later clips on all unlocked tracks by the length difference.
+pub fn ripple_overwrite(state: &Rc<AppState>) {
+    let Some(source_id) = current_source(state) else {
+        state.message("Pick a clip in the Media Pool first.");
+        return;
+    };
+    let pos = state.frame_floor(state.playhead_us());
+    let targets = {
+        let sel = all_selected(state);
+        if !sel.is_empty() {
+            sel
+        } else {
+            let dest_v = state.dest_track(TrackKind::Video);
+            let dest_a = state.dest_track(TrackKind::Audio);
+            let primary = state
+                .with_timeline(|t| {
+                    dest_v
+                        .and_then(|id| t.find_track(id).filter(|tr| !tr.locked))
+                        .and_then(|tr| tr.clip_at(pos))
+                        .or_else(|| dest_a.and_then(|id| t.find_track(id).filter(|tr| !tr.locked)).and_then(|tr| tr.clip_at(pos)))
+                        .map(|c| c.id)
+                })
+                .flatten();
+            match primary {
+                Some(id) => {
+                    let mut ids = vec![id];
+                    ids.extend(state.linked_to(id));
+                    state
+                        .with_timeline(|t| {
+                            ids.iter().filter_map(|cid| t.find_clip(*cid)).filter(|(tr, _)| !tr.locked).map(|(tr, c)| (tr.id, c.clone())).collect()
+                        })
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            }
+        }
+    };
+    if targets.is_empty() {
+        place_source(state, source_id, Place::Insert, None, None, true);
+        return;
+    }
+
+    let old_in = targets.iter().map(|(_, c)| c.timeline_in).min().unwrap_or(pos);
+    let old_out = targets.iter().map(|(_, c)| c.timeline_out).max().unwrap_or(pos);
+    let old_len = old_out - old_in;
+
+    let video_track = targets
+        .iter()
+        .find(|(_, c)| c.clip_type != ClipType::Audio)
+        .map(|(tr, _)| *tr)
+        .or_else(|| state.dest_track(TrackKind::Video));
+    let audio_track = targets
+        .iter()
+        .find(|(_, c)| c.clip_type == ClipType::Audio)
+        .map(|(tr, _)| *tr)
+        .or_else(|| state.dest_track(TrackKind::Audio));
+
+    let new_clips = clips_for_source(state, source_id, old_in, video_track, audio_track);
+    if new_clips.is_empty() {
+        state.message("Pick a clip in the Media Pool first.");
+        return;
+    }
+    let first_id = new_clips[0].id;
+    let new_out = new_clips[0].timeline_out;
+    let delta = (new_out - old_in) - old_len;
+    let target_ids: Vec<Uuid> = targets.iter().map(|(_, c)| c.id).collect();
+    let target_tracks: Vec<Uuid> = targets.iter().map(|(tr, _)| *tr).collect();
+
+    let mut commands: Vec<Box<dyn Command>> = targets
+        .iter()
+        .map(|(tr, c)| Box::new(DeleteClipCommand::new(*tr, c.id)) as Box<dyn Command>)
+        .collect();
+
+    if delta != 0 {
+        let mut later: Vec<(Uuid, Uuid, i64)> = state
+            .with_timeline(|t| {
+                t.tracks
+                    .iter()
+                    .filter(|tr| !tr.locked)
+                    .flat_map(|tr| {
+                        tr.clips
+                            .iter()
+                            .filter(|c| !target_ids.contains(&c.id) && c.timeline_in >= old_out)
+                            .map(|c| (tr.id, c.id, c.timeline_in))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if delta > 0 {
+            later.sort_by_key(|m| std::cmp::Reverse(m.2));
+        } else {
+            later.sort_by_key(|m| m.2);
+        }
+        for (track, id, from) in later {
+            commands.push(Box::new(MoveClipCommand::new(id, track, track, from, from + delta)));
+        }
+    }
+
+    for clip in new_clips {
+        if target_tracks.contains(&clip.track_id) {
+            commands.push(Box::new(InsertClipCommand::new(clip)));
+        } else {
+            commands.push(Box::new(OverwriteClipCommand::new(clip)));
+        }
+    }
+
+    if state.execute(Box::new(CompositeCommand::new("Ripple Overwrite", commands))) {
+        state.select(Some(first_id));
+        state.player.seek_timeline(new_out);
+    }
+}
+
+/// Swap each selected clip with its neighbor before (`forward = false`) or after (`forward = true`) on its track.
+pub fn swap_clips(state: &Rc<AppState>, forward: bool) {
+    let selected = all_selected(state);
+    if selected.is_empty() {
+        state.message("Select a clip on the timeline first.");
+        return;
+    }
+    let commands: Vec<Box<dyn Command>> = state
+        .with_timeline(|t| {
+            let mut cmds: Vec<Box<dyn Command>> = Vec::new();
+            let mut handled_tracks: Vec<Uuid> = Vec::new();
+            for (track_id, clip) in &selected {
+                if handled_tracks.contains(track_id) {
+                    continue;
+                }
+                let Some(track) = t.find_track(*track_id).filter(|tr| !tr.locked) else { continue };
+                let Some(idx) = track.clips.iter().position(|c| c.id == clip.id) else { continue };
+                let neighbor_idx = if forward {
+                    (idx + 1 < track.clips.len()).then_some(idx + 1)
+                } else {
+                    idx.checked_sub(1)
+                };
+                let Some(n_idx) = neighbor_idx else { continue };
+                let (left, right) = if forward { (&track.clips[idx], &track.clips[n_idx]) } else { (&track.clips[n_idx], &track.clips[idx]) };
+                handled_tracks.push(*track_id);
+                let left_len = left.duration_us();
+                let right_in = right.timeline_in;
+                let right_out = right.timeline_out;
+                let left_in = left.timeline_in;
+                let temp = track.duration_us().max(right_out) + left_len + right.duration_us() + 1_000_000;
+                cmds.push(Box::new(MoveClipCommand::new(left.id, *track_id, *track_id, left_in, temp)));
+                cmds.push(Box::new(MoveClipCommand::new(right.id, *track_id, *track_id, right_in, left_in)));
+                cmds.push(Box::new(MoveClipCommand::new(left.id, *track_id, *track_id, temp, right_out - left_len)));
+            }
+            cmds
+        })
+        .unwrap_or_default();
+
+    if commands.is_empty() {
+        state.message("No clip there to swap with.");
+    } else {
+        state.execute(Box::new(CompositeCommand::new("Swap Clips", commands)));
+    }
+}
+
+/// Adjust selected audio clips' volume by `db` decibels (clamped to 0.0..=4.0).
+pub fn adjust_volume_db(state: &Rc<AppState>, db: f32) {
+    let factor = 10.0f32.powf(db / 20.0);
+    let done = for_selected(state, "Adjust Volume", |_, clip| {
+        if clip.clip_type != ClipType::Audio {
+            return None;
+        }
+        let cur = clip.properties.volume;
+        let next = if db > 0.0 && cur < 0.001 { 0.001 * factor } else { cur * factor }.clamp(0.0, 4.0);
+        Some(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Volume(next))) as Box<dyn Command>)
+    });
+    if !done && state.selected_ids().is_empty() {
+        state.message("Select an audio clip first.");
+    }
+}
+
+/// Toggle enabled state of Video track `kind_index` (1-based, Ctrl+Shift+1..4).
+pub fn toggle_video_track(state: &Rc<AppState>, kind_index: u32) {
+    let target = state
+        .with_timeline(|t| t.tracks.iter().find(|tr| tr.kind == TrackKind::Video && tr.kind_index == kind_index).map(|tr| (tr.id, tr.enabled)))
+        .flatten();
+    if let Some((track_id, enabled)) = target {
+        state.execute(Box::new(SetTrackFlagCommand::new(track_id, TrackFlag::Enabled, !enabled)));
     }
 }
 
@@ -1284,6 +1660,200 @@ pub fn mark_clip(state: &Rc<AppState>) {
     }
 }
 
+/// Mark In/Out around the span of the currently selected clips (`Shift+A`).
+pub fn mark_selection(state: &Rc<AppState>) {
+    let ids = state.selected_ids();
+    let range = state
+        .with_timeline(|t| {
+            let mut lo = i64::MAX;
+            let mut hi = i64::MIN;
+            for id in &ids {
+                if let Some((_, c)) = t.find_clip(*id) {
+                    lo = lo.min(c.timeline_in);
+                    hi = hi.max(c.timeline_out);
+                }
+            }
+            (lo < hi).then_some((lo, hi))
+        })
+        .flatten();
+    match range {
+        Some((a, b)) => {
+            state.mark_in.set(Some(a));
+            state.mark_out.set(Some(b));
+            state.emit(Change::Options);
+        }
+        None => state.message("Select a clip on the timeline first."),
+    }
+}
+
+/// Select the edit point nearest the playhead on an unlocked track (`V`).
+pub fn select_nearest_edit(state: &Rc<AppState>) {
+    let pos = state.playhead_us();
+    let dest_v = state.dest_track(TrackKind::Video);
+    let dest_a = state.dest_track(TrackKind::Audio);
+    let found = state
+        .with_timeline(|t| {
+            t.tracks
+                .iter()
+                .filter(|tr| !tr.locked)
+                .flat_map(|tr| {
+                    let prio = (Some(tr.id) != dest_v, tr.kind != TrackKind::Video, Some(tr.id) != dest_a, tr.kind_index);
+                    tr.edit_points().into_iter().map(move |e| ((e.position_us - pos).abs(), prio, tr.id, e.position_us))
+                })
+                .min_by_key(|(dist, prio, _, _)| (*dist, *prio))
+                .map(|(_, _, track_id, position_us)| (track_id, position_us))
+        })
+        .flatten();
+    match found {
+        Some((track_id, position_us)) => state.select_edit(Some(EditSelection::Edit { track_id, position_us })),
+        None => state.message("There is no edit point on an unlocked track."),
+    }
+}
+
+/// Select clips forward (`Y` / `Alt+Y`) or backward (`Ctrl+Y` / `Ctrl+Alt+Y`) from the playhead.
+pub fn select_range_relative(state: &Rc<AppState>, forward: bool, all_tracks: bool) {
+    let pos = state.playhead_us();
+    let ids = state
+        .with_timeline(|t| {
+            let target_track = if all_tracks {
+                None
+            } else {
+                match state.edit_selection.get() {
+                    Some(EditSelection::Edit { track_id, .. } | EditSelection::Transition { track_id, .. }) => Some(track_id),
+                    None => state
+                        .selection
+                        .get()
+                        .and_then(|id| t.find_clip(id).map(|(tr, _)| tr.id))
+                        .or_else(|| state.dest_track(TrackKind::Video))
+                        .or_else(|| state.dest_track(TrackKind::Audio)),
+                }
+            };
+            let mut matched: Vec<(i64, u32, Uuid)> = t
+                .tracks
+                .iter()
+                .filter(|tr| !tr.locked && target_track.is_none_or(|id| tr.id == id))
+                .flat_map(|tr| {
+                    tr.clips.iter().filter_map(move |c| {
+                        let hit = if forward { c.timeline_out > pos } else { c.timeline_in < pos };
+                        hit.then_some((c.timeline_in, tr.sort_order, c.id))
+                    })
+                })
+                .collect();
+            matched.sort_by_key(|(tin, order, _)| (*tin, *order));
+            matched.into_iter().map(|(_, _, id)| id).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    state.select_ids(ids);
+}
+
+/// Jump to the first (`last = false`) or last (`last = true`) frame of the clip under the playhead.
+pub fn first_or_last_frame(state: &AppState, last: bool) {
+    if state.source_mode() {
+        let target = if last { state.frame_step(state.player.duration_us(), -1).max(0) } else { 0 };
+        state.player.pause();
+        state.player.seek(target, true);
+        return;
+    }
+    let pos = state.playhead_us();
+    let primary = state.selection.get();
+    let dest = state.dest_track(TrackKind::Video);
+    let span = state
+        .with_timeline(|t| {
+            if let Some(id) = primary {
+                if let Some((_, c)) = t.find_clip(id) {
+                    if pos >= c.timeline_in && pos <= c.timeline_out {
+                        return Some((c.timeline_in, c.timeline_out));
+                    }
+                }
+            }
+            let mut tracks: Vec<_> = t.tracks.iter().collect();
+            tracks.sort_by_key(|tr| (Some(tr.id) != dest, tr.kind != TrackKind::Video, std::cmp::Reverse(tr.kind_index)));
+            tracks
+                .iter()
+                .find_map(|tr| tr.clip_at(pos).map(|c| (c.timeline_in, c.timeline_out)))
+                .or_else(|| tracks.iter().find_map(|tr| tr.clips.iter().find(|c| c.timeline_out == pos).map(|c| (c.timeline_in, c.timeline_out))))
+        })
+        .flatten();
+    if let Some((cin, cout)) = span {
+        let target = if last { state.frame_step(cout, -1).max(cin) } else { cin };
+        state.player.pause();
+        state.player.seek(target, true);
+    }
+}
+
+/// Play In to Out (`Alt+/`).
+pub fn play_in_to_out(state: &AppState) -> bool {
+    let (in_us, out_us) = if state.source_mode() {
+        (state.src_in.get(), state.src_out.get())
+    } else {
+        (state.mark_in.get(), state.mark_out.get())
+    };
+    let dur = state.player.duration_us();
+    if in_us.is_none() && out_us.is_none() {
+        state.message("Mark In and Out first (I and O).");
+        return false;
+    }
+    let start = in_us.unwrap_or(0).clamp(0, dur);
+    let end = out_us.unwrap_or(dur).clamp(0, dur);
+    if end <= start {
+        state.message("Out point must be after In point.");
+        return false;
+    }
+    state.player.play_range(1.0, start, end);
+    true
+}
+
+const PLAY_AROUND_ROLL_US: i64 = 2_000_000;
+
+/// Timeline/source `(start_us, end_us)` around the selection, edit point, or playhead (`/`).
+pub fn play_around_bounds(state: &AppState) -> Option<(i64, i64)> {
+    let dur = state.player.duration_us();
+    if dur <= 0 {
+        return None;
+    }
+    if state.source_mode() {
+        let pos = state.player.position_us();
+        let start = (pos - PLAY_AROUND_ROLL_US).max(0);
+        let end = (pos + PLAY_AROUND_ROLL_US).min(dur);
+        return (end > start).then_some((start, end));
+    }
+    let selected = state.selected_ids();
+    let range = state.with_timeline(|t| {
+        if !selected.is_empty() {
+            let mut lo = i64::MAX;
+            let mut hi = i64::MIN;
+            for id in &selected {
+                if let Some((_, c)) = t.find_clip(*id) {
+                    lo = lo.min(c.timeline_in);
+                    hi = hi.max(c.timeline_out);
+                }
+            }
+            if lo < hi {
+                return (lo, hi);
+            }
+        }
+        match state.edit_selection.get() {
+            Some(EditSelection::Edit { position_us, .. }) => (position_us, position_us),
+            Some(EditSelection::Transition { track_id, clip_id, edge }) => t
+                .find_track(track_id)
+                .and_then(|tr| tr.transition_at_edit(clip_id, edge).and_then(|x| tr.transition_span(x)))
+                .unwrap_or((state.playhead_us(), state.playhead_us())),
+            None => (state.playhead_us(), state.playhead_us()),
+        }
+    });
+    let (lo, hi) = range?;
+    let start = (lo - PLAY_AROUND_ROLL_US).max(0);
+    let end = (hi + PLAY_AROUND_ROLL_US).min(dur);
+    (end > start).then_some((start, end))
+}
+
+/// Play around current selection, edit point, or playhead (`/`).
+pub fn play_around(state: &AppState) -> bool {
+    let Some((start, end)) = play_around_bounds(state) else { return false };
+    state.player.play_range(1.0, start, end);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,5 +2086,105 @@ mod tests {
         // Assert
         assert_eq!((marked[0].source_in, marked[0].source_out), (2 * S, 5 * S));
         assert_eq!((whole[0].source_in, whole[0].source_out), (0, 10 * S));
+    }
+
+    fn setup_two_track_project() -> (Rc<AppState>, Uuid, Uuid) {
+        let state = AppState::new();
+        let mut project = tempo_timeline::Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        let v1 = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video && t.kind_index == 1).unwrap().id;
+        let a1 = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio && t.kind_index == 1).unwrap().id;
+        let src = MediaSource::new(std::path::PathBuf::from("clip.mp4"), MediaType::Video, 12 * S);
+        for (i, (tin, sin)) in [(0, 0), (4 * S, 4 * S), (8 * S, 8 * S)].into_iter().enumerate() {
+            let link = Some(Uuid::new_v4());
+            let mut vc = Clip::new(v1, src.id, ClipType::Video, format!("v{i}"), tin, tin + 4 * S, sin, sin + 4 * S);
+            let mut ac = Clip::new(a1, src.id, ClipType::Audio, format!("a{i}"), tin, tin + 4 * S, sin, sin + 4 * S);
+            vc.properties.link = link;
+            ac.properties.link = link;
+            project.timeline.find_track_mut(v1).unwrap().clips.push(vc);
+            project.timeline.find_track_mut(a1).unwrap().clips.push(ac);
+        }
+        project.sources.insert(src.id, src);
+        state.set_project(Some(project), None);
+        (state, v1, a1)
+    }
+
+    #[test]
+    fn split_without_selection_cuts_under_playhead_and_join_reunites_with_undo() {
+        let (state, v1, a1) = setup_two_track_project();
+        state.player.seek_timeline(2 * S);
+        split_selected(&state);
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().clips.len()), Some(4));
+        assert_eq!(state.with_timeline(|t| t.find_track(a1).unwrap().clips.len()), Some(4));
+
+        // Alt+\ with nothing selected joins the continuous split at the playhead in one undo step.
+        join_clip(&state);
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().clips.len()), Some(3));
+        assert_eq!(state.with_timeline(|t| t.find_track(a1).unwrap().clips.len()), Some(3));
+        state.undo();
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().clips.len()), Some(4));
+        assert_eq!(state.with_timeline(|t| t.find_track(a1).unwrap().clips.len()), Some(4));
+    }
+
+    #[test]
+    fn track_and_all_selection_follow_playhead_and_mark_selection_sets_in_out() {
+        let (state, v1, a1) = setup_two_track_project();
+        state.player.seek_timeline(4 * S);
+        select_range_relative(&state, true, false);
+        let sel = state.selected_ids();
+        assert_eq!(sel.len(), 2);
+        assert!(sel.iter().all(|id| state.with_timeline(|t| t.find_track(v1).unwrap().find_clip(*id).is_some()).unwrap()));
+
+        select_range_relative(&state, true, true);
+        assert_eq!(state.selected_ids().len(), 4);
+
+        select_range_relative(&state, false, false);
+        assert_eq!(state.selected_ids().len(), 1);
+        assert!(state.with_timeline(|t| t.find_track(v1).unwrap().find_clip(state.selected_ids()[0]).is_some()).unwrap());
+
+        select_range_relative(&state, false, true);
+        assert_eq!(state.selected_ids().len(), 2);
+        assert!(state.with_timeline(|t| t.find_track(a1).unwrap().find_clip(state.selected_ids()[1]).is_some()).unwrap());
+
+        mark_selection(&state);
+        assert_eq!((state.mark_in.get(), state.mark_out.get()), (Some(0), Some(4 * S)));
+    }
+
+    #[test]
+    fn select_nearest_edit_swap_paste_insert_volume_and_video_track_toggle() {
+        let (state, v1, a1) = setup_two_track_project();
+        state.player.seek_timeline(4_100_000);
+        select_nearest_edit(&state);
+        assert_eq!(state.edit_selection.get(), Some(EditSelection::Edit { track_id: v1, position_us: 4 * S }));
+
+        // Swap first clip forward with second clip on V1.
+        let first_id = state.with_timeline(|t| t.find_track(v1).unwrap().clips[0].id).unwrap();
+        state.select(Some(first_id));
+        swap_clips(&state, true);
+        assert_eq!(state.with_timeline(|t| t.find_clip(first_id).unwrap().1.timeline_in), Some(4 * S));
+        state.undo();
+        assert_eq!(state.with_timeline(|t| t.find_clip(first_id).unwrap().1.timeline_in), Some(0));
+
+        // Paste insert pushes later clips right by clip length.
+        state.select(Some(first_id));
+        copy_selected(&state, false);
+        state.player.seek_timeline(4 * S);
+        paste_insert(&state);
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().clips.len()), Some(4));
+        assert_eq!(state.with_timeline(|t| t.duration_us()), Some(16 * S));
+        state.undo();
+        assert_eq!(state.with_timeline(|t| t.duration_us()), Some(12 * S));
+
+        // Adjust volume +3 dB only modifies Audio clip in linked selection.
+        let audio_id = state.with_timeline(|t| t.find_track(a1).unwrap().clips[0].id).unwrap();
+        state.select(Some(first_id));
+        adjust_volume_db(&state, 3.0);
+        let vol = state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume).unwrap();
+        assert!((vol - 10.0f32.powf(0.15)).abs() < 1e-4);
+
+        // Toggle video track 1 enabled state and undo.
+        toggle_video_track(&state, 1);
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().enabled), Some(false));
+        state.undo();
+        assert_eq!(state.with_timeline(|t| t.find_track(v1).unwrap().enabled), Some(true));
     }
 }

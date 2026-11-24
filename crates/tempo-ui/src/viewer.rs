@@ -13,6 +13,14 @@ use crate::state::{timecode, AppState, Change};
 use crate::util::{label, tool_button};
 use crate::video_surface::VideoSurface;
 
+const VIEWER_ZOOMS: [(&str, Option<f64>); 5] = [
+    ("Fit", None),
+    ("25%", Some(0.25)),
+    ("50%", Some(0.5)),
+    ("100%", Some(1.0)),
+    ("200%", Some(2.0)),
+];
+
 const MARKER_CLASSES: [&str; 17] = [
     "marker-blue", "marker-cyan", "marker-green", "marker-yellow", "marker-red", "marker-pink", "marker-purple", "marker-fuchsia",
     "marker-rose", "marker-lavender", "marker-sky", "marker-mint", "marker-lemon", "marker-sand", "marker-cocoa", "marker-cream",
@@ -87,11 +95,15 @@ impl Viewer {
         // Preview quality is the setting that matters most on a slow computer,
         // so it is in plain sight, not inside a menu.
         let (quality, sync_quality) = quality_button(state);
+        let zoom_pair = if !source_only { Some(zoom_dropdown(state)) } else { None };
         let back = crate::util::text_button("Back to Timeline", "Stop looking at this Media Pool clip and show the timeline again (Q)");
         back.set_visible(false);
         let s = state.clone();
         back.connect_clicked(move |_| s.show_source(None));
         let start = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        if let Some((zoom_dd, _)) = &zoom_pair {
+            start.append(zoom_dd);
+        }
         start.append(&quality);
         start.append(&back);
         header.set_start_widget(Some(&start));
@@ -144,8 +156,26 @@ impl Viewer {
         let stop = tool_button("media-playback-stop-symbolic", "Stop (K)");
         let play = tool_button("media-playback-start-symbolic", "Play / stop (Space)");
         let last = tool_button("media-skip-forward-symbolic", "Go to end (End)");
+        let loop_btn = if !source_only {
+            let b = crate::util::text_toggle("Loop", "Loop playback (Ctrl+/)");
+            b.add_css_class("accent");
+            b.update_property(&[gtk::accessible::Property::Label("Loop playback")]);
+            b.set_active(state.loop_playback.get());
+            let s = state.clone();
+            b.connect_toggled(move |btn| {
+                if s.loop_playback.get() != btn.is_active() {
+                    s.set_loop_playback(btn.is_active());
+                }
+            });
+            Some(b)
+        } else {
+            None
+        };
         let centre = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         for b in [&first, &reverse, &stop, &play, &last] {
+            centre.append(b);
+        }
+        if let Some(b) = &loop_btn {
             centre.append(b);
         }
         let mark_in = tool_button("go-first-symbolic", "Mark In (I)");
@@ -186,7 +216,7 @@ impl Viewer {
         reverse.connect_clicked(move |_| p.play(-1.0));
         let p = player.clone();
         stop.connect_clicked(move |_| p.pause());
-        if let Some(check) = dual_check {
+        if let Some(check) = &dual_check {
             let v = viewer.clone();
             check.connect_toggled(move |c| {
                 if let Some(f) = v.dual_listener.borrow().as_ref() {
@@ -249,9 +279,28 @@ impl Viewer {
 
         let v = viewer.clone();
         let height = Cell::new(u32::MAX);
+        let sync_zoom = zoom_pair.map(|(_, f)| f);
         state.connect(move |change| {
             if matches!(change, Change::Options) {
                 v.show_marks();
+                v.player.set_looping(v.state.loop_playback.get());
+                v.player.set_scrub_audio(v.state.scrub_audio.get());
+                v.surface.set_zoom(v.state.viewer_zoom.get());
+                if let Some(btn) = &loop_btn {
+                    let on = v.state.loop_playback.get();
+                    if btn.is_active() != on {
+                        btn.set_active(on);
+                    }
+                }
+                if let Some(sync) = &sync_zoom {
+                    sync(v.state.viewer_zoom.get());
+                }
+                if let Some(check) = &dual_check {
+                    let dual = v.state.dual_viewer.get();
+                    if check.is_active() != dual {
+                        check.set_active(dual);
+                    }
+                }
                 // The quality may have changed, here or in Preferences.
                 let now = v.state.settings.borrow().playback_height;
                 if height.replace(now) != now {
@@ -355,6 +404,7 @@ impl Viewer {
         self.state.source_clip.set(shown);
         self.state.src_in.set(None);
         self.state.src_out.set(None);
+        self.state.sync_loop_range();
         if self.source_only {
             self.shown_source.set(shown);
             self.player.pause();
@@ -486,6 +536,36 @@ fn quality_button(state: &Rc<AppState>) -> (gtk::MenuButton, impl Fn(u32)) {
     };
     sync(state.settings.borrow().playback_height);
     (button, sync)
+}
+
+/// The viewer zoom drop-down (`Fit`, `25%`, `50%`, `100%`, `200%`) and a function to sync it.
+fn zoom_dropdown(state: &Rc<AppState>) -> (gtk::DropDown, impl Fn(Option<f64>)) {
+    let labels = VIEWER_ZOOMS.map(|z| z.0);
+    let dropdown = gtk::DropDown::from_strings(&labels);
+    dropdown.set_tooltip_text(Some("Viewer zoom (Z: Fit, Alt+Shift+Z: 100%)"));
+    dropdown.update_property(&[gtk::accessible::Property::Label("Viewer zoom")]);
+    let syncing = Rc::new(Cell::new(false));
+    let s = state.clone();
+    let sy = syncing.clone();
+    dropdown.connect_selected_notify(move |d| {
+        if sy.get() {
+            return;
+        }
+        if let Some(&(_, factor)) = VIEWER_ZOOMS.get(d.selected() as usize) {
+            s.set_viewer_zoom(factor);
+        }
+    });
+    let d = dropdown.clone();
+    let sync = move |factor: Option<f64>| {
+        let idx = VIEWER_ZOOMS.iter().position(|z| z.1 == factor).unwrap_or(0) as u32;
+        if d.selected() != idx {
+            syncing.set(true);
+            d.set_selected(idx);
+            syncing.set(false);
+        }
+    };
+    sync(state.viewer_zoom.get());
+    (dropdown, sync)
 }
 
 /// The main viewer's menu: the dual-viewer switch.

@@ -115,6 +115,12 @@ pub struct AppState {
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
+    /// When on, playback loops over In..Out (if both set) or the whole timeline/source.
+    pub loop_playback: Cell<bool>,
+    /// When on, scrubbing or stepping plays a short snippet of audio at the playhead.
+    pub scrub_audio: Cell<bool>,
+    /// Viewer picture zoom: `None` fits the frame to the viewer, `Some(s)` scales by `s` (1.0 = 100%).
+    pub viewer_zoom: Cell<Option<f64>>,
     /// Filters offered by the enabled plugins, kept current by `Plugins`.
     pub filters: RefCell<Vec<tempo_timeline::ClipEffect>>,
     /// Upload targets offered by the enabled plugins, kept current by `Plugins`.
@@ -158,6 +164,9 @@ impl AppState {
             transition_clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
+            loop_playback: Cell::new(false),
+            scrub_audio: Cell::new(false),
+            viewer_zoom: Cell::new(None),
             filters: RefCell::new(Vec::new()),
             uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
@@ -173,11 +182,37 @@ impl AppState {
     }
 
     pub fn emit(&self, change: Change) {
+        if matches!(change, Change::Options) {
+            self.sync_loop_range();
+        }
         // Clone the list first: a listener may register another listener.
         let listeners: Vec<_> = self.listeners.borrow().clone();
         for l in listeners {
             l(&change);
         }
+    }
+
+    pub fn set_loop_playback(&self, on: bool) {
+        if self.loop_playback.replace(on) != on {
+            self.player.set_looping(on);
+            self.sync_loop_range();
+            self.emit(Change::Options);
+        }
+    }
+
+    pub fn set_viewer_zoom(&self, zoom: Option<f64>) {
+        if self.viewer_zoom.replace(zoom) != zoom {
+            self.emit(Change::Options);
+        }
+    }
+
+    pub fn sync_loop_range(&self) {
+        let (in_us, out_us) = if self.source_mode() {
+            (self.src_in.get(), self.src_out.get())
+        } else {
+            (self.mark_in.get(), self.mark_out.get())
+        };
+        self.player.set_loop_range(in_us, out_us);
     }
 
     pub fn message(&self, text: impl Into<String>) {
@@ -285,6 +320,12 @@ impl AppState {
         self.mark_out.set(None);
         self.dest_video.set(1);
         self.dest_audio.set(1);
+        self.loop_playback.set(false);
+        self.scrub_audio.set(false);
+        self.viewer_zoom.set(None);
+        self.player.set_looping(false);
+        self.player.set_scrub_audio(false);
+        self.sync_loop_range();
         self.dirty.set(false);
         self.sync_player();
         self.player.seek(0, true);
@@ -361,6 +402,7 @@ impl AppState {
         self.mark_out.set(None);
         self.dest_video.set(1);
         self.dest_audio.set(1);
+        self.sync_loop_range();
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Timeline);
@@ -514,6 +556,23 @@ impl AppState {
         self.selection.set(clip);
         *self.extra_selection.borrow_mut() = clip.map(|id| self.linked_to(id)).unwrap_or_default();
         if had_gap || before != self.selected_ids() {
+            self.emit(Change::Selection);
+        }
+    }
+
+    /// Select an explicit list of clips (first is primary), clearing any gap or edit selection.
+    pub fn select_ids(&self, ids: Vec<Uuid>) {
+        let mut unique = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        let before = self.selected_ids();
+        let had_special = self.gap.take().is_some() | self.edit_selection.take().is_some();
+        self.selection.set(if unique.is_empty() { None } else { Some(unique.remove(0)) });
+        *self.extra_selection.borrow_mut() = unique;
+        if had_special || before != self.selected_ids() {
             self.emit(Change::Selection);
         }
     }

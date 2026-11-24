@@ -54,6 +54,7 @@ pub struct MainWindow {
     edit_only: gtk::Box,
     speed: Cell<f64>,
     cinema: Cell<bool>,
+    full_viewer: Cell<bool>,
     /// When the last rolling backup was started, and whether a failure was already reported.
     last_backup: Cell<std::time::Instant>,
     backup_warned: Cell<bool>,
@@ -255,6 +256,7 @@ impl MainWindow {
             edit_only,
             speed: Cell::new(0.0),
             cinema: Cell::new(false),
+            full_viewer: Cell::new(false),
             last_backup: Cell::new(std::time::Instant::now()),
             backup_warned: Cell::new(false),
             loading_status,
@@ -598,6 +600,10 @@ impl MainWindow {
     }
 
     fn enter_project(self: &Rc<Self>, project: Project, path: PathBuf) {
+        self.full_viewer.set(false);
+        if let Some(lower) = self.edit.timeline.root.parent() {
+            lower.set_visible(true);
+        }
         self.state.set_project(Some(project), Some(path));
         self.viewer.show_source(None);
         self.show_page("edit");
@@ -863,6 +869,7 @@ impl MainWindow {
             v.show_source(if on { self.state.media_selection.get() } else { None });
         }
         self.state.source_clip.set(if on { self.state.media_selection.get() } else { None });
+        self.state.emit(Change::Options);
     }
 
     fn set_cinema(&self, on: bool) {
@@ -875,6 +882,11 @@ impl MainWindow {
         } else {
             self.window.unfullscreen();
             self.edit.set_inspector_open(self.panel_buttons[2].is_active());
+            if self.full_viewer.get() {
+                if let Some(lower) = self.edit.timeline.root.parent() {
+                    lower.set_visible(false);
+                }
+            }
         }
     }
 
@@ -1137,7 +1149,7 @@ impl MainWindow {
                 self.viewer.toggle_play();
             }
             "win.play-forward" | "win.play-reverse" => {
-                // Pressing the same direction again doubles the speed, up to 8×.
+                // Pressing the same direction again doubles the speed, up to 64×.
                 let dir = if action == "win.play-forward" { 1.0 } else { -1.0 };
                 // Playback started with Space or the on-screen button counts as 1×.
                 let cur = match (player.is_playing(), self.speed.get()) {
@@ -1148,7 +1160,7 @@ impl MainWindow {
                 if dir > 0.0 && !player.is_playing() && player.position_us() >= player.duration_us() {
                     player.seek(0, true);
                 }
-                let next = if player.is_playing() && cur * dir > 0.0 { (cur.abs() * 2.0).min(8.0) * dir } else { dir };
+                let next = if player.is_playing() && cur * dir > 0.0 { (cur.abs() * 2.0).min(64.0) * dir } else { dir };
                 self.speed.set(next);
                 player.play(next);
                 if next.abs() > 1.0 {
@@ -1158,11 +1170,11 @@ impl MainWindow {
             // Shift+L and Shift+J step through the speeds: each press of Shift+L is
             // one step faster forward, each press of Shift+J one step the other way.
             "win.fast-forward" | "win.fast-reverse" => {
-                const SPEEDS: [f64; 9] = [-8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0];
+                const SPEEDS: [f64; 15] = [-64.0, -32.0, -16.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
                 let now = if player.is_playing() { self.speed.get() } else { 0.0 };
                 // A plain "play" (Space or the button) counts as 1×.
                 let now = if player.is_playing() && now == 0.0 { 1.0 } else { now };
-                let at = SPEEDS.iter().position(|s| *s == now).unwrap_or(4);
+                let at = SPEEDS.iter().position(|s| *s == now).unwrap_or(SPEEDS.len() / 2);
                 let first_press = !player.is_playing();
                 let next = match (action == "win.fast-forward", first_press) {
                     // From a stop, "fast" starts at double speed.
@@ -1185,6 +1197,27 @@ impl MainWindow {
                 player.play(0.5);
                 self.flash_activity("Playing at half speed");
             }
+            "win.play-again" => {
+                self.speed.set(1.0);
+                player.play_again();
+            }
+            "win.play-in-to-out" => {
+                if actions::play_in_to_out(state) {
+                    self.speed.set(1.0);
+                }
+            }
+            "win.play-around" => {
+                if actions::play_around(state) {
+                    self.speed.set(1.0);
+                }
+            }
+            "win.loop-toggle" => state.set_loop_playback(!state.loop_playback.get()),
+            "win.scrub-audio-toggle" => {
+                let on = !state.scrub_audio.get();
+                state.scrub_audio.set(on);
+                state.emit(Change::Options);
+                self.flash_activity(if on { "Audio scrubbing on" } else { "Audio scrubbing off" });
+            }
             "win.stop" => {
                 self.speed.set(0.0);
                 player.pause();
@@ -1195,6 +1228,8 @@ impl MainWindow {
             "win.large-step-reverse" => actions::step_frames(state, -(state.fps().round() as i64)),
             "win.clip-next" => actions::goto_edit(state, true),
             "win.clip-prev" => actions::goto_edit(state, false),
+            "win.first-frame" => actions::first_or_last_frame(state, false),
+            "win.last-frame" => actions::first_or_last_frame(state, true),
             "win.timeline-start" => player.seek(0, true),
             "win.timeline-end" => player.seek(player.duration_us(), true),
 
@@ -1208,6 +1243,7 @@ impl MainWindow {
                 actions::set_mark(state, false, true);
             }
             "win.mark-clip" => actions::mark_clip(state),
+            "win.mark-selection" => actions::mark_selection(state),
             "win.goto-in" | "win.goto-out" => {
                 let source = state.source_mode();
                 let mark = match (source, action == "win.goto-in") {
@@ -1229,7 +1265,11 @@ impl MainWindow {
 
             // Markers
             "win.marker-add" => {
-                actions::add_marker(state, false);
+                if let Some(existing) = actions::marker_at_playhead(state) {
+                    dialogs::edit_marker(&self.window, state, existing);
+                } else {
+                    actions::add_marker(state, false);
+                }
             }
             "win.marker-add-modify" => {
                 if let Some(m) = actions::add_marker(state, true) {
@@ -1285,6 +1325,8 @@ impl MainWindow {
             }
             "win.queue-render-all" if !on_edit => self.export.render_all(),
             "win.viewer-cinema" => self.set_cinema(!self.cinema.get()),
+            "win.viewer-fit" => state.set_viewer_zoom(None),
+            "win.viewer-actual-size" => state.set_viewer_zoom(Some(1.0)),
 
             // Everything below edits the timeline and belongs to the Edit page.
             _ if !on_edit => {}
@@ -1298,6 +1340,7 @@ impl MainWindow {
             }
             "win.edit-insert" => actions::place_current(state, Place::Insert),
             "win.edit-overwrite" => actions::place_current(state, Place::Overwrite),
+            "win.edit-ripple-overwrite" => actions::ripple_overwrite(state),
             "win.edit-place-on-top" => actions::place_current(state, Place::OnTop),
             "win.edit-append" => actions::place_current(state, Place::Append),
             "win.clip-enable-toggle" => actions::toggle_enabled(state),
@@ -1320,9 +1363,15 @@ impl MainWindow {
                     actions::paste(state);
                 }
             }
+            "win.paste-insert" => actions::paste_insert(state),
             "win.edit-replace" => actions::replace_selected(state),
             "win.select-all" => state.select_all(),
             "win.deselect-all" => state.select(None),
+            "win.select-track-after" => actions::select_range_relative(state, true, false),
+            "win.select-all-after" => actions::select_range_relative(state, true, true),
+            "win.select-track-before" => actions::select_range_relative(state, false, false),
+            "win.select-all-before" => actions::select_range_relative(state, false, true),
+            "win.select-edit-point" => actions::select_nearest_edit(state),
             "win.link-toggle" => actions::toggle_link(state),
             "win.linked-selection-toggle" => {
                 state.linked_selection.set(!state.linked_selection.get());
@@ -1337,6 +1386,7 @@ impl MainWindow {
             "win.fade-out" => actions::set_fade(state, false, actions::STANDARD_TRANSITION_S),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
+            "win.join-clip" => actions::join_clip(state),
             // A selected transition is deleted alone, whichever delete key was pressed.
             "win.delete" | "win.ripple-delete" if actions::delete_transition(state) => {}
             "win.delete" => actions::delete_selected(state, false),
@@ -1357,6 +1407,16 @@ impl MainWindow {
             "win.nudge-forward" => actions::nudge(state, 1),
             "win.nudge-multi-left" => actions::nudge(state, -5),
             "win.nudge-multi-right" => actions::nudge(state, 5),
+            "win.swap-reverse" => actions::swap_clips(state, false),
+            "win.swap-forward" => actions::swap_clips(state, true),
+            "win.volume-up-1" => actions::adjust_volume_db(state, 1.0),
+            "win.volume-down-1" => actions::adjust_volume_db(state, -1.0),
+            "win.volume-up-3" => actions::adjust_volume_db(state, 3.0),
+            "win.volume-down-3" => actions::adjust_volume_db(state, -3.0),
+            "win.video-track-toggle-1" => actions::toggle_video_track(state, 1),
+            "win.video-track-toggle-2" => actions::toggle_video_track(state, 2),
+            "win.video-track-toggle-3" => actions::toggle_video_track(state, 3),
+            "win.video-track-toggle-4" => actions::toggle_video_track(state, 4),
             "win.clip-move-up" => actions::move_track(state, 1),
             "win.clip-move-down" => actions::move_track(state, -1),
             "win.zoom-in" => {
@@ -1376,12 +1436,38 @@ impl MainWindow {
                     self.viewer.show_source(target);
                 }
             }
+            "win.viewer-full-page" => {
+                let on = !self.full_viewer.get();
+                self.full_viewer.set(on);
+                if let Some(lower) = self.edit.timeline.root.parent() {
+                    lower.set_visible(!on);
+                }
+            }
             "win.focus-media-pool" => {
                 self.panel_buttons[0].set_active(true);
                 self.edit.media_pool.focus();
             }
+            "win.focus-source-viewer" => {
+                let prev_source = state.media_selection.get().or_else(|| state.source_clip.get());
+                if !state.dual_viewer.get() {
+                    self.set_dual_viewer(true);
+                }
+                if let Some(sv) = self.source_viewer.borrow().as_ref() {
+                    if state.source_clip.get().is_none() && prev_source.is_some() {
+                        sv.show_source(prev_source);
+                        state.source_clip.set(prev_source);
+                    }
+                    sv.surface.grab_focus();
+                }
+            }
             "win.focus-timeline" => {
                 self.edit.timeline.canvas.grab_focus();
+            }
+            "win.focus-timeline-viewer" => {
+                if !state.dual_viewer.get() && state.source_mode() {
+                    self.viewer.show_source(None);
+                }
+                self.viewer.surface.grab_focus();
             }
             "win.focus-inspector" => {
                 self.panel_buttons[2].set_active(true);

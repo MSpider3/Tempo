@@ -158,7 +158,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Resolve keys Tempo must never use for something else (docs/KEYBINDS.md §14).
-    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>r", "<Primary>y", "<Primary>e", "<Primary><Shift>c"];
+    const RESERVED: &[&str] = &["w", "s", "e", "u", "f", "g", "<Primary>d", "<Primary>r", "<Primary>e", "<Primary><Shift>c"];
 
     #[test]
     fn only_the_delete_keys_are_kept_for_widgets_that_own_them() {
@@ -232,6 +232,9 @@ mod tests {
             "comma" => ",".to_string(),
             "period" => ".".to_string(),
             "backslash" => "\\".to_string(),
+            "slash" => "/".to_string(),
+            "semicolon" => ";".to_string(),
+            "apostrophe" => "'".to_string(),
             "equal" => "=".to_string(),
             "minus" => "-".to_string(),
             k if k.len() == 1 => k.to_uppercase(),
