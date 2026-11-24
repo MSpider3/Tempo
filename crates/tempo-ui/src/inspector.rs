@@ -139,14 +139,20 @@ impl Inspector {
                 // An edit from the curve graph rebuilds the panel; keep the keyboard on the new graph
                 // so the next Delete removes a key, not the transition.
                 let prev_focus = i.root.root().and_then(|r| r.focus());
+                let had_no_focus = prev_focus.is_none();
                 let in_body = prev_focus.as_ref().is_some_and(|f| f.is_ancestor(&i.body));
                 let graph_focused = prev_focus.as_ref().is_some_and(|f| f.has_css_class(crate::keybinds::OWNS_DELETE_KEYS) && f.is_ancestor(&i.body));
+                if !graph_focused && in_body {
+                    if let Some(win) = i.root.root().and_downcast::<gtk::Window>() {
+                        gtk::prelude::GtkWindowExt::set_focus(&win, None::<&gtk::Widget>);
+                    }
+                }
                 i.rebuild();
                 if graph_focused {
                     if let Some(graph) = descendant_with_class(i.body.upcast_ref(), crate::keybinds::OWNS_DELETE_KEYS) {
                         graph.grab_focus();
                     }
-                } else if in_body || prev_focus.is_none() {
+                } else if in_body || had_no_focus {
                     // Prevent GTK from falling back onto the first text entry when a focused
                     // widget in the rebuilt body is removed (or when focus was unset), which would hijack Ctrl+Z.
                     if let Some(win) = i.root.root().and_downcast::<gtk::Window>() {
@@ -154,7 +160,17 @@ impl Inspector {
                     }
                 }
                 let adjustment = i.scroller.vadjustment();
-                glib::idle_add_local_once(move || adjustment.set_value(at));
+                let (root, body) = (i.root.clone(), i.body.clone());
+                glib::idle_add_local_once(move || {
+                    adjustment.set_value(at);
+                    if !graph_focused && (in_body || had_no_focus) {
+                        if let Some(win) = root.root().and_downcast::<gtk::Window>() {
+                            if gtk::prelude::GtkWindowExt::focus(&win).is_some_and(|f| f.is_ancestor(&body)) {
+                                gtk::prelude::GtkWindowExt::set_focus(&win, None::<&gtk::Widget>);
+                            }
+                        }
+                    }
+                });
             }
         });
         inspector.rebuild();
