@@ -6,6 +6,26 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Project Manager & File Operations (DaVinci Resolve parity):**
+  - Hierarchical Project Manager folders (`New Folder`, `Rename…`, `Delete Folder` returning projects to root, `Move to Folder…`, breadcrumb navigation), Grid/List views (`GtkColumnView`), Sort dropdown (`Date Modified`, `Name A–Z`, `Name Z–A`), Thumbnail Size slider (`160–320 px`), real project card thumbnails (`~/.cache/tempo/project-thumbs/`), and footer `Export` button.
+  - `New Project` dialog now validates project names case-insensitively (`"Name Already Exists"` modal) and lets users pick a custom save folder.
+  - `Save Project As…` (`Ctrl+Shift+S` / `app.save-as`) and `Project Settings…` (`Shift+9` / `win.project-settings`, also accessible from the bottom-right Settings button).
+- **Media Pool Bins, Usage Bar & Hover-Scrubbing:**
+  - `New Bin` (`Ctrl+Shift+N` / `win.new-bin`) + `Master` bin hierarchy, collapsible Bin Tree sidebar, breadcrumb navigation (`Master / …`), drag-and-drop for clips and timelines across bins, active-bin inheritance on `Create New Timeline`, recursive `Import Folder…`, Grid/List view toggle, Sort selector, and Thumbnail Zoom slider (`64–160 px`).
+  - Red bottom `"Used in Timeline"` indicator bar on placed clips, debounced thumbnail hover-scrubbing into the Source Viewer, and SQLite schema migration **v6 → v7** persisting `timelines.bin_id`.
+- **Timeline Editing, Resolve Keybinds & Viewer Controls:**
+  - Track header right-click menu (`Add Video Track`, `Add Audio Track (Stereo/Mono)`, `Delete Track` via undoable `DeleteTrackCommand`), `Shift+Scroll` track height resize (`36–140 px`), `Alt+drag` atomic clip duplication (`CompositeCommand`), and Effects drop support for `Filters`, `Titles`, and `Audio Transitions > Crossfade`.
+  - Split Clip (`Ctrl+\`) falls back to unlocked clips under the playhead when nothing is selected; `M` reopens `Edit Marker` when already on a marker; `J`/`L` & `Shift+J`/`Shift+L` shuttle up to `64×`.
+  - Viewer `Loop` button (`Ctrl+/`), Zoom dropdown (`Fit`, `25%`, `50%`, `100%`, `200%`, `Z`, `Alt+Shift+Z`), Full-Page Viewer (`Shift+F`), Source/Timeline viewer focus (`Ctrl+3` / `Ctrl+5`), and remaining Resolve keybinds (`V` select edit point, `Alt+\` join clip, `Y`/`Alt+Y`/`Ctrl+Y`/`Ctrl+Alt+Y` track selection, `Ctrl+Shift+V` paste insert, `Shift+F10` ripple overwrite, `Ctrl+Shift+,`/`.` swap, `±1`/`±3 dB` volume steps, `Ctrl+Shift+1..4` video track toggles, `Alt+L` play again, `Alt+/` play In to Out, `/` play around, `Shift+S` scrub audio, `;`/`'` first/last frame, `Shift+A` mark selection).
+- **Inspector Multi-Clip Editing & Effects Panel:**
+  - Multi-clip batch editing across `Transform`, `Composite`, `Audio`, `Fades`, and `Title` with `"Mixed"` badges and single-step `CompositeCommand` undo/redo.
+  - Full `TitleData` controls (`Font` entry + presets, `Color`, and transparent/color `Background`), `Audio Transitions > Crossfade`, and drag-and-drop sources on `Titles` and `Filters`.
+- **Deliver / Export Queue & Custom Controls:**
+  - Exposed `Format` (`MP4`, `MOV`, `MKV`), `Video Codec` (`H.264`, `H.265`), `Audio Codec` (`AAC`, `FLAC`, `PCM`), `Normalize` (`Off`, `YouTube (-14 LUFS)`), and `Custom` preset `Width`/`Height` spinbuttons alongside `YouTube 1080p` / `YouTube 2160p` preset labels.
+  - Render Queue job card selection toggles `Render 1` (render selected queued job) vs `Render All` when deselected.
+
 ## [0.3.0] - 2026-11-20
 
 Alpha. The Edit page works much more like DaVinci Resolve's:
