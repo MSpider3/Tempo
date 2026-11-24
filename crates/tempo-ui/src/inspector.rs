@@ -128,6 +128,9 @@ impl Inspector {
         let i = inspector.clone();
         state.connect(move |change| {
             if matches!(change, Change::Selection | Change::Timeline | Change::Project) {
+                if i.busy.get() {
+                    return;
+                }
                 // Editing keeps the panel where the user is; something else selected starts at the top.
                 let now = Some((i.state.edit_selection.get(), i.state.selected_ids()));
                 let same = *i.shown.borrow() == now;
@@ -1011,10 +1014,13 @@ fn bind_title_entry(entry: &gtk::Entry, initial: String, mixed: bool, commit: im
                 dirty.set(false);
                 return;
             }
-            if commit(text.clone()) {
-                *last.borrow_mut() = Some(text);
-                dirty.set(false);
+            let prev_last = last.borrow().clone();
+            *last.borrow_mut() = Some(text.clone());
+            dirty.set(false);
+            if commit(text) {
                 e.set_placeholder_text(None);
+            } else {
+                *last.borrow_mut() = prev_last;
             }
         }
     });
