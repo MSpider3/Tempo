@@ -6,6 +6,15 @@ All notable changes to Tempo are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-25
+
+Alpha. More of DaVinci Resolve's everyday tools:
+- Project Manager folders, Save Project As and Project Settings;
+- Media Pool bins, a "used in timeline" bar and hover scrubbing;
+- multi-clip editing in the Inspector, and Clip Attributes (frame rate conform, audio channels, display name);
+- MP4/MOV/MKV, H.264/H.265 and loudness normalising on the Export page;
+- the remaining Resolve shortcuts from the key list, a startup splash and beginner help.
+
 ### Added
 
 - **Project Manager & File Operations (DaVinci Resolve parity):**
@@ -388,7 +397,9 @@ The first release of the Rust rewrite. It replaces the earlier Python prototype.
 - The wgpu renderer, the WebAssembly plugin host and the Python helper, none of which the
   editor used any more.
 
-[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MSpider3/Tempo/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MSpider3/Tempo/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/MSpider3/Tempo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MSpider3/Tempo/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MSpider3/Tempo/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MSpider3/Tempo/releases/tag/v0.1.0
