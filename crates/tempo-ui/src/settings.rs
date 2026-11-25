@@ -17,7 +17,7 @@ pub struct Settings {
     pub playback_height: u32,
     /// Make small proxy files for heavy footage in the background.
     pub auto_proxies: bool,
-    /// Show the GTA-style behind-the-scenes splash screen on interactive startup.
+    /// Show the behind-the-scenes splash screen on interactive startup.
     #[serde(default = "default_true")]
     pub show_splash: bool,
     /// Use the graphics chip to decode video when it can. Off by default until

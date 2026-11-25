@@ -26,8 +26,8 @@ All notable changes to Tempo are recorded here. The format follows
   - Exposed `Format` (`MP4`, `MOV`, `MKV`), `Video Codec` (`H.264`, `H.265`), `Audio Codec` (`AAC`, `FLAC`, `PCM`), `Normalize` (`Off`, `YouTube (-14 LUFS)`), and `Custom` preset `Width`/`Height` spinbuttons alongside `YouTube 1080p` / `YouTube 2160p` preset labels.
   - Render Queue job card selection toggles `Render 1` (render selected queued job) vs `Render All` when deselected.
 
-- **GTA-Style Startup Splash & Beginner Helper Suite:**
-  - GTA-style behind-the-scenes meme startup splash screen with 4 compressed 1280×720 illustrations (`assets/splash/`), Ken Burns motion, DaVinci Resolve beginner tips, instant Skip (click/any key), lazy texture decode/free on exit (`0 MB` kept during editing), and Preferences toggle (`Show startup splash screen`).
+- **Startup Splash & Beginner Helper Suite:**
+  - Behind-the-scenes meme startup splash screen with 4 compressed 1280×720 illustrations (`assets/splash/`), Ken Burns motion, DaVinci Resolve beginner tips, instant Skip (click/any key), lazy texture decode/free on exit (`0 MB` kept during editing), and Preferences toggle (`Show startup splash screen`).
   - Searchable **How Do I…?** dialog (`?` button in the top bar and Help menu) with step-by-step guides and DaVinci Resolve shortcuts.
   - Auto-tracking **First-Edit Checklist** popover (`First Edit 0/5` -> `5/5 ✓`, dismissible/restorable) updating live across Import, Place, Split, Transition, and Export Queue actions.
   - Per-panel `?` mini-guide popovers on **Media Pool**, **Timeline**, **Inspector**, and **Export** explaining each panel and its DaVinci Resolve equivalent.

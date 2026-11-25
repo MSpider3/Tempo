@@ -705,7 +705,7 @@ impl ExportPage {
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.rebuild_queue();
-        self.state.checklist_queued.set(true);
+        crate::help::tick_step(&self.state.checklist_queued, "queued");
         self.state.emit(Change::Options);
         true
     }

@@ -363,6 +363,28 @@ pub fn checklist_dismissed_marker() -> PathBuf {
     glib::user_config_dir().join("tempo").join("checklist-dismissed")
 }
 
+/// Marker for a step the project itself cannot show ("split", "queued").
+fn checklist_step_marker(step: &str) -> PathBuf {
+    glib::user_config_dir().join("tempo").join(format!("checklist-{step}"))
+}
+
+/// Blocking: call from a worker.
+fn write_marker(path: PathBuf) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, b"1\n");
+}
+
+/// Tick a step the project cannot show and remember it for this user, like the dismissed flag.
+pub fn tick_step(done: &Cell<bool>, step: &'static str) {
+    if !done.replace(true) {
+        glib::MainContext::default().spawn_local(async move {
+            let _ = gio::spawn_blocking(move || write_marker(checklist_step_marker(step))).await;
+        });
+    }
+}
+
 /// Top-bar popover checklist that auto-ticks steps as the user edits in the real app.
 pub struct FirstEditChecklist {
     pub button: gtk::MenuButton,
@@ -455,7 +477,20 @@ impl FirstEditChecklist {
 
         let c = checklist.clone();
         glib::MainContext::default().spawn_local(async move {
-            let dismissed = gio::spawn_blocking(|| checklist_dismissed_marker().exists()).await.unwrap_or(false);
+            let (dismissed, split, queued) = gio::spawn_blocking(|| {
+                (
+                    checklist_dismissed_marker().exists(),
+                    checklist_step_marker("split").exists(),
+                    checklist_step_marker("queued").exists(),
+                )
+            })
+            .await
+            .unwrap_or((false, false, false));
+            if split || queued {
+                c.state.checklist_split.set(c.state.checklist_split.get() || split);
+                c.state.checklist_queued.set(c.state.checklist_queued.get() || queued);
+                c.refresh();
+            }
             if dismissed {
                 c.dismissed.set(true);
                 c.button.set_visible(false);
@@ -502,14 +537,7 @@ impl FirstEditChecklist {
         }
         self.button.set_visible(false);
         glib::MainContext::default().spawn_local(async move {
-            let _ = gio::spawn_blocking(|| {
-                let path = checklist_dismissed_marker();
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(path, b"1\n");
-            })
-            .await;
+            let _ = gio::spawn_blocking(|| write_marker(checklist_dismissed_marker())).await;
         });
     }
 
@@ -533,6 +561,21 @@ mod tests {
         Clip, ClipType, MediaSource, MediaType, Project, RationalFps, Transition,
         TransitionAlignment, TransitionEdge, TransitionKind,
     };
+
+    #[test]
+    fn opening_another_project_keeps_the_split_and_queue_ticks() {
+        // Arrange
+        let state = AppState::new();
+        state.checklist_split.set(true);
+        state.checklist_queued.set(true);
+
+        // Act
+        state.set_project(Some(Project::new("t", 1920, 1080, RationalFps::FPS_30)), None);
+
+        // Assert
+        let st = ChecklistStatus::for_state(&state);
+        assert!(st.split && st.queued);
+    }
 
     #[test]
     fn guide_search_filters_by_title_steps_and_shortcuts() {

@@ -1,4 +1,4 @@
-//! GTA-style startup splash showing behind-the-scenes illustrations of classic memes
+//! Startup splash showing behind-the-scenes illustrations of classic memes
 //! together with DaVinci Resolve beginner tips, decoded lazily and freed on exit.
 
 use std::cell::{Cell, RefCell};
@@ -155,11 +155,11 @@ impl SplashScreen {
         let on_skip: Rc<dyn Fn()> = Rc::new(on_skip);
         let canvas = SplashCanvas::new();
 
-        let brand = label("TEMPO", &["gta-brand"]);
+        let brand = label("TEMPO", &["splash-brand"]);
         brand.set_xalign(0.0);
-        let badge = label("BEHIND THE SCENES", &["gta-badge"]);
+        let badge = label("BEHIND THE SCENES", &["splash-badge"]);
         badge.set_valign(gtk::Align::Center);
-        let counter = label("1 / 4", &["gta-counter"]);
+        let counter = label("1 / 4", &["splash-counter"]);
         counter.set_valign(gtk::Align::Center);
         let top_row = gtk::Box::builder().spacing(10).halign(gtk::Align::Start).build();
         top_row.append(&badge);
@@ -169,20 +169,20 @@ impl SplashScreen {
         top_box.append(&brand);
         top_box.append(&top_row);
 
-        let slide_title = label("", &["gta-slide-title"]);
+        let slide_title = label("", &["splash-slide-title"]);
         slide_title.set_xalign(0.0);
         slide_title.set_wrap(true);
-        let caption = label("", &["gta-caption"]);
+        let caption = label("", &["splash-caption"]);
         caption.set_xalign(0.0);
         caption.set_wrap(true);
         caption.set_max_width_chars(56);
-        let tip = label("", &["gta-tip"]);
+        let tip = label("", &["splash-tip"]);
         tip.set_xalign(0.0);
         tip.set_wrap(true);
         tip.set_max_width_chars(60);
 
-        let progress = gtk::ProgressBar::builder().width_request(340).halign(gtk::Align::Start).css_classes(["gta-progress"]).build();
-        let status = label("STARTING MEDIA ENGINE", &["gta-status"]);
+        let progress = gtk::ProgressBar::builder().width_request(340).halign(gtk::Align::Start).css_classes(["splash-progress"]).build();
+        let status = label("STARTING MEDIA ENGINE", &["splash-status"]);
         status.set_xalign(0.0);
 
         let bottom_left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).hexpand(true).valign(gtk::Align::End).build();
@@ -195,13 +195,13 @@ impl SplashScreen {
         let skip_btn = gtk::Button::builder()
             .label("Skip")
             .tooltip_text("Skip loading screen (click or press any key)")
-            .css_classes(["pill-outline", "gta-skip"])
+            .css_classes(["pill-outline", "splash-skip"])
             .build();
         skip_btn.update_property(&[gtk::accessible::Property::Label("Skip loading screen")]);
         let skip_cb = on_skip.clone();
         skip_btn.connect_clicked(move |_| skip_cb());
 
-        let skip_hint = label("Click or press any key to skip", &["gta-skip-hint"]);
+        let skip_hint = label("Click or press any key to skip", &["splash-skip-hint"]);
         let bottom_right = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).halign(gtk::Align::End).valign(gtk::Align::End).build();
         bottom_right.append(&skip_btn);
         bottom_right.append(&skip_hint);
@@ -216,13 +216,13 @@ impl SplashScreen {
             .spacing(12)
             .hexpand(true)
             .vexpand(true)
-            .css_classes(["gta-splash-scrim"])
+            .css_classes(["splash-scrim"])
             .build();
         scrim.append(&top_box);
         scrim.append(&spacer);
         scrim.append(&bottom_row);
 
-        let root = gtk::Overlay::builder().css_classes(["loading", "gta-splash"]).build();
+        let root = gtk::Overlay::builder().css_classes(["loading", "splash"]).build();
         root.set_child(Some(&canvas));
         root.add_overlay(&scrim);
 
