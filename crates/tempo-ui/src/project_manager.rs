@@ -315,6 +315,71 @@ pub fn remember(name: &str, path: &Path) {
     remember_at(&list_path(), name, path, None);
 }
 
+/// Like [`remember`], but a project new to the list goes into `folder`. Blocking.
+pub fn remember_in(name: &str, path: &Path, folder: Option<&str>) {
+    remember_at(&list_path(), name, path, folder);
+}
+
+/// Whether a project other than the one at `except` already has `name` (case-insensitive).
+fn name_in_use(index: &ProjectIndex, except: &Path, name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    index.entries.iter().any(|e| e.path != except && e.name.trim().to_lowercase() == name)
+}
+
+/// Name and id for Save Project As to `new_path`. The name follows the file name typed,
+/// but keeping the suggested one is not a rename. A different file gets a new id so its
+/// backups and thumbnail don't mix with (and prune) the original's. Blocking.
+pub fn save_as_identity(
+    name: &str,
+    id: uuid::Uuid,
+    current_path: Option<&Path>,
+    new_path: &Path,
+) -> Result<(String, uuid::Uuid), String> {
+    save_as_identity_at(&list_path(), name, id, current_path, new_path)
+}
+
+fn save_as_identity_at(
+    list_file: &Path,
+    name: &str,
+    id: uuid::Uuid,
+    current_path: Option<&Path>,
+    new_path: &Path,
+) -> Result<(String, uuid::Uuid), String> {
+    let stem = new_path.file_stem().map(|s| s.to_string_lossy().trim().to_string()).unwrap_or_default();
+    let new_name = if stem.is_empty() || stem == safe_filename(name).trim() { name.to_string() } else { stem };
+    let same_file = current_path == Some(new_path);
+    if !(same_file && new_name == name) && name_in_use(&load_raw_index_at(list_file), new_path, &new_name) {
+        return Err("A project with the same name is already in use.".into());
+    }
+    Ok((new_name, if same_file { id } else { uuid::Uuid::new_v4() }))
+}
+
+/// Add `.tempo` unless the file name already ends in it. Appends rather than replaces,
+/// so "My.Film" becomes "My.Film.tempo", not "My.tempo".
+pub fn with_tempo_extension(path: PathBuf) -> PathBuf {
+    if path.extension().is_some_and(|e| e == "tempo") {
+        return path;
+    }
+    let mut s = path.into_os_string();
+    s.push(".tempo");
+    s.into()
+}
+
+/// Copy a project file for Export. Refuses the project's own file (or a link to it):
+/// `fs::copy` truncates the target before reading, which would empty the project. Blocking.
+fn export_project_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(dest)) {
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "that is the project's own file"));
+        }
+    }
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(src, dest).map(|_| ())
+}
+
 fn forget_at(list_file: &Path, path: &Path) {
     let mut index = load_raw_index_at(list_file);
     index.entries.retain(|e| e.path != path);
@@ -394,13 +459,7 @@ fn rename_project(path: &Path, name: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("Project name cannot be empty.".into());
     }
-    let list_file = list_path();
-    let index = load_raw_index_at(&list_file);
-    let duplicate = index
-        .entries
-        .iter()
-        .any(|e| e.path != path && e.name.trim().to_lowercase() == trimmed.to_lowercase());
-    if duplicate {
+    if name_in_use(&load_raw_index_at(&list_path()), path, trimmed) {
         return Err("A project with the same name is already in use.".into());
     }
     let mut project = tempo_project::load_project(path).map_err(|e| e.to_string())?;
@@ -514,8 +573,9 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
-    /// `on_open` receives a project path; `on_new` asks for the New Project dialog.
-    pub fn new(on_open: impl Fn(PathBuf) + Clone + 'static, on_new: impl Fn() + 'static) -> Rc<Self> {
+    /// `on_open` receives a project path; `on_new` asks for the New Project dialog,
+    /// with the folder that is open (the new project goes there).
+    pub fn new(on_open: impl Fn(PathBuf) + Clone + 'static, on_new: impl Fn(Option<String>) + 'static) -> Rc<Self> {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .css_classes(["tempo-panel"])
@@ -726,7 +786,8 @@ impl ProjectManager {
             p.export.set_sensitive(matches!(item, Some(ManagerItem::Project(e)) if !e.missing));
         });
 
-        new.connect_clicked(move |_| on_new());
+        let p = pm.clone();
+        new.connect_clicked(move |_| on_new(p.current_folder.borrow().clone()));
 
         let p = pm.clone();
         let open_cb = on_open.clone();
@@ -793,20 +854,11 @@ impl ProjectManager {
             let pm = p.clone();
             let src = entry.path.clone();
             dialog.save(b.root().and_downcast::<gtk::Window>().as_ref(), gio::Cancellable::NONE, move |result| {
-                let Some(mut dest) = result.ok().and_then(|f| f.path()) else { return };
-                if dest.extension().is_none() {
-                    dest.set_extension("tempo");
-                }
+                let Some(dest) = result.ok().and_then(|f| f.path()).map(with_tempo_extension) else { return };
                 let pm = pm.clone();
                 let src = src.clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let res = gio::spawn_blocking(move || {
-                        if let Some(dir) = dest.parent() {
-                            std::fs::create_dir_all(dir)?;
-                        }
-                        std::fs::copy(&src, &dest).map(|_| ())
-                    })
-                    .await;
+                    let res = gio::spawn_blocking(move || export_project_file(&src, &dest)).await;
                     match res {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => pm.report(&format!("Could not export the project: {e}")),
@@ -1176,7 +1228,9 @@ impl ProjectManager {
                     glib::MainContext::default().spawn_local(async move {
                         let restored = gio::spawn_blocking(move || {
                             let (copy, name) = restore_backup(&file, &taken, &original)?;
-                            remember(&name, &copy);
+                            let index = load_raw_index_at(&list_path());
+                            let folder = index.entries.iter().find(|e| e.path == original).and_then(|e| e.folder.clone());
+                            remember_in(&name, &copy, folder.as_deref());
                             Ok::<_, String>(copy)
                         });
                         match restored.await {
@@ -1753,6 +1807,96 @@ mod tests {
         assert_eq!(next_default_project_name(&[]), "Untitled Project");
         assert_eq!(next_default_project_name(&["Untitled Project".into()]), "Untitled Project 2");
         assert_eq!(next_default_project_name(&existing), "Untitled Project 3");
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tempo-pm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
+
+    fn entry(name: &str, path: &str, folder: Option<&str>) -> Entry {
+        Entry {
+            name: name.into(),
+            path: PathBuf::from(path),
+            folder: folder.map(str::to_string),
+            modified: None,
+            missing: false,
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn export_onto_the_projects_own_file_is_refused_and_keeps_it() {
+        let dir = test_dir("export");
+        let src = dir.join("Film.tempo");
+        std::fs::write(&src, vec![7u8; 4096]).expect("write");
+        let link = dir.join("link.tempo");
+        std::fs::hard_link(&src, &link).expect("hard link");
+
+        assert!(export_project_file(&src, &src).is_err());
+        assert!(export_project_file(&src, &link).is_err());
+        assert_eq!(std::fs::metadata(&src).expect("meta").len(), 4096, "the project is not emptied");
+
+        let out = dir.join("out").join("Film.tempo");
+        export_project_file(&src, &out).expect("export elsewhere");
+        assert_eq!(std::fs::read(&out).expect("read"), vec![7u8; 4096]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tempo_extension_is_appended_not_swapped() {
+        assert_eq!(with_tempo_extension("/a/My.Film".into()), PathBuf::from("/a/My.Film.tempo"));
+        assert_eq!(with_tempo_extension("/a/Film".into()), PathBuf::from("/a/Film.tempo"));
+        assert_eq!(with_tempo_extension("/a/Film.tempo".into()), PathBuf::from("/a/Film.tempo"));
+    }
+
+    #[test]
+    fn new_projects_go_into_the_given_folder_and_known_ones_keep_theirs() {
+        let dir = test_dir("remember");
+        let list = dir.join("projects.json");
+        let index = ProjectIndex {
+            folders: vec!["Client Work".into(), "Archive".into()],
+            entries: vec![entry("Old", "/tmp/old.tempo", Some("Archive"))],
+        };
+        save_index_at(&list, &index).expect("save");
+
+        remember_at(&list, "New", Path::new("/tmp/new.tempo"), Some("Client Work"));
+        remember_at(&list, "Old", Path::new("/tmp/old.tempo"), Some("Client Work"));
+        let index = load_raw_index_at(&list);
+        let folder_of = |p: &str| index.entries.iter().find(|e| e.path == Path::new(p)).and_then(|e| e.folder.clone());
+        assert_eq!(folder_of("/tmp/new.tempo").as_deref(), Some("Client Work"));
+        assert_eq!(folder_of("/tmp/old.tempo").as_deref(), Some("Archive"), "an existing entry keeps its folder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_gives_a_new_file_its_own_id_and_checks_the_name() {
+        let dir = test_dir("save-as");
+        let list = dir.join("projects.json");
+        let index = ProjectIndex {
+            folders: Vec::new(),
+            entries: vec![entry("Film", "/p/Film.tempo", None), entry("Cut/1", "/p/Cut_1.tempo", None)],
+        };
+        save_index_at(&list, &index).expect("save");
+        let id = uuid::Uuid::new_v4();
+        let here = Some(Path::new("/p/Film.tempo"));
+
+        // A new file: new id, name from the typed file name.
+        let (name, new_id) = save_as_identity_at(&list, "Film", id, here, Path::new("/q/Film v2.tempo")).expect("ok");
+        assert_eq!(name, "Film v2");
+        assert_ne!(new_id, id);
+        // Same file: same id, so its own backups stay its own.
+        let (name, same_id) = save_as_identity_at(&list, "Film", id, here, Path::new("/p/Film.tempo")).expect("ok");
+        assert_eq!((name.as_str(), same_id), ("Film", id));
+        // The suggested name in another folder would be a second "Film".
+        assert!(save_as_identity_at(&list, "Film", id, here, Path::new("/q/film.tempo")).is_err());
+        // Keeping the suggested (made safe) file name is not a rename.
+        let cut = Some(Path::new("/p/Cut_1.tempo"));
+        let (name, _) = save_as_identity_at(&list, "Cut/1", id, cut, Path::new("/p/Cut_1.tempo")).expect("ok");
+        assert_eq!(name, "Cut/1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

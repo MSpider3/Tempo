@@ -293,7 +293,7 @@ impl MainWindow {
         // Project Manager needs callbacks into the window, so it is built last.
         let w = win.clone();
         let w2 = win.clone();
-        let manager = ProjectManager::new(move |path| w.open_project(path), move || w2.new_project());
+        let manager = ProjectManager::new(move |path| w.open_project(path), move |folder| w2.new_project(folder));
         win.root.add_named(&manager.root, Some("projects"));
         *win.manager.borrow_mut() = Some(manager);
 
@@ -612,7 +612,8 @@ impl MainWindow {
 
     // ---- Projects ------------------------------------------------------------------
 
-    fn new_project(self: &Rc<Self>) {
+    /// New Project dialog; the project is filed in `folder` of the Project Manager.
+    fn new_project(self: &Rc<Self>, folder: Option<String>) {
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let existing_names = gio::spawn_blocking(|| {
@@ -623,6 +624,7 @@ impl MainWindow {
             let w2 = w.clone();
             dialogs::new_project(&w.window, existing_names, move |np| {
                 let w = w2.clone();
+                let folder = folder.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let created = gio::spawn_blocking(move || -> Result<(Project, PathBuf), String> {
                         let mut target_path = np.path.clone();
@@ -644,7 +646,7 @@ impl MainWindow {
                             tempo_project::create_new_project(&np.name, np.width, np.height, np.fps, &target_path)
                                 .map_err(|e| e.to_string())?;
                         project.proxy_dir = glib::user_cache_dir().join("tempo").join("proxies");
-                        project_manager::remember(&project.name, &target_path);
+                        project_manager::remember_in(&project.name, &target_path, folder.as_deref());
                         Ok((project, target_path))
                     })
                     .await;
@@ -767,18 +769,18 @@ impl MainWindow {
         let current_path = self.state.path.borrow().clone();
         let Some(current_name) = self.state.with_project(|p| p.name.clone()) else { return };
         let w = self.clone();
+        let old_path = current_path.clone();
         dialogs::save_project_as(&self.window, current_path.as_deref(), &current_name, move |new_path| {
             let Some(mut project) = w.state.project.borrow().clone() else { return };
-            if let Some(stem) = new_path.file_stem().map(|s| s.to_string_lossy().trim().to_string()).filter(|s| !s.is_empty()) {
-                if stem != project.name {
-                    project.name = stem;
-                }
-            }
-            let saved_name = project.name.clone();
             let w2 = w.clone();
             let path_for_state = new_path.clone();
+            let old_path = old_path.clone();
             glib::MainContext::default().spawn_local(async move {
-                let res = gio::spawn_blocking(move || -> Result<(), String> {
+                let res = gio::spawn_blocking(move || -> Result<(String, uuid::Uuid), String> {
+                    let (name, id) =
+                        project_manager::save_as_identity(&project.name, project.id, old_path.as_deref(), &new_path)?;
+                    project.name = name;
+                    project.id = id;
                     if let Some(dir) = new_path.parent() {
                         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                     }
@@ -786,14 +788,15 @@ impl MainWindow {
                     tempo_project::remove_autosave(&new_path);
                     project_manager::remember(&project.name, &new_path);
                     project_manager::save_project_thumbnail(&project);
-                    Ok(())
+                    Ok((project.name, project.id))
                 })
                 .await;
                 match res {
-                    Ok(Ok(())) => {
+                    Ok(Ok((saved_name, saved_id))) => {
                         *w2.state.path.borrow_mut() = Some(path_for_state);
                         if let Some(p) = w2.state.project.borrow_mut().as_mut() {
                             p.name = saved_name;
+                            p.id = saved_id;
                         }
                         w2.state.set_dirty(false);
                         w2.state.emit(Change::Project);
