@@ -131,6 +131,8 @@ pub struct MediaPool {
     thumb_cache: RefCell<HashMap<Uuid, (usize, gdk::Texture)>>,
     hover_gen: Cell<u64>,
     hover_restore: Cell<Option<(Option<Uuid>, (Option<i64>, Option<i64>))>>,
+    /// The project the pool was last reset for; Save As and Project Settings keep it.
+    last_project: Cell<Option<Uuid>>,
     window: glib::WeakRef<gtk::Window>,
     on_open: Rc<dyn Fn(Uuid)>,
 }
@@ -361,6 +363,7 @@ impl MediaPool {
             thumb_cache: RefCell::new(HashMap::new()),
             hover_gen: Cell::new(0),
             hover_restore: Cell::new(None),
+            last_project: Cell::new(None),
             window: glib::WeakRef::new(),
             on_open,
         });
@@ -476,12 +479,15 @@ impl MediaPool {
         state.connect(move |change| {
             match change {
                 Change::Project => {
-                    p.end_hover_scrub();
-                    p.hover_restore.set(None);
-                    p.thumb_cache.borrow_mut().clear();
-                    p.current_bin.set(None);
-                    let has_bins = p.state.with_project(|proj| !proj.bins.is_empty()).unwrap_or(false);
-                    p.set_sidebar_open(has_bins);
+                    let id = p.state.with_project(|proj| proj.id);
+                    if p.last_project.replace(id) != id {
+                        p.end_hover_scrub();
+                        p.hover_restore.set(None);
+                        p.thumb_cache.borrow_mut().clear();
+                        p.current_bin.set(None);
+                        let has_bins = p.state.with_project(|proj| !proj.bins.is_empty()).unwrap_or(false);
+                        p.set_sidebar_open(has_bins);
+                    }
                     p.reload();
                 }
                 Change::Media | Change::Timeline | Change::Timelines => {
@@ -1198,7 +1204,7 @@ impl MediaPool {
     }
 
     fn schedule_hover_scrub(self: &Rc<Self>, id: Uuid, duration_us: i64, x: f64, width: i32) {
-        if duration_us <= 0 || width <= 0 || self.state.player.is_playing() {
+        if duration_us <= 0 || width <= 0 || self.state.shown_source_player().is_playing() {
             return;
         }
         let frac = (x / width as f64).clamp(0.0, 1.0);
@@ -1207,7 +1213,7 @@ impl MediaPool {
         self.hover_gen.set(generation);
         let pool = self.clone();
         glib::timeout_add_local_once(Duration::from_millis(HOVER_SCRUB_DEBOUNCE_MS), move || {
-            if pool.hover_gen.get() != generation || pool.state.player.is_playing() {
+            if pool.hover_gen.get() != generation || pool.state.shown_source_player().is_playing() {
                 return;
             }
             pool.preview_hover(id, target_us);
@@ -1234,9 +1240,7 @@ impl MediaPool {
         if self.state.source_clip.get() != Some(id) {
             self.state.show_source(Some(id));
         }
-        if !self.state.dual_viewer.get() {
-            self.state.player.seek(target_us, false);
-        }
+        self.state.shown_source_player().seek(target_us, false);
     }
 
     fn end_hover_scrub(&self) {
@@ -1678,7 +1682,8 @@ fn scan_media_folder(folder: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let path = entry.path();
-            if path.is_dir() {
+            // file_type() does not follow symlinks, so a link back to a parent folder cannot loop.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 if depth < MAX_DEPTH {
                     stack.push((path, depth + 1));
                 }
@@ -2206,6 +2211,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let names: Vec<_> = found.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
         assert_eq!(names, vec!["clip.MP4", "take.wav"]);
+    }
+
+    #[test]
+    fn scan_media_folder_does_not_follow_symlinked_directories() {
+        let dir = std::env::temp_dir().join(format!("tempo-media-pool-loop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip.mp4"), b"").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+
+        let found = scan_media_folder(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, vec![dir.join("clip.mp4")]);
     }
 
     #[test]

@@ -1593,16 +1593,23 @@ impl ReplaceTimelineCommand {
     pub fn new(description: impl Into<String>, after: Timeline) -> Self {
         Self { other: after, description: description.into() }
     }
+
+    /// Bin moves are not undo steps, so the timeline keeps the bin it is in now.
+    fn swap(&mut self, timeline: &mut Timeline) {
+        let bin_id = timeline.bin_id;
+        std::mem::swap(timeline, &mut self.other);
+        timeline.bin_id = bin_id;
+    }
 }
 
 impl Command for ReplaceTimelineCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
-        std::mem::swap(timeline, &mut self.other);
+        self.swap(timeline);
         Ok(())
     }
 
     fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
-        std::mem::swap(timeline, &mut self.other);
+        self.swap(timeline);
         Ok(())
     }
 
@@ -2675,6 +2682,24 @@ mod tests {
         assert_eq!(timeline, before);
         log.redo(&mut timeline).unwrap();
         assert_eq!(timeline, other);
+    }
+
+    #[test]
+    fn replace_timeline_keeps_the_bin_the_timeline_is_in_now() {
+        let mut timeline = Timeline::new_default();
+        let stale = timeline.clone();
+        let bin = Some(Uuid::new_v4());
+        timeline.bin_id = bin;
+        let mut log = CommandLog::new();
+        log.execute(Box::new(ReplaceTimelineCommand::new("Script", stale)), &mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, bin);
+
+        let moved = Some(Uuid::new_v4());
+        timeline.bin_id = moved;
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, moved);
+        log.redo(&mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, moved);
     }
 
     #[test]

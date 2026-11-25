@@ -996,6 +996,7 @@ impl MainWindow {
         if on && self.source_viewer.borrow().is_none() {
             let player = crate::player::Player::new();
             player.set_max_height(self.state.settings.borrow().playback_height);
+            *self.state.source_player.borrow_mut() = Some(player.clone());
             let source = Viewer::new_source(&self.state, player);
             self.edit.source_slot.append(&source.root);
             hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
