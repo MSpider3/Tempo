@@ -999,12 +999,17 @@ impl MainWindow {
             let player = crate::player::Player::new();
             player.set_max_height(self.state.settings.borrow().playback_height);
             let source = Viewer::new_source(&self.state, player);
-            // Clicking a viewer's picture makes it the one the keys act on.
-            for (surface, active) in [(&source.surface, true), (&self.viewer.surface, false)] {
+            // Clicking a viewer's picture makes it the one the keys act on; a click in the timeline hands them back to the timeline viewer.
+            let targets: [(&gtk::Widget, bool); 3] = [
+                (source.surface.upcast_ref(), true),
+                (self.viewer.surface.upcast_ref(), false),
+                (self.edit.timeline.canvas.upcast_ref(), false),
+            ];
+            for (widget, active) in targets {
                 let click = gtk::GestureClick::new();
                 let w = self.clone();
                 click.connect_pressed(move |_, _, _, _| w.source_active.set(active));
-                surface.add_controller(click);
+                widget.add_controller(click);
             }
             self.edit.source_slot.append(&source.root);
             hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
@@ -1632,6 +1637,7 @@ impl MainWindow {
                 }
             }
             "win.focus-timeline" => {
+                self.source_active.set(false);
                 self.edit.timeline.canvas.grab_focus();
             }
             "win.focus-timeline-viewer" => {

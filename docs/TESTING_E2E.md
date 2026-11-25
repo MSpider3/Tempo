@@ -118,7 +118,7 @@ anything missing. No root, no X server, no other compositor.
 | `24_new_timeline_marks` | Create New Timeline: Use Project Settings left of Cancel/Create in the bottom bar; with In/Out on a source clip, Empty Timeline off and Use Selected Mark In/Out on, the new clip's length is the marked span |
 | `25_curve_guides` | the curve graph's dashed guides at Start Ratio 20 % and End Ratio 80 % are outline-coloured, none at 50 %; a dragged key stays selected and Delete removes it |
 | `26_updown_source` | with a source clip shown in the viewer (scrubbed to about 5.4 s), Down/Up move the timeline playhead 4 s to 8 s to 12 s and back, from its own position |
-| `36_viewer_focus` | Ctrl+3 with one viewer shows the selected clip there (still one viewer); dual viewer: after Ctrl+3, L plays the source viewer and not the timeline, I/O + Loop loop the source's own In..Out; Ctrl+5 hands the keys back |
+| `36_viewer_focus` | Ctrl+3 with one viewer shows the selected clip there (still one viewer); dual viewer: after Ctrl+3, L plays the source viewer and not the timeline, I/O + Loop loop the source's own In..Out; Ctrl+5, Ctrl+4 or a click in the timeline hands the keys back |
 | `37_scrub_sound` | (`AUDIO`) Shift+S on, playback stopped: each Right step is heard; with it off, silent |
 
 ## Sound

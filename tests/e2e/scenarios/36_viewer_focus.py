@@ -1,4 +1,4 @@
-"""Ctrl+3 / Ctrl+5 pick the viewer the keys act on. One viewer: Ctrl+3 shows the selected Media Pool clip there and keeps the layout. Dual viewer: after Ctrl+3, L plays the source viewer (not the timeline), I/O mark it and Loop loops its own In..Out; Ctrl+5 hands the keys back to the timeline viewer."""
+"""Ctrl+3 / Ctrl+5 pick the viewer the keys act on. One viewer: Ctrl+3 shows the selected Media Pool clip there and keeps the layout. Dual viewer: after Ctrl+3, L plays the source viewer (not the timeline), I/O mark it and Loop loops its own In..Out; Ctrl+5, Ctrl+4 or a click in the timeline hands the keys back to the timeline viewer."""
 
 import re
 import time
@@ -79,4 +79,21 @@ def run(s):
     s.key("ctrl+5")
     s.key("l")
     s.wait_for(lambda: s.state()["playing"], "L to play the timeline after Ctrl+5")
+    s.key("k")
+
+    # 6. Ctrl+4 (Timeline window active) also hands the keys back to the timeline viewer.
+    s.wait_for(lambda: not s.state()["playing"], "K to stop the timeline")
+    s.key("ctrl+3")
+    s.key("ctrl+4")
+    s.key("l")
+    s.wait_for(lambda: s.state()["playing"], "L to play the timeline after Ctrl+3, Ctrl+4")
+    s.key("k")
+    s.wait_for(lambda: not s.state()["playing"], "K to stop the timeline")
+
+    # 7. So does a click in the timeline.
+    s.key("ctrl+3")
+    x, y, w, h = s.widget(type="TempoTimelineCanvas")["rect"]
+    s.click(x + w // 2, y + h - 10)
+    s.key("l")
+    s.wait_for(lambda: s.state()["playing"], "L to play the timeline after Ctrl+3 and a timeline click")
     s.key("k")
