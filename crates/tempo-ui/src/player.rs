@@ -514,11 +514,7 @@ impl Worker {
         }
         if self.playing && self.speed == 1.0 {
             // Wait for the audio thread to empty its queue, so the frame count starts at zero.
-            let deadline = Instant::now() + Duration::from_millis(150);
-            while out.clear_pending() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            if !out.clear_pending() {
+            if wait_while(|| out.clear_pending(), Duration::from_millis(150)) {
                 let _ = self.feeder.send(Feed::Start { snapshot: self.active(), pos_us: self.pos_us });
                 self.audio_clock = true;
                 self.audio_seen = (0, Instant::now());
@@ -903,6 +899,15 @@ fn stretch(src: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Waits (at most `timeout`) until `pending` turns false; true if it did.
+fn wait_while(pending: impl Fn() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while pending() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    !pending()
+}
+
 /// Mixes the audio tracks and keeps the output queue topped up while playing.
 fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
     let mut readers: Vec<(Uuid, PathBuf, AudioReader)> = Vec::new();
@@ -935,7 +940,9 @@ fn feed_audio(rx: Receiver<Feed>, out: Arc<AudioOutput>) {
             }
             Some(Feed::Scrub { snapshot, mut pos_us }) => {
                 readers.retain(|(id, path, _)| snapshot.sources.get(id) == Some(path) || snapshot.audio_sources.get(id) == Some(path));
-                if !out.clear_pending() && out.queued_frames() < FEED_FRAMES * 4 {
+                // The Seek that sent this cleared the queue just before; until the audio
+                // callback carries that out, a pushed snippet would be flushed with it.
+                if wait_while(|| out.clear_pending(), Duration::from_millis(60)) && out.queued_frames() < FEED_FRAMES * 4 {
                     for _ in 0..3 {
                         mix_audio_block(&snapshot, &mut readers, pos_us, &mut mix, &mut part, &mut source);
                         out.push(&mix);
@@ -1054,6 +1061,17 @@ mod tests {
     }
 
     const FRAME: Duration = Duration::from_millis(33);
+
+    #[test]
+    fn wait_while_returns_once_the_flag_clears_and_gives_up_at_the_timeout() {
+        // A clear that the audio callback carries out a few ms later is waited for.
+        let start = Instant::now();
+        assert!(wait_while(|| start.elapsed() < Duration::from_millis(5), Duration::from_millis(60)));
+        // One that never happens is given up on, not waited for forever.
+        let start = Instant::now();
+        assert!(!wait_while(|| true, Duration::from_millis(10)));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
 
     #[test]
     fn snapshot_steps_on_the_timelines_own_rate() {

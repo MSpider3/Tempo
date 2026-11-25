@@ -337,6 +337,8 @@ impl AppState {
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Project);
+        // Loop, scrub and zoom were reset above: let the viewers show and apply that.
+        self.emit(Change::Options);
     }
 
     /// Opens timeline `id`, as Resolve's timeline menu above the viewer does.
@@ -705,6 +707,23 @@ mod tests {
         assert_eq!(state.fps(), 25.0);
         assert_eq!(state.frame_step(0, 25), 1_000_000);
         assert_eq!(state.frame_floor(1_030_000), 1_000_000);
+    }
+
+    #[test]
+    fn opening_a_project_announces_the_reset_viewer_options() {
+        let state = AppState::new();
+        state.loop_playback.set(true);
+        state.viewer_zoom.set(Some(1.0));
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let s = state.clone();
+        let log = seen.clone();
+        state.connect(move |change| {
+            if matches!(change, Change::Options) {
+                log.borrow_mut().push((s.loop_playback.get(), s.viewer_zoom.get()));
+            }
+        });
+        state.set_project(None, None);
+        assert_eq!(*seen.borrow(), vec![(false, None)]);
     }
 
     #[test]
