@@ -115,6 +115,8 @@ pub struct AppState {
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
+    /// The dual Source Viewer's own player, once that viewer has been built.
+    pub source_player: RefCell<Option<Player>>,
     /// When on, playback loops over In..Out (if both set) or the whole timeline/source.
     pub loop_playback: Cell<bool>,
     /// When on, scrubbing or stepping plays a short snippet of audio at the playhead.
@@ -167,6 +169,7 @@ impl AppState {
             transition_clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
+            source_player: RefCell::new(None),
             loop_playback: Cell::new(false),
             scrub_audio: Cell::new(false),
             viewer_zoom: Cell::new(None),
@@ -238,6 +241,11 @@ impl AppState {
     /// True when In/Out and the transport act on a source clip shown in the single viewer.
     pub fn source_mode(&self) -> bool {
         self.source_clip.get().is_some() && !self.dual_viewer.get()
+    }
+
+    /// The player of whichever viewer shows source clips right now.
+    pub fn shown_source_player(&self) -> Player {
+        self.source_player.borrow().clone().filter(|_| self.dual_viewer.get()).unwrap_or_else(|| self.player.clone())
     }
 
     pub fn show_source(&self, source: Option<Uuid>) {
@@ -705,6 +713,21 @@ mod tests {
         assert_eq!(state.fps(), 25.0);
         assert_eq!(state.frame_step(0, 25), 1_000_000);
         assert_eq!(state.frame_floor(1_030_000), 1_000_000);
+    }
+
+    #[test]
+    fn shown_source_player_is_the_source_viewers_only_in_dual_mode() {
+        let state = AppState::new();
+        let source = Player::new();
+        *state.source_player.borrow_mut() = Some(source.clone());
+        state.shown_source_player().seek(1_000_000, false);
+        assert_eq!(state.player.position_us(), 1_000_000);
+        assert_eq!(source.position_us(), 0);
+
+        state.dual_viewer.set(true);
+        state.shown_source_player().seek(2_000_000, false);
+        assert_eq!(source.position_us(), 2_000_000);
+        assert_eq!(state.player.position_us(), 1_000_000);
     }
 
     #[test]
