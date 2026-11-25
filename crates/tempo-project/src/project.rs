@@ -974,8 +974,8 @@ mod tests {
         project.sources.insert(src_id, source);
 
         // Add 10 clips across 3 tracks
-        for track_idx in 0..3 {
-            let track_id = project.timeline.tracks[track_idx].id;
+        for (track_idx, track) in project.timeline.tracks.iter_mut().enumerate().take(3) {
+            let track_id = track.id;
             for clip_idx in 0..3 {
                 let start = clip_idx * 5_000_000;
                 let end = start + 4_000_000;
@@ -990,7 +990,7 @@ mod tests {
                     4_000_000,
                 );
                 clip.properties.opacity = 0.85;
-                project.timeline.tracks[track_idx].clips.push(clip);
+                track.clips.push(clip);
             }
         }
 
