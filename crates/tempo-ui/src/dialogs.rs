@@ -52,12 +52,17 @@ const RATES: [(&str, RationalFps); 8] = [
     ("60", RationalFps::FPS_60),
 ];
 
-/// The `RATES` that `native` footage can be conformed to within the clip speed limits.
-fn conform_rates(native: Option<RationalFps>) -> Vec<(&'static str, RationalFps)> {
-    let Some(n) = native.map(|n| n.to_f64()).filter(|n| *n > 0.0) else {
+/// The `RATES` that every one of `natives` can be conformed to within the clip speed limits.
+fn conform_rates(natives: &[RationalFps]) -> Vec<(&'static str, RationalFps)> {
+    let natives: Vec<f64> = natives.iter().map(|n| n.to_f64()).filter(|n| *n > 0.0).collect();
+    if natives.is_empty() {
         return Vec::new();
-    };
-    RATES.iter().copied().filter(|(_, r)| (MIN_SPEED..=MAX_SPEED).contains(&(r.to_f64() / n))).collect()
+    }
+    RATES
+        .iter()
+        .copied()
+        .filter(|(_, r)| natives.iter().all(|n| (MIN_SPEED..=MAX_SPEED).contains(&(r.to_f64() / n))))
+        .collect()
 }
 
 /// The speed each clip needs so it plays its own frames at `target` (None: native).
@@ -814,6 +819,8 @@ struct ClipAttributesSpec {
     has_video: bool,
     video_summary: String,
     native_fps: Option<RationalFps>,
+    /// Native rates of every source the conform retimes; the dropdown offers only rates all can honour.
+    conform_natives: Vec<RationalFps>,
     initial_conform_fps: Option<RationalFps>,
     source_duration_us: i64,
     preview_fps: RationalFps,
@@ -849,7 +856,7 @@ fn present_clip_attributes_dialog(
         None => "Native".to_string(),
     };
     // Only rates the speed limits can honour, so the label never promises a rate that is not played.
-    let rates = conform_rates(spec.native_fps);
+    let rates = conform_rates(&spec.conform_natives);
     let mut fps_labels = vec![native_label];
     for (r_label, _) in &rates {
         fps_labels.push(format!("{r_label} fps"));
@@ -1008,6 +1015,7 @@ pub fn clip_attributes_source(parent: &impl IsA<gtk::Widget>, state: &Rc<AppStat
                 has_video,
                 video_summary,
                 native_fps: s.video_fps,
+                conform_natives: s.video_fps.into_iter().collect(),
                 initial_conform_fps: s.conform_fps,
                 source_duration_us: s.duration_us,
                 preview_fps: p.timeline_fps(),
@@ -1034,11 +1042,13 @@ pub fn clip_attributes_source(parent: &impl IsA<gtk::Widget>, state: &Rc<AppStat
                     } else {
                         Some(patch.display_name)
                     };
-                    if src.display_name == next_name && src.conform_fps == patch.conform_fps && src.audio_channel_map == patch.channel_map {
+                    // Keep a stored conform the dropdown no longer offers unless the user changed the rate.
+                    let next_fps = if patch.fps_changed { patch.conform_fps } else { src.conform_fps };
+                    if src.display_name == next_name && src.conform_fps == next_fps && src.audio_channel_map == patch.channel_map {
                         return false;
                     }
                     src.display_name = next_name;
-                    src.conform_fps = patch.conform_fps;
+                    src.conform_fps = next_fps;
                     src.audio_channel_map = patch.channel_map;
                     true
                 })
@@ -1109,6 +1119,14 @@ pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppSt
                 .map(|(_, r)| *r)
                 .find(|r| (r.to_f64() - eff).abs() < 0.05 && (r.to_f64() - nf.to_f64()).abs() >= 0.05)
         });
+        let mut conform_natives: Vec<RationalFps> = Vec::new();
+        for c in collected.iter().filter(|c| matches!(c.clip_type, ClipType::Video | ClipType::Audio)) {
+            if let Some(f) = p.sources.get(&c.source_id).and_then(|s| s.video_fps) {
+                if !conform_natives.contains(&f) {
+                    conform_natives.push(f);
+                }
+            }
+        }
         let subtitle = if collected.len() == 1 {
             format!("Timeline Clip · {}", primary.name)
         } else {
@@ -1121,6 +1139,7 @@ pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppSt
             has_video,
             video_summary,
             native_fps,
+            conform_natives,
             initial_conform_fps,
             source_duration_us: (primary.source_out - primary.source_in).max(1),
             preview_fps: p.timeline_fps(),
@@ -1775,10 +1794,15 @@ mod clip_attributes_tests {
     #[test]
     fn only_rates_within_the_speed_limits_are_offered() {
         // 120 fps footage cannot slow below 0.25x, so 30 fps is the lowest it can be conformed to.
-        let rates: Vec<RationalFps> = conform_rates(Some(RationalFps { num: 120, den: 1 })).into_iter().map(|r| r.1).collect();
+        let fps_120 = RationalFps { num: 120, den: 1 };
+        let rates: Vec<RationalFps> = conform_rates(&[fps_120]).into_iter().map(|r| r.1).collect();
         assert_eq!(rates.first(), Some(&RationalFps::FPS_30));
         assert!(!rates.contains(&RationalFps::FPS_24));
-        assert_eq!(conform_rates(Some(RationalFps::FPS_30)).len(), super::RATES.len());
-        assert!(conform_rates(None).is_empty());
+        assert_eq!(conform_rates(&[RationalFps::FPS_30]).len(), super::RATES.len());
+        assert!(conform_rates(&[]).is_empty());
+        // A 30 fps clip selected with a 120 fps clip: 24 would clamp the 120 fps one, so it is not offered.
+        let mixed: Vec<RationalFps> = conform_rates(&[RationalFps::FPS_30, fps_120]).into_iter().map(|r| r.1).collect();
+        assert!(!mixed.contains(&RationalFps::FPS_24));
+        assert!(mixed.contains(&RationalFps::FPS_30));
     }
 }
