@@ -504,6 +504,9 @@ impl MainWindow {
             || std::env::var_os("TEMPO_SCREENSHOT").is_some()
             || std::env::var_os("TEMPO_OPEN").is_some();
         let started_at = std::time::Instant::now();
+        // Whether a slow start-up may show the splash: only once the setting says so, and
+        // never after start-up has finished (release() would not run again to stop it).
+        let splash_wanted = Rc::new(Cell::new(false));
 
         if force_splash {
             self.splash.activate();
@@ -514,8 +517,9 @@ impl MainWindow {
             self.root.set_visible_child_name("blank");
             // Show the loading screen only if start-up is not instant.
             let w = self.clone();
+            let wanted = splash_wanted.clone();
             glib::timeout_add_local_once(Duration::from_millis(300), move || {
-                if w.root.visible_child_name().as_deref() == Some("blank") {
+                if wanted.get() && w.root.visible_child_name().as_deref() == Some("blank") {
                     w.splash.activate();
                     w.root.set_visible_child_name("loading");
                 }
@@ -526,9 +530,12 @@ impl MainWindow {
         glib::MainContext::default().spawn_local(async move {
             w.splash.set_status("STARTING MEDIA ENGINE");
             w.splash.set_progress(0.35);
-            let (settings, hardware, turned_off) = gio::spawn_blocking(|| {
+            // The settings first (a small file), so the slow-start splash knows whether it is wanted.
+            let settings = gio::spawn_blocking(crate::settings::Settings::load).await.unwrap_or_default();
+            splash_wanted.set(force_splash || (!automated && settings.show_splash));
+            let (settings, hardware, turned_off) = gio::spawn_blocking(move || {
                 tempo_media::ensure_ffmpeg_init();
-                let mut settings = crate::settings::Settings::load();
+                let mut settings = settings;
                 let hardware = (tempo_media::hardware_decode_available(), tempo_export::ffmpeg::vaapi_h264_available());
                 // A saved setting the machine can't do is switched off, as Resolve resets
                 // an invalid GPU configuration, and the user is told once.
@@ -567,6 +574,7 @@ impl MainWindow {
                     if completed.replace(true) {
                         return;
                     }
+                    splash_wanted.set(false);
                     *w.splash_finish.borrow_mut() = None;
                     w.splash.release();
                     match open_target.as_ref() {

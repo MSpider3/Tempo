@@ -52,6 +52,35 @@ const RATES: [(&str, RationalFps); 8] = [
     ("60", RationalFps::FPS_60),
 ];
 
+/// The `RATES` that `native` footage can be conformed to within the clip speed limits.
+fn conform_rates(native: Option<RationalFps>) -> Vec<(&'static str, RationalFps)> {
+    let Some(n) = native.map(|n| n.to_f64()).filter(|n| *n > 0.0) else {
+        return Vec::new();
+    };
+    RATES.iter().copied().filter(|(_, r)| (MIN_SPEED..=MAX_SPEED).contains(&(r.to_f64() / n))).collect()
+}
+
+/// The speed each clip needs so it plays its own frames at `target` (None: native).
+/// A linked group counts once, as `SetClipSpeedCommand` retimes the whole group;
+/// clips whose source has no frame rate (music, stills) are left alone.
+fn conform_speeds(
+    clips: &[Clip],
+    target: Option<RationalFps>,
+    src_fps: &std::collections::HashMap<Uuid, RationalFps>,
+) -> Vec<(Uuid, f64)> {
+    let mut seen_links = std::collections::HashSet::new();
+    clips
+        .iter()
+        .filter(|c| matches!(c.clip_type, ClipType::Video | ClipType::Audio))
+        .filter_map(|clip| {
+            let native = src_fps.get(&clip.source_id).filter(|f| f.to_f64() > 0.0)?;
+            let speed = target.map_or(1.0, |t| (t.to_f64() / native.to_f64()).clamp(MIN_SPEED, MAX_SPEED));
+            let first = seen_links.insert(clip.properties.link.unwrap_or(clip.id));
+            (first && (clip.properties.speed - speed).abs() > 1e-4).then_some((clip.id, speed))
+        })
+        .collect()
+}
+
 /// Index of `fps` in `RATES`, or of 30 when the rate is not listed.
 fn rate_index(fps: RationalFps) -> u32 {
     RATES.iter().position(|r| r.1 == fps).or_else(|| RATES.iter().position(|r| r.1 == RationalFps::FPS_30)).unwrap_or(0) as u32
@@ -819,15 +848,17 @@ fn present_clip_attributes_dialog(
         Some(f) => format!("Native ({:.2} fps)", f.to_f64()),
         None => "Native".to_string(),
     };
+    // Only rates the speed limits can honour, so the label never promises a rate that is not played.
+    let rates = conform_rates(spec.native_fps);
     let mut fps_labels = vec![native_label];
-    for (r_label, _) in RATES {
+    for (r_label, _) in &rates {
         fps_labels.push(format!("{r_label} fps"));
     }
     let fps_refs: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
     let fps_drop = gtk::DropDown::from_strings(&fps_refs);
     let initial_fps_idx = spec
         .initial_conform_fps
-        .and_then(|cf| RATES.iter().position(|(_, r)| r.num == cf.num && r.den == cf.den))
+        .and_then(|cf| rates.iter().position(|(_, r)| r.num == cf.num && r.den == cf.den))
         .map(|i| (i + 1) as u32)
         .unwrap_or(0);
     fps_drop.set_selected(initial_fps_idx);
@@ -839,7 +870,7 @@ fn present_clip_attributes_dialog(
     form_row(&video_grid, 2, "Playback", &speed_preview);
 
     let update_preview = {
-        let (fps_drop, speed_preview) = (fps_drop.clone(), speed_preview.clone());
+        let (fps_drop, speed_preview, rates) = (fps_drop.clone(), speed_preview.clone(), rates.clone());
         let (native_fps, source_dur, preview_fps, has_video) =
             (spec.native_fps, spec.source_duration_us, spec.preview_fps, spec.has_video);
         move || {
@@ -849,7 +880,7 @@ fn present_clip_attributes_dialog(
             }
             let sel = fps_drop.selected() as usize;
             let spd = match (native_fps, sel) {
-                (Some(n), idx) if idx > 0 => RATES
+                (Some(n), idx) if idx > 0 => rates
                     .get(idx - 1)
                     .map(|(_, t)| (t.to_f64() / n.to_f64().max(1.0)).clamp(MIN_SPEED, MAX_SPEED))
                     .unwrap_or(1.0),
@@ -930,7 +961,7 @@ fn present_clip_attributes_dialog(
     dialog.connect_response(Some("apply"), move |_, _| {
         let sel_fps = fps_drop.selected();
         let conform_fps = if sel_fps > 0 {
-            RATES.get((sel_fps - 1) as usize).map(|(_, f)| *f)
+            rates.get((sel_fps - 1) as usize).map(|(_, f)| *f)
         } else {
             None
         };
@@ -1031,7 +1062,7 @@ pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppSt
         return;
     }
 
-    let Some((clips, spec, timeline_fps, source_limits, lead_fps)) = state.with_project(|p| {
+    let Some((clips, spec, timeline_fps, source_limits, src_fps)) = state.with_project(|p| {
         let mut collected: Vec<Clip> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for id in &selected {
@@ -1103,7 +1134,8 @@ pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppSt
             .filter(|(_, s)| s.duration_us > 0)
             .map(|(id, s)| (*id, s.duration_us))
             .collect::<std::collections::HashMap<_, _>>();
-        Some((collected, spec, p.timeline_fps(), limits, native_fps))
+        let src_fps = p.sources.iter().filter_map(|(id, s)| Some((*id, s.video_fps?))).collect();
+        Some((collected, spec, p.timeline_fps(), limits, src_fps))
     }).flatten() else {
         return;
     };
@@ -1133,27 +1165,8 @@ pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppSt
         }
 
         if patch.fps_changed {
-            if let Some(native) = lead_fps.filter(|f| f.to_f64() > 0.0) {
-                let target_speed = match patch.conform_fps {
-                    Some(target) => (target.to_f64() / native.to_f64()).clamp(MIN_SPEED, MAX_SPEED),
-                    None => 1.0,
-                };
-                let mut seen_links = std::collections::HashSet::new();
-                for clip in &clips {
-                    if !matches!(clip.clip_type, ClipType::Video | ClipType::Audio) {
-                        continue;
-                    }
-                    let key = clip.properties.link.unwrap_or(clip.id);
-                    if seen_links.insert(key) && (clip.properties.speed - target_speed).abs() > 1e-4 {
-                        cmds.push(Box::new(SetClipSpeedCommand::new(
-                            clip.id,
-                            target_speed,
-                            true,
-                            timeline_fps,
-                            source_limits.clone(),
-                        )));
-                    }
-                }
+            for (id, speed) in conform_speeds(&clips, patch.conform_fps, &src_fps) {
+                cmds.push(Box::new(SetClipSpeedCommand::new(id, speed, true, timeline_fps, source_limits.clone())));
             }
         }
 
@@ -1457,7 +1470,7 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     general.add(&autosave);
     let show_splash = adw::SwitchRow::builder()
         .title("Show startup splash screen")
-        .subtitle("GTA-style behind-the-scenes cards and tips while loading (press any key to skip)")
+        .subtitle("Behind-the-scenes cards and tips while loading (press any key to skip)")
         .active(current.show_splash)
         .build();
     let c = change.clone();
@@ -1727,5 +1740,45 @@ mod marker_time_tests {
         assert_eq!(parse_timecode("00:75:00:00", 24.0), None);
         assert_eq!(parse_timecode("-1:00", 24.0), None);
         assert_eq!(parse_timecode("5", 24.0), None);
+    }
+}
+
+#[cfg(test)]
+mod clip_attributes_tests {
+    use super::{conform_rates, conform_speeds};
+    use tempo_timeline::{Clip, ClipType, RationalFps};
+    use uuid::Uuid;
+
+    #[test]
+    fn each_clip_is_conformed_from_its_own_frame_rate() {
+        // Arrange: a 60 fps clip, a 30 fps clip and a music clip with no frame rate.
+        let (s60, s30, music) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let fps = [(s60, RationalFps::FPS_60), (s30, RationalFps::FPS_30)].into_iter().collect();
+        let t = Uuid::new_v4();
+        let clips = [
+            Clip::new(t, s60, ClipType::Video, "a", 0, 1, 0, 1),
+            Clip::new(t, s30, ClipType::Video, "b", 1, 2, 0, 1),
+            Clip::new(t, music, ClipType::Audio, "m", 0, 1, 0, 1),
+        ];
+
+        // Act
+        let speeds = conform_speeds(&clips, Some(RationalFps::FPS_24), &fps);
+
+        // Assert
+        assert_eq!(speeds.len(), 2);
+        assert_eq!(speeds[0].0, clips[0].id);
+        assert!((speeds[0].1 - 0.4).abs() < 1e-9);
+        assert_eq!(speeds[1].0, clips[1].id);
+        assert!((speeds[1].1 - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_rates_within_the_speed_limits_are_offered() {
+        // 120 fps footage cannot slow below 0.25x, so 30 fps is the lowest it can be conformed to.
+        let rates: Vec<RationalFps> = conform_rates(Some(RationalFps { num: 120, den: 1 })).into_iter().map(|r| r.1).collect();
+        assert_eq!(rates.first(), Some(&RationalFps::FPS_30));
+        assert!(!rates.contains(&RationalFps::FPS_24));
+        assert_eq!(conform_rates(Some(RationalFps::FPS_30)).len(), super::RATES.len());
+        assert!(conform_rates(None).is_empty());
     }
 }

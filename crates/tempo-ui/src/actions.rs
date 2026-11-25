@@ -54,8 +54,10 @@ fn clips_for_source_marked(state: &AppState, source_id: Uuid, at_us: i64, video_
     // Honour In/Out marks set on this clip in the viewer's source mode.
     let marked = use_marks && state.source_clip.get() == Some(source_id);
     let full = if media_type == MediaType::Image { STILL_DURATION_US } else { duration.max(1) };
-    let src_in = if marked { state.src_in.get().unwrap_or(0).clamp(0, full - 1) } else { 0 };
-    let src_out = if marked { state.src_out.get().unwrap_or(full).clamp(src_in + 1, full) } else { full };
+    // The marks are in viewer time, which runs at the conformed rate; the clip wants file time.
+    let to_src = |v: i64| tempo_timeline::scale_us(v, conform_speed);
+    let src_in = if marked { to_src(state.src_in.get().unwrap_or(0)).clamp(0, full - 1) } else { 0 };
+    let src_out = if marked { state.src_out.get().map_or(full, to_src).clamp(src_in + 1, full) } else { full };
     let src_len = src_out - src_in;
     let timeline_len = if (conform_speed - 1.0).abs() < 1e-9 {
         src_len
@@ -815,9 +817,11 @@ pub fn replace_selected(state: &Rc<AppState>) {
         state.message("Select a clip on the timeline and a clip in the Media Pool first.");
         return;
     };
-    let Some((name, duration, media, has_audio)) = state
+    let Some((name, duration, media, has_audio, speed)) = state
         .with_project(|p| {
-            p.sources.get(&source).map(|s| (s.display_name(), s.duration_us, s.media_type, s.audio_channels.is_some()))
+            p.sources
+                .get(&source)
+                .map(|s| (s.display_name(), s.duration_us, s.media_type, s.audio_channels.is_some(), s.conform_speed()))
         })
         .flatten()
     else {
@@ -827,7 +831,8 @@ pub fn replace_selected(state: &Rc<AppState>) {
         state.message("Select a clip on the timeline first.");
         return;
     }
-    let src_in = if state.source_clip.get() == Some(source) { state.src_in.get().unwrap_or(0) } else { 0 };
+    // The In mark is in viewer (conformed) time; the command wants file time.
+    let src_in = if state.source_clip.get() == Some(source) { tempo_timeline::scale_us(state.src_in.get().unwrap_or(0), speed) } else { 0 };
     let too_short = std::cell::Cell::new(false);
     let done = for_selected(state, "Replace", |track, clip| {
         // Like for like: a picture for a picture, a sound for a sound.
@@ -899,7 +904,7 @@ pub fn razor(state: &Rc<AppState>) {
     if cuts.is_empty() {
         state.message("There is no clip under the playhead to cut.");
     } else if state.execute(Box::new(CompositeCommand::new("Razor", cuts))) {
-        state.checklist_split.set(true);
+        crate::help::tick_step(&state.checklist_split, "split");
         state.emit(Change::Options);
     }
 }
@@ -910,7 +915,7 @@ pub fn split_at(state: &Rc<AppState>, clip_id: Uuid, at_us: i64) {
     ids.extend(state.linked_to(clip_id));
     let cuts = split_commands(state, &ids, at_us);
     if !cuts.is_empty() && state.execute(Box::new(CompositeCommand::new("Split", cuts))) {
-        state.checklist_split.set(true);
+        crate::help::tick_step(&state.checklist_split, "split");
         state.emit(Change::Options);
     }
 }
@@ -933,7 +938,7 @@ pub fn split_selected(state: &Rc<AppState>) {
             "There is no clip under the playhead to cut."
         });
     } else if state.execute(Box::new(CompositeCommand::new("Split", cuts))) {
-        state.checklist_split.set(true);
+        crate::help::tick_step(&state.checklist_split, "split");
         state.emit(Change::Options);
     }
 }
@@ -2107,6 +2112,29 @@ mod tests {
         assert_eq!((whole[0].source_in, whole[0].source_out), (0, 10 * S));
     }
 
+    #[test]
+    fn marks_on_a_conformed_source_are_read_back_in_file_time() {
+        // Arrange: a 10 s 60 fps file conformed to 24 fps (0.4x) plays 25 s long in the viewer.
+        let state = AppState::new();
+        let mut project = tempo_timeline::Project::new("t", 1920, 1080, RationalFps::FPS_30);
+        let mut src = MediaSource::new(std::path::PathBuf::from("a"), MediaType::Video, 10 * S);
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.conform_fps = Some(RationalFps::FPS_24);
+        let (id, track) = (src.id, project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id));
+        project.sources.insert(id, src);
+        *state.project.borrow_mut() = Some(project);
+        state.source_clip.set(Some(id));
+        state.src_in.set(Some(5 * S));
+        state.src_out.set(Some(7 * S));
+
+        // Act
+        let clips = clips_for_source_marked(&state, id, 0, track, None, true);
+
+        // Assert: viewer 5..7 s is file 2..2.8 s, and it lasts 2 s on the timeline.
+        assert_eq!((clips[0].source_in, clips[0].source_out), (2 * S, 2_800_000));
+        assert_eq!(clips[0].duration_us(), 2 * S);
+    }
+
     fn setup_two_track_project() -> (Rc<AppState>, Uuid, Uuid) {
         let state = AppState::new();
         let mut project = tempo_timeline::Project::new("t", 1920, 1080, RationalFps::FPS_30);
@@ -2125,6 +2153,28 @@ mod tests {
         project.sources.insert(src.id, src);
         state.set_project(Some(project), None);
         (state, v1, a1)
+    }
+
+    #[test]
+    fn replace_reads_the_in_mark_of_a_conformed_source_in_file_time() {
+        // Arrange: a 10 s 60 fps file conformed to 24 fps, In marked at 5 s of viewer time.
+        let (state, v1, _) = setup_two_track_project();
+        let mut src = MediaSource::new(std::path::PathBuf::from("b.mp4"), MediaType::Video, 10 * S);
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.conform_fps = Some(RationalFps::FPS_24);
+        let sid = src.id;
+        state.project.borrow_mut().as_mut().unwrap().sources.insert(sid, src);
+        state.source_clip.set(Some(sid));
+        state.src_in.set(Some(5 * S));
+        let target = state.with_timeline(|t| t.find_track(v1).unwrap().clips[0].id).unwrap();
+        state.select(Some(target));
+
+        // Act
+        replace_selected(&state);
+
+        // Assert
+        let clip = state.with_timeline(|t| t.find_clip(target).unwrap().1.clone()).unwrap();
+        assert_eq!((clip.source_id, clip.source_in), (sid, 2 * S));
     }
 
     #[test]
