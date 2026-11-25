@@ -253,11 +253,8 @@ pub fn save_project_as(
     }
     let dialog = builder.build();
     dialog.save(Some(parent.as_ref()), gtk::gio::Cancellable::NONE, move |result| {
-        if let Some(mut path) = result.ok().and_then(|f| f.path()) {
-            if path.extension().is_none() {
-                path.set_extension("tempo");
-            }
-            on_choose(path);
+        if let Some(path) = result.ok().and_then(|f| f.path()) {
+            on_choose(crate::project_manager::with_tempo_extension(path));
         }
     });
 }
