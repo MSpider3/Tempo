@@ -131,6 +131,21 @@ pub fn rows(timeline: &Timeline) -> Vec<Row> {
     out
 }
 
+/// The row an Alt+drag copy of a clip on `from` lands on when the dragged clip moved `row_delta`
+/// rows of `drag_kind`. Linked clips of the other kind move the same number of rows on their own
+/// kind (V1 to V2 puts the sound on A2), and stay put when that row does not exist.
+fn duplicate_row<'a>(rows: &'a [Row], from: &'a Row, drag_kind: TrackKind, row_delta: i32) -> Option<&'a Row> {
+    if row_delta == 0 {
+        return Some(from);
+    }
+    let shifted = rows.iter().find(|r| r.kind == from.kind && r.index as i32 == from.index as i32 + row_delta);
+    if from.kind == drag_kind {
+        shifted
+    } else {
+        shifted.or(Some(from))
+    }
+}
+
 /// The three zoom preset buttons left of the zoom slider.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ZoomPreset {
@@ -1842,23 +1857,14 @@ impl TimelineCanvas {
         if delta == 0 && shift.is_none() {
             return;
         }
-        let targets: Option<Vec<Uuid>> = state
-            .with_timeline(|t| {
-                clips
-                    .iter()
-                    .map(|(track, _)| {
-                        let from = t.find_track(*track)?;
-                        match shift.filter(|(kind, _)| *kind == from.kind) {
-                            Some((kind, row_delta)) => {
-                                let want = from.kind_index as i32 + row_delta;
-                                t.tracks.iter().find(|tr| tr.kind == kind && tr.kind_index as i32 == want && !tr.locked).map(|tr| tr.id)
-                            }
-                            None => Some(*track),
-                        }
-                    })
-                    .collect()
+        let (drag_kind, row_delta) = shift.unwrap_or((TrackKind::Video, 0));
+        let targets: Option<Vec<Uuid>> = clips
+            .iter()
+            .map(|(track, _)| {
+                let from = rows.iter().find(|r| r.track_id == *track)?;
+                duplicate_row(&rows, from, drag_kind, row_delta).filter(|r| !r.locked).map(|r| r.track_id)
             })
-            .flatten();
+            .collect();
         let Some(targets) = targets else {
             state.message("There is no free track there for every selected clip.");
             return;
@@ -2178,6 +2184,7 @@ impl TimelineCanvas {
                     .find(|r| r.track_id == *from_track)
                     .zip(rows.iter().find(|r| r.track_id == *to_track))
                     .map_or(0, |(f, t)| t.index as i32 - f.index as i32);
+                let drag_kind = rows.iter().find(|r| r.track_id == *from_track).map_or(TrackKind::Video, |r| r.kind);
                 let moving = self.moving_with(*clip);
                 for r in &rows {
                     let Some(tr) = timeline.find_track(r.track_id) else { continue };
@@ -2187,10 +2194,8 @@ impl TimelineCanvas {
                         }
                         let target_row = if r.track_id == *from_track {
                             rows.iter().find(|dst| dst.track_id == *to_track)
-                        } else if r.kind == rows.iter().find(|f| f.track_id == *from_track).map(|f| f.kind).unwrap_or(r.kind) && row_delta != 0 {
-                            rows.iter().find(|dst| dst.kind == r.kind && dst.index as i32 == r.index as i32 + row_delta)
                         } else {
-                            Some(r)
+                            duplicate_row(&rows, r, drag_kind, row_delta)
                         };
                         let Some(dst) = target_row else { continue };
                         let (x0, x1) = (self.x_of((c.timeline_in + delta).max(0)) as f32, self.x_of((c.timeline_out + delta).max(0)) as f32);
@@ -2797,6 +2802,21 @@ mod tests {
         assert_eq!(ghost_lanes(mid, below, MediaType::Audio, true), None);
         assert_eq!(ghost_lanes(below, below, MediaType::Audio, true), Some((false, true)));
         assert_eq!(ghost_lanes(below, below, MediaType::Video, true), None);
+    }
+
+    #[test]
+    fn alt_drag_copy_moves_linked_sound_to_the_matching_audio_row() {
+        let row = |kind, index| Row { track_id: Uuid::new_v4(), kind, index, y: 0.0, h: 0.0, locked: false, enabled: true, solo: false };
+        let rows = vec![row(TrackKind::Video, 2), row(TrackKind::Video, 1), row(TrackKind::Audio, 1), row(TrackKind::Audio, 2)];
+        let (v1, v2, a1, a2) = (&rows[1], &rows[0], &rows[2], &rows[3]);
+        let id = |r: Option<&Row>| r.map(|r| r.track_id);
+        // V1 to V2: the picture goes to V2 and its linked sound to A2, not onto the original on A1.
+        assert_eq!(id(duplicate_row(&rows, v1, TrackKind::Video, 1)), Some(v2.track_id));
+        assert_eq!(id(duplicate_row(&rows, a1, TrackKind::Video, 1)), Some(a2.track_id));
+        // No row there: the dragged kind cannot land, the linked kind stays on its own track.
+        assert_eq!(id(duplicate_row(&rows, v2, TrackKind::Video, 1)), None);
+        assert_eq!(id(duplicate_row(&rows, a2, TrackKind::Video, 1)), Some(a2.track_id));
+        assert_eq!(id(duplicate_row(&rows, a1, TrackKind::Video, 0)), Some(a1.track_id));
     }
 
     #[test]

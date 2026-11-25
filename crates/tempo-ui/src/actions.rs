@@ -1217,7 +1217,8 @@ pub fn swap_clips(state: &Rc<AppState>, forward: bool) {
     }
 }
 
-/// Adjust selected audio clips' volume by `db` decibels (clamped to 0.0..=4.0).
+/// Adjust selected audio clips' volume by `db` decibels. A nudge never goes past the Inspector's
+/// 200%, and never pulls a clip already above that (set by a plugin or an older project) down.
 pub fn adjust_volume_db(state: &Rc<AppState>, db: f32) {
     let factor = 10.0f32.powf(db / 20.0);
     let done = for_selected(state, "Adjust Volume", |_, clip| {
@@ -1225,7 +1226,7 @@ pub fn adjust_volume_db(state: &Rc<AppState>, db: f32) {
             return None;
         }
         let cur = clip.properties.volume;
-        let next = if db > 0.0 && cur < 0.001 { 0.001 * factor } else { cur * factor }.clamp(0.0, 4.0);
+        let next = if db > 0.0 && cur < 0.001 { 0.001 * factor } else { cur * factor }.clamp(0.0, cur.max(2.0));
         Some(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Volume(next))) as Box<dyn Command>)
     });
     if !done && state.selected_ids().is_empty() {
@@ -1762,6 +1763,8 @@ pub fn select_range_relative(state: &Rc<AppState>, forward: bool, all_tracks: bo
             matched.into_iter().map(|(_, _, id)| id).collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // Linked Selection: each matched clip brings its linked clips (it stays first, so the primary is on the track).
+    let ids: Vec<Uuid> = ids.into_iter().flat_map(|id| std::iter::once(id).chain(state.linked_to(id))).collect();
     state.select_ids(ids);
 }
 
@@ -2148,17 +2151,28 @@ mod tests {
     fn track_and_all_selection_follow_playhead_and_mark_selection_sets_in_out() {
         let (state, v1, a1) = setup_two_track_project();
         state.player.seek_timeline(4 * S);
+        let on = |track: Uuid, id: Uuid| state.with_timeline(|t| t.find_track(track).unwrap().find_clip(id).is_some()).unwrap();
+        // Linked Selection (on by default): Y takes the 2 V1 clips and their A1 sound.
+        select_range_relative(&state, true, false);
+        let sel = state.selected_ids();
+        assert_eq!(sel.len(), 4);
+        assert!(on(v1, sel[0]));
+        assert_eq!(sel.iter().filter(|id| on(v1, **id)).count(), 2);
+
+        state.linked_selection.set(false);
         select_range_relative(&state, true, false);
         let sel = state.selected_ids();
         assert_eq!(sel.len(), 2);
-        assert!(sel.iter().all(|id| state.with_timeline(|t| t.find_track(v1).unwrap().find_clip(*id).is_some()).unwrap()));
+        assert!(sel.iter().all(|id| on(v1, *id)));
+        state.linked_selection.set(true);
 
         select_range_relative(&state, true, true);
         assert_eq!(state.selected_ids().len(), 4);
 
         select_range_relative(&state, false, false);
-        assert_eq!(state.selected_ids().len(), 1);
-        assert!(state.with_timeline(|t| t.find_track(v1).unwrap().find_clip(state.selected_ids()[0]).is_some()).unwrap());
+        let sel = state.selected_ids();
+        assert_eq!(sel.len(), 2);
+        assert!(on(v1, sel[0]) && on(a1, sel[1]));
 
         select_range_relative(&state, false, true);
         assert_eq!(state.selected_ids().len(), 2);
@@ -2199,6 +2213,18 @@ mod tests {
         adjust_volume_db(&state, 3.0);
         let vol = state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume).unwrap();
         assert!((vol - 10.0f32.powf(0.15)).abs() < 1e-4);
+        // Never past the Inspector's 200% ceiling.
+        for _ in 0..5 {
+            adjust_volume_db(&state, 3.0);
+        }
+        assert_eq!(state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume), Some(2.0));
+        // A clip already above 200% is not turned down by Up, and Down still lowers it.
+        state.execute(Box::new(SetClipPropertyCommand::new(audio_id, PropertyChange::Volume(3.0))));
+        adjust_volume_db(&state, 3.0);
+        assert_eq!(state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume), Some(3.0));
+        adjust_volume_db(&state, -3.0);
+        let vol = state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume).unwrap();
+        assert!(vol < 3.0);
 
         // Toggle video track 1 enabled state and undo.
         toggle_video_track(&state, 1);
