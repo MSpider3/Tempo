@@ -1825,9 +1825,17 @@ mod tests {
             normalize_lufs: Some(-14.0),
             ..settings(media.with_extension("out.mkv"))
         };
+        // An FFmpeg without libx265 (as on CI) refuses H.265 up front; the other options are checked with H.264.
+        let hevc = crate::ffmpeg::x265_available();
+        if !hevc {
+            assert!(matches!(build_ffmpeg_args(&project, &mkv_cfg, None), Err(ExportError::InvalidParameter(_))));
+        }
+        let mkv_cfg = if hevc { mkv_cfg } else { TimelineExport { video_codec: VideoCodec::H264, ..mkv_cfg } };
         let (args, _, _) = build_ffmpeg_args(&project, &mkv_cfg, None).unwrap();
         let joined = args.join(" ");
-        assert!(args.windows(2).any(|w| w == ["-c:v", "libx265"]), "{joined}");
+        if hevc {
+            assert!(args.windows(2).any(|w| w == ["-c:v", "libx265"]), "{joined}");
+        }
         assert!(args.windows(2).any(|w| w == ["-c:a", "flac"]), "{joined}");
         assert!(args.windows(2).any(|w| w == ["-r", "24/1"]), "{joined}");
         assert!(args.windows(2).any(|w| w == ["-ar", "48000"]), "{joined}");
