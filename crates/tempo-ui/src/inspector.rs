@@ -1015,6 +1015,8 @@ impl Inspector {
             move |c: [u8; 4]| {
                 color.set(c);
                 if toggle.is_active() {
+                    // Every title gets a box now, so the "values differ" dash is stale.
+                    toggle.set_inconsistent(false);
                     apply(Some(c));
                 }
             }
