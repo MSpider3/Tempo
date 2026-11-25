@@ -38,6 +38,9 @@ pub struct MainWindow {
     viewer: Rc<Viewer>,
     /// The second viewer of dual-viewer mode, made the first time it is switched on.
     source_viewer: std::cell::RefCell<Option<Rc<Viewer>>>,
+    /// Dual viewer: the source viewer is the active one (Ctrl+3, or a click on it), so the
+    /// transport and mark keys act on it; Ctrl+5 or a click on the timeline viewer hands them back.
+    source_active: Cell<bool>,
     pub(crate) edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
@@ -266,6 +269,7 @@ impl MainWindow {
             pages,
             viewer,
             source_viewer: Default::default(),
+            source_active: Cell::new(false),
             edit,
             export,
             proxies: Proxies::new(&state_for_proxies),
@@ -993,11 +997,24 @@ impl MainWindow {
         // Leave single-viewer source mode before switching.
         self.viewer.show_source(None);
         self.state.dual_viewer.set(on);
+        self.source_active.set(false);
         if on && self.source_viewer.borrow().is_none() {
             let player = crate::player::Player::new();
             player.set_max_height(self.state.settings.borrow().playback_height);
             *self.state.source_player.borrow_mut() = Some(player.clone());
             let source = Viewer::new_source(&self.state, player);
+            // Clicking a viewer's picture makes it the one the keys act on; a click in the timeline hands them back to the timeline viewer.
+            let targets: [(&gtk::Widget, bool); 3] = [
+                (source.surface.upcast_ref(), true),
+                (self.viewer.surface.upcast_ref(), false),
+                (self.edit.timeline.canvas.upcast_ref(), false),
+            ];
+            for (widget, active) in targets {
+                let click = gtk::GestureClick::new();
+                let w = self.clone();
+                click.connect_pressed(move |_, _, _, _| w.source_active.set(active));
+                widget.add_controller(click);
+            }
             self.edit.source_slot.append(&source.root);
             hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
             *self.source_viewer.borrow_mut() = Some(source);
@@ -1246,7 +1263,12 @@ impl MainWindow {
 
     pub fn run_action(self: &Rc<Self>, action: &str) {
         let state = &self.state;
-        let player = &state.player;
+        // The viewer the transport and mark keys act on: the dual-mode source viewer after
+        // Ctrl+3, else the main one (which may show a source clip itself).
+        let source_viewer = self.source_viewer.borrow().clone().filter(|_| state.dual_viewer.get() && self.source_active.get());
+        let viewer = source_viewer.as_ref().unwrap_or(&self.viewer);
+        let player = viewer.player();
+        let source = source_viewer.is_some() || state.source_mode();
         match action {
             "app.quit" => {
                 self.window.close();
@@ -1298,7 +1320,7 @@ impl MainWindow {
             // Playback
             "win.play-toggle" => {
                 self.speed.set(0.0);
-                self.viewer.toggle_play();
+                viewer.toggle_play();
             }
             "win.play-forward" | "win.play-reverse" => {
                 // Pressing the same direction again doubles the speed, up to 64×.
@@ -1354,12 +1376,12 @@ impl MainWindow {
                 player.play_again();
             }
             "win.play-in-to-out" => {
-                if actions::play_in_to_out(state) {
+                if actions::play_in_to_out(state, player, source) {
                     self.speed.set(1.0);
                 }
             }
             "win.play-around" => {
-                if actions::play_around(state) {
+                if actions::play_around(state, player, source) {
                     self.speed.set(1.0);
                 }
             }
@@ -1374,30 +1396,29 @@ impl MainWindow {
                 self.speed.set(0.0);
                 player.pause();
             }
-            "win.step-forward" => actions::step_frames(state, 1),
-            "win.step-reverse" => actions::step_frames(state, -1),
-            "win.large-step-forward" => actions::step_frames(state, state.fps().round() as i64),
-            "win.large-step-reverse" => actions::step_frames(state, -(state.fps().round() as i64)),
+            "win.step-forward" => actions::step_frames(state, player, 1),
+            "win.step-reverse" => actions::step_frames(state, player, -1),
+            "win.large-step-forward" => actions::step_frames(state, player, state.fps().round() as i64),
+            "win.large-step-reverse" => actions::step_frames(state, player, -(state.fps().round() as i64)),
             "win.clip-next" => actions::goto_edit(state, true),
             "win.clip-prev" => actions::goto_edit(state, false),
-            "win.first-frame" => actions::first_or_last_frame(state, false),
-            "win.last-frame" => actions::first_or_last_frame(state, true),
+            "win.first-frame" => actions::first_or_last_frame(state, player, source, false),
+            "win.last-frame" => actions::first_or_last_frame(state, player, source, true),
             "win.timeline-start" => player.seek(0, true),
             "win.timeline-end" => player.seek(player.duration_us(), true),
 
             // In and Out
-            "win.mark-in" => actions::set_mark(state, true, false),
-            "win.mark-out" => actions::set_mark(state, false, false),
-            "win.clear-in" => actions::set_mark(state, true, true),
-            "win.clear-out" => actions::set_mark(state, false, true),
+            "win.mark-in" => actions::set_mark(state, player, source, true, false),
+            "win.mark-out" => actions::set_mark(state, player, source, false, false),
+            "win.clear-in" => actions::set_mark(state, player, source, true, true),
+            "win.clear-out" => actions::set_mark(state, player, source, false, true),
             "win.clear-in-out" => {
-                actions::set_mark(state, true, true);
-                actions::set_mark(state, false, true);
+                actions::set_mark(state, player, source, true, true);
+                actions::set_mark(state, player, source, false, true);
             }
             "win.mark-clip" => actions::mark_clip(state),
             "win.mark-selection" => actions::mark_selection(state),
             "win.goto-in" | "win.goto-out" => {
-                let source = state.source_mode();
                 let mark = match (source, action == "win.goto-in") {
                     (true, true) => state.src_in.get(),
                     (true, false) => state.src_out.get(),
@@ -1603,8 +1624,14 @@ impl MainWindow {
             "win.focus-source-viewer" => {
                 let prev_source = state.media_selection.get().or_else(|| state.source_clip.get());
                 if !state.dual_viewer.get() {
-                    self.set_dual_viewer(true);
+                    // One viewer: it switches to the source clip, as Q does; the layout stays.
+                    if !state.source_mode() && prev_source.is_some() {
+                        self.viewer.show_source(prev_source);
+                    }
+                    self.viewer.surface.grab_focus();
+                    return;
                 }
+                self.source_active.set(true);
                 if let Some(sv) = self.source_viewer.borrow().as_ref() {
                     if state.source_clip.get().is_none() && prev_source.is_some() {
                         sv.show_source(prev_source);
@@ -1614,9 +1641,11 @@ impl MainWindow {
                 }
             }
             "win.focus-timeline" => {
+                self.source_active.set(false);
                 self.edit.timeline.canvas.grab_focus();
             }
             "win.focus-timeline-viewer" => {
+                self.source_active.set(false);
                 if !state.dual_viewer.get() && state.source_mode() {
                     self.viewer.show_source(None);
                 }

@@ -13,6 +13,7 @@ use tempo_timeline::{
 };
 use uuid::Uuid;
 
+use crate::player::Player;
 use crate::state::{AppState, Change, EditSelection, Gap};
 
 /// Still images get this length when placed on the timeline.
@@ -1647,16 +1648,15 @@ pub fn goto_edit(state: &Rc<AppState>, forward: bool) {
     state.player.seek_timeline(pos);
 }
 
-pub fn step_frames(state: &Rc<AppState>, frames: i64) {
-    let target = state.frame_step(state.player.position_us(), frames);
-    state.player.pause();
-    state.player.seek(target.min(state.player.duration_us()), true);
+pub fn step_frames(state: &Rc<AppState>, player: &Player, frames: i64) {
+    let target = state.frame_step(player.position_us(), frames);
+    player.pause();
+    player.seek(target.min(player.duration_us()), true);
 }
 
-/// Set (or clear) In / Out. In source mode the marks belong to the source clip.
-pub fn set_mark(state: &Rc<AppState>, is_in: bool, clear: bool) {
-    let value = (!clear).then(|| state.player.position_us());
-    let source = state.source_mode();
+/// Set (or clear) In / Out at `player`'s position. With `source` the marks belong to the source clip.
+pub fn set_mark(state: &Rc<AppState>, player: &Player, source: bool, is_in: bool, clear: bool) {
+    let value = (!clear).then(|| player.position_us());
     match (source, is_in) {
         (true, true) => state.src_in.set(value),
         (true, false) => state.src_out.set(value),
@@ -1769,11 +1769,11 @@ pub fn select_range_relative(state: &Rc<AppState>, forward: bool, all_tracks: bo
 }
 
 /// Jump to the first (`last = false`) or last (`last = true`) frame of the clip under the playhead.
-pub fn first_or_last_frame(state: &AppState, last: bool) {
-    if state.source_mode() {
-        let target = if last { state.frame_step(state.player.duration_us(), -1).max(0) } else { 0 };
-        state.player.pause();
-        state.player.seek(target, true);
+pub fn first_or_last_frame(state: &AppState, player: &Player, source: bool, last: bool) {
+    if source {
+        let target = if last { state.frame_step(player.duration_us(), -1).max(0) } else { 0 };
+        player.pause();
+        player.seek(target, true);
         return;
     }
     let pos = state.playhead_us();
@@ -1804,13 +1804,13 @@ pub fn first_or_last_frame(state: &AppState, last: bool) {
 }
 
 /// Play In to Out (`Alt+/`).
-pub fn play_in_to_out(state: &AppState) -> bool {
-    let (in_us, out_us) = if state.source_mode() {
+pub fn play_in_to_out(state: &AppState, player: &Player, source: bool) -> bool {
+    let (in_us, out_us) = if source {
         (state.src_in.get(), state.src_out.get())
     } else {
         (state.mark_in.get(), state.mark_out.get())
     };
-    let dur = state.player.duration_us();
+    let dur = player.duration_us();
     if in_us.is_none() && out_us.is_none() {
         state.message("Mark In and Out first (I and O).");
         return false;
@@ -1821,20 +1821,20 @@ pub fn play_in_to_out(state: &AppState) -> bool {
         state.message("Out point must be after In point.");
         return false;
     }
-    state.player.play_range(1.0, start, end);
+    player.play_range(1.0, start, end);
     true
 }
 
 const PLAY_AROUND_ROLL_US: i64 = 2_000_000;
 
 /// Timeline/source `(start_us, end_us)` around the selection, edit point, or playhead (`/`).
-pub fn play_around_bounds(state: &AppState) -> Option<(i64, i64)> {
-    let dur = state.player.duration_us();
+pub fn play_around_bounds(state: &AppState, player: &Player, source: bool) -> Option<(i64, i64)> {
+    let dur = player.duration_us();
     if dur <= 0 {
         return None;
     }
-    if state.source_mode() {
-        let pos = state.player.position_us();
+    if source {
+        let pos = player.position_us();
         let start = (pos - PLAY_AROUND_ROLL_US).max(0);
         let end = (pos + PLAY_AROUND_ROLL_US).min(dur);
         return (end > start).then_some((start, end));
@@ -1870,9 +1870,9 @@ pub fn play_around_bounds(state: &AppState) -> Option<(i64, i64)> {
 }
 
 /// Play around current selection, edit point, or playhead (`/`).
-pub fn play_around(state: &AppState) -> bool {
-    let Some((start, end)) = play_around_bounds(state) else { return false };
-    state.player.play_range(1.0, start, end);
+pub fn play_around(state: &AppState, player: &Player, source: bool) -> bool {
+    let Some((start, end)) = play_around_bounds(state, player, source) else { return false };
+    player.play_range(1.0, start, end);
     true
 }
 

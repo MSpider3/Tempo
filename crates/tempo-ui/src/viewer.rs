@@ -284,6 +284,10 @@ impl Viewer {
             if matches!(change, Change::Options) {
                 v.show_marks();
                 v.player.set_looping(v.state.loop_playback.get());
+                if v.source_only {
+                    // The timeline player gets its range from AppState::sync_loop_range.
+                    v.player.set_loop_range(v.state.src_in.get(), v.state.src_out.get());
+                }
                 v.player.set_scrub_audio(v.state.scrub_audio.get());
                 v.surface.set_zoom(v.state.viewer_zoom.get());
                 if let Some(btn) = &loop_btn {
@@ -374,18 +378,13 @@ impl Viewer {
     }
 
     fn mark(&self, is_in: bool) {
-        if self.source_only {
-            // The source viewer's buttons mark the source clip at its own position.
-            let pos = Some(self.player.position_us());
-            if is_in {
-                self.state.src_in.set(pos);
-            } else {
-                self.state.src_out.set(pos);
-            }
-            self.state.emit(Change::Options);
-        } else {
-            crate::actions::set_mark(&self.state, is_in, false);
-        }
+        // The source viewer's buttons mark the source clip at its own position.
+        crate::actions::set_mark(&self.state, &self.player, self.source_only || self.state.source_mode(), is_in, false);
+    }
+
+    /// The playback this viewer shows and controls.
+    pub fn player(&self) -> &Player {
+        &self.player
     }
 
     /// Show a Media Pool clip (source mode) or go back to the timeline.
@@ -417,6 +416,7 @@ impl Viewer {
         if self.source_only {
             self.shown_source.set(shown);
             self.player.pause();
+            self.player.set_loop_range(None, None);
             self.player.set_timeline(snapshot.unwrap_or_else(Snapshot::empty));
             self.player.seek(0, true);
         } else {
