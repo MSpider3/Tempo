@@ -754,6 +754,11 @@ impl MainWindow {
         }
         self.state.set_project(Some(project), Some(path));
         self.viewer.show_source(None);
+        // The source viewer still holds the old project's clip: empty it and give the keys back.
+        self.source_active.set(false);
+        if let Some(source) = self.source_viewer.borrow().as_ref() {
+            source.show_source(None);
+        }
         self.show_page("edit");
         self.page_buttons[0].set_active(true);
         self.root.set_visible_child_name("project");

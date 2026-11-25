@@ -61,6 +61,10 @@ def run(s):
     s.key("ctrl+shift+a")
     v1_ids = [c["id"] for c in s.track("V1")["clips"]]
     a1_ids = [c["id"] for c in s.track("A1")["clips"]]
+    # Linked Selection is on by default: Y brings each clip's linked A1 sound, as in Resolve.
+    s.key("y")
+    s.wait_for(lambda: set(s.state()["selection"]) == {v1_ids[1], v1_ids[2], a1_ids[1], a1_ids[2]}, "Y with Linked Selection takes linked sound")
+    s.key("ctrl+shift+l")  # Linked Selection off: Y stays on one track
     s.key("y")
     sel_y = s.wait_for(lambda: set(s.state()["selection"]) == {v1_ids[1], v1_ids[2]} and s.state()["selection"], "Y selects V1 clips forward")
     expect_eq(set(sel_y), {v1_ids[1], v1_ids[2]}, "Y forward single-track selection")
@@ -72,6 +76,7 @@ def run(s):
     s.key("ctrl+y")
     sel_ctrl_y = s.wait_for(lambda: set(s.state()["selection"]) == {v1_ids[0], v1_ids[1]} and s.state()["selection"], "Ctrl+Y selects V1 clips backward")
     expect_eq(set(sel_ctrl_y), {v1_ids[0], v1_ids[1]}, "Ctrl+Y backward single-track selection")
+    s.key("ctrl+shift+l")  # Linked Selection back on
     s.key("ctrl+shift+a")
 
     # 6. Ctrl+/ toggles Viewer Loop button.

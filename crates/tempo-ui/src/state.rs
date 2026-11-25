@@ -72,6 +72,8 @@ impl EditSelection {
 
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
+    /// Bumped by each open or close; Save As and Project Settings keep it (they may change the id).
+    pub project_generation: Cell<u64>,
     pub path: RefCell<Option<PathBuf>>,
     log: RefCell<CommandLog>,
     /// The undo history of each timeline that is not open, so each keeps its own.
@@ -144,6 +146,7 @@ impl AppState {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             project: RefCell::new(None),
+            project_generation: Cell::new(0),
             path: RefCell::new(None),
             log: RefCell::new(CommandLog::new()),
             parked_logs: RefCell::new(Default::default()),
@@ -317,6 +320,7 @@ impl AppState {
         self.player.set_source(None);
         *self.project.borrow_mut() = project;
         *self.path.borrow_mut() = path;
+        self.project_generation.set(self.project_generation.get() + 1);
         self.log.borrow_mut().clear();
         self.parked_logs.borrow_mut().clear();
         self.selection.set(None);
@@ -728,6 +732,21 @@ mod tests {
         state.shown_source_player().seek(2_000_000, false);
         assert_eq!(source.position_us(), 2_000_000);
         assert_eq!(state.player.position_us(), 1_000_000);
+    }
+
+    #[test]
+    fn only_opening_or_closing_changes_the_project_generation() {
+        let state = AppState::new();
+        state.set_project(Some(Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30)), None);
+        let opened = state.project_generation.get();
+        // Save As gives a new file its own id; it is still the same open project.
+        if let Some(p) = state.project.borrow_mut().as_mut() {
+            p.id = Uuid::new_v4();
+        }
+        state.emit(Change::Project);
+        assert_eq!(state.project_generation.get(), opened);
+        state.set_project(None, None);
+        assert_eq!(state.project_generation.get(), opened + 1);
     }
 
     #[test]

@@ -131,8 +131,8 @@ pub struct MediaPool {
     thumb_cache: RefCell<HashMap<Uuid, (usize, gdk::Texture)>>,
     hover_gen: Cell<u64>,
     hover_restore: Cell<Option<(Option<Uuid>, (Option<i64>, Option<i64>))>>,
-    /// The project the pool was last reset for; Save As and Project Settings keep it.
-    last_project: Cell<Option<Uuid>>,
+    /// The project open the pool was last reset for (`AppState::project_generation`); Save As and Project Settings keep it.
+    last_project: Cell<Option<u64>>,
     window: glib::WeakRef<gtk::Window>,
     on_open: Rc<dyn Fn(Uuid)>,
 }
@@ -479,8 +479,8 @@ impl MediaPool {
         state.connect(move |change| {
             match change {
                 Change::Project => {
-                    let id = p.state.with_project(|proj| proj.id);
-                    if p.last_project.replace(id) != id {
+                    let opened = Some(p.state.project_generation.get());
+                    if p.last_project.replace(opened) != opened {
                         p.end_hover_scrub();
                         p.hover_restore.set(None);
                         p.thumb_cache.borrow_mut().clear();
