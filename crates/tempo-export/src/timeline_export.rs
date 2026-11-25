@@ -118,12 +118,20 @@ fn validate_export(e: &TimelineExport) -> Result<()> {
     if e.container == ContainerFormat::Mov && e.audio_codec == AudioCodec::Flac {
         return Err(ExportError::InvalidParameter("FLAC audio is not supported in MOV; use MP4 or MKV.".into()));
     }
+    if uses_libx265(e) && !crate::ffmpeg::x265_available() {
+        return Err(ExportError::InvalidParameter("This FFmpeg has no H.265 encoder (libx265); choose H.264.".into()));
+    }
     if let Some(lufs) = e.normalize_lufs {
         if !lufs.is_finite() {
             return Err(ExportError::InvalidParameter("Normalization target LUFS must be a finite number.".into()));
         }
     }
     Ok(())
+}
+
+/// H.265 on the processor: a size cap, or hardware encoding off (a failed VA-API try reruns this way).
+fn uses_libx265(e: &TimelineExport) -> bool {
+    e.video_codec == VideoCodec::H265 && !(e.hardware && e.max_video_kbps.is_none())
 }
 
 fn video_codec_args(e: &TimelineExport, w: u32, h: u32, hardware: bool) -> Vec<String> {
@@ -157,8 +165,12 @@ fn audio_codec_args(codec: AudioCodec, audio_kbps: u32) -> Vec<String> {
     }
 }
 
-fn container_args(container: ContainerFormat) -> Vec<String> {
-    match container {
+fn container_args(e: &TimelineExport) -> Vec<String> {
+    match e.container {
+        // Apple players (QuickTime, iOS, Final Cut) refuse FFmpeg's default 'hev1' tag.
+        ContainerFormat::Mp4 | ContainerFormat::Mov if e.video_codec == VideoCodec::H265 => {
+            ["-movflags", "+faststart", "-tag:v", "hvc1"].map(String::from).to_vec()
+        }
         ContainerFormat::Mp4 | ContainerFormat::Mov => vec!["-movflags".into(), "+faststart".into()],
         ContainerFormat::Mkv => Vec::new(),
     }
@@ -738,7 +750,7 @@ fn build_args(
     if section.is_some() {
         args.extend(["-f".into(), "matroska".into()]);
     } else {
-        args.extend(container_args(e.container));
+        args.extend(container_args(e));
     }
     args.extend(["-t".into(), secs(total), e.output.to_string_lossy().into_owned()]);
     Ok((args, total, text_files))
@@ -933,7 +945,7 @@ fn render_and_join(
         }
         args.extend(audio_codec_args(e.audio_codec, e.audio_kbps));
     }
-    args.extend(container_args(e.container));
+    args.extend(container_args(e));
     args.push(e.output.to_string_lossy().into_owned());
     run_one(&args, r1 - r0, &[], cancel, &mut |f| progress(0.98 + f * 0.02))
 }
@@ -1712,6 +1724,49 @@ mod tests {
     }
 
     #[test]
+    fn only_a_processor_hevc_export_needs_libx265() {
+        let base = settings(PathBuf::from("out.mp4"));
+        assert!(!uses_libx265(&base));
+        let sw = TimelineExport { video_codec: VideoCodec::H265, ..base.clone() };
+        assert!(uses_libx265(&sw));
+        assert!(!uses_libx265(&TimelineExport { hardware: true, ..sw.clone() }), "hardware uses hevc_vaapi");
+        assert!(uses_libx265(&TimelineExport { hardware: true, max_video_kbps: Some(2_000), ..sw }), "a size cap always uses libx265");
+    }
+
+    #[test]
+    fn a_long_cut_joins_into_mov_with_pcm_normalized_sound_and_apple_hevc_tag() {
+        let Some(path) = sample() else { return };
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let project = project_with_many_cuts(path, 16);
+        assert!(plan_sections(&project, 0, 16 * CUT).len() > 1);
+        let out = std::env::temp_dir().join(format!("tempo-export-sections-mov-{}.mov", std::process::id()));
+        let hevc = crate::ffmpeg::x265_available();
+        let e = TimelineExport {
+            container: ContainerFormat::Mov,
+            audio_codec: AudioCodec::Pcm,
+            video_codec: if hevc { VideoCodec::H265 } else { VideoCodec::H264 },
+            normalize_lufs: Some(-14.0),
+            ..settings(out.clone())
+        };
+        export_timeline(&project, &e, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(!out.with_extension("parts").exists(), "the section files are removed");
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=format_name:stream=codec_name,codec_tag_string,sample_rate", "-of", "default=nw=1"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let _ = std::fs::remove_file(&out);
+        assert!(text.contains("format_name=mov"), "{text}");
+        assert!(text.contains("codec_name=pcm_s16le") && text.contains("sample_rate=48000"), "{text}");
+        if hevc {
+            assert!(text.contains("codec_tag_string=hvc1"), "{text}");
+        }
+    }
+
+    #[test]
     fn hardware_export_falls_back_to_software_when_it_cannot_run() {
         let Some(path) = sample() else { return };
         if Command::new("ffmpeg").arg("-version").output().is_err() {
@@ -1796,6 +1851,12 @@ mod tests {
         };
         let (hw_args, _, _) = build_ffmpeg_args(&project, &hw_hevc, None).unwrap();
         assert!(hw_args.windows(2).any(|w| w == ["-c:v", "hevc_vaapi"]));
+        assert!(hw_args.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "H.265 in MP4 carries the tag Apple players accept");
+        let mov_hevc = TimelineExport { container: ContainerFormat::Mov, video_codec: VideoCodec::H265, hardware: true, ..settings(media.with_extension("out.mov")) };
+        let (mov_hevc_args, _, _) = build_ffmpeg_args(&project, &mov_hevc, None).unwrap();
+        assert!(mov_hevc_args.windows(2).any(|w| w == ["-tag:v", "hvc1"]));
+        assert!(!args.iter().any(|a| a == "-tag:v"), "MKV needs no tag");
+        assert!(!mov_args.iter().any(|a| a == "-tag:v"), "H.264 keeps its default tag");
 
         let bad_mp4_pcm = TimelineExport {
             container: ContainerFormat::Mp4,
