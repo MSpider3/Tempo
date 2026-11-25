@@ -64,6 +64,51 @@ fn is_mixed_f64(clips: &[Clip], get: impl Fn(&Clip) -> f64) -> bool {
     clips[1..].iter().any(|c| (get(c) - first).abs() > 1e-3)
 }
 
+/// A field value rounded to what the field shows. GtkSpinButton re-reads its text when it loses
+/// focus; a stored value that differs from that text (0.7 opacity is 69.9999988 %) would fire
+/// value-changed and write the shown value onto every selected clip.
+fn round_to_digits(v: f64, digits: u32) -> f64 {
+    let scale = 10f64.powi(digits as i32);
+    (v * scale).round() / scale
+}
+
+/// The Place dropdown's index: none shown while the titles differ, so any pick applies to all.
+fn place_selection(kind: TitleType, mixed: bool) -> u32 {
+    match (mixed, kind) {
+        (true, _) => gtk::INVALID_LIST_POSITION,
+        (false, TitleType::LowerThird) => 1,
+        (false, _) => 0,
+    }
+}
+
+/// Whether a title entry holds an edit to commit. An entry left empty under a Mixed
+/// placeholder (no `last` text) is no change.
+fn title_entry_has_edit(last: Option<&str>, dirty: bool, text: &str) -> bool {
+    match last {
+        None => dirty && !text.is_empty(),
+        Some(prev) => prev != text,
+    }
+}
+
+/// Stands in for a `ColorDialogButton` while the selected titles' colors differ: that button
+/// drops a pick equal to the color it shows, so the shown color could not be applied to all.
+fn mixed_color_button(initial: [u8; 4], accessible: &str, pick: impl Fn([u8; 4]) + 'static) -> gtk::Button {
+    let btn = gtk::Button::builder().label("Choose…").tooltip_text("Pick one color for all selected titles").build();
+    btn.update_property(&[gtk::accessible::Property::Label(accessible)]);
+    let pick = Rc::new(pick);
+    btn.connect_clicked(move |b| {
+        let pick = pick.clone();
+        let parent = b.root().and_downcast::<gtk::Window>();
+        gtk::ColorDialog::new().choose_rgba(parent.as_ref(), Some(&rgba_from_bytes(initial)), gtk::gio::Cancellable::NONE, move |res| {
+            // An error here means the dialog was dismissed.
+            if let Ok(c) = res {
+                pick(bytes_from_rgba(&c));
+            }
+        });
+    });
+    btn
+}
+
 fn selected_clips(state: &AppState) -> Vec<Clip> {
     let ids = state.selected_ids();
     state
@@ -331,7 +376,7 @@ impl Inspector {
         let name_label = Self::row_label(grid, row, name);
         name_label.set_cursor_from_name(Some("ew-resize"));
         name_label.set_tooltip_text(Some("Drag left or right to change"));
-        let first = clips.first().map(&get).unwrap_or(0.0);
+        let first = round_to_digits(clips.first().map(&get).unwrap_or(0.0), digits);
         let mixed = is_mixed_f64(clips, &get);
         let ids: Rc<Vec<Uuid>> = Rc::new(clips.iter().map(|c| c.id).collect());
         let make = Rc::new(make);
@@ -830,7 +875,7 @@ impl Inspector {
 
         Self::row_label(&grid, 2, "Place");
         let place = gtk::DropDown::from_strings(&["Centre", "Lower third"]);
-        place.set_selected(if first.title_type == TitleType::LowerThird { 1 } else { 0 });
+        place.set_selected(place_selection(first.title_type, place_mixed));
         let place_badge = place_mixed.then(|| mixed_badge_label("Selected titles have different placement"));
         if let Some(badge) = &place_badge {
             let box_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -902,10 +947,33 @@ impl Inspector {
         grid.attach(&font_row, 1, 3, 1, 1);
 
         Self::row_label(&grid, 4, "Color");
-        let color_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-        color_btn.set_rgba(&rgba_from_bytes(first.color));
-        color_btn.update_property(&[gtk::accessible::Property::Label("Title color")]);
         let color_badge = color_mixed.then(|| mixed_badge_label("Selected titles have different colors"));
+        let apply_color = {
+            let (state, busy, ids, badge) = (self.state.clone(), self.busy.clone(), ids.clone(), color_badge.clone());
+            let last_color = Cell::new(first.color);
+            let is_mixed = Cell::new(color_mixed);
+            move |next: [u8; 4]| {
+                if !is_mixed.get() && last_color.get() == next {
+                    return;
+                }
+                if apply_title(&state, &busy, &ids, "Title Color", |_, t| t.color = next) {
+                    last_color.set(next);
+                    is_mixed.set(false);
+                    if let Some(badge) = &badge {
+                        badge.set_visible(false);
+                    }
+                }
+            }
+        };
+        let color_btn: gtk::Widget = if color_mixed {
+            mixed_color_button(first.color, "Title color", apply_color).upcast()
+        } else {
+            let btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+            btn.set_rgba(&rgba_from_bytes(first.color));
+            btn.update_property(&[gtk::accessible::Property::Label("Title color")]);
+            btn.connect_rgba_notify(move |b| apply_color(bytes_from_rgba(&b.rgba())));
+            btn.upcast()
+        };
         if let Some(badge) = &color_badge {
             let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             row_box.append(&color_btn);
@@ -914,36 +982,53 @@ impl Inspector {
         } else {
             grid.attach(&color_btn, 1, 4, 1, 1);
         }
-        {
-            let (state, busy, ids) = (self.state.clone(), self.busy.clone(), ids.clone());
-            let last_color = Cell::new(first.color);
-            let is_mixed = Cell::new(color_mixed);
-            color_btn.connect_rgba_notify(move |b| {
-                let next = bytes_from_rgba(&b.rgba());
-                if !is_mixed.get() && last_color.get() == next {
-                    return;
-                }
-                if apply_title(&state, &busy, &ids, "Title Color", |_, t| t.color = next) {
-                    last_color.set(next);
-                    is_mixed.set(false);
-                    if let Some(badge) = &color_badge {
-                        badge.set_visible(false);
-                    }
-                }
-            });
-        }
 
         Self::row_label(&grid, 5, "Background");
         let bg_toggle = gtk::CheckButton::builder()
             .active(first.background_color.is_some())
+            // Some titles have a box and some do not: show neither state.
+            .inconsistent(titles[1..].iter().any(|t| t.background_color.is_some() != first.background_color.is_some()))
             .tooltip_text("Show background box (uncheck for transparent)")
             .build();
         bg_toggle.update_property(&[gtk::accessible::Property::Label("Title background box")]);
-        let bg_btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-        bg_btn.set_rgba(&rgba_from_bytes(first.background_color.unwrap_or(DEFAULT_TITLE_BG)));
-        bg_btn.set_sensitive(first.background_color.is_some());
-        bg_btn.update_property(&[gtk::accessible::Property::Label("Title background color")]);
         let bg_badge = bg_mixed.then(|| mixed_badge_label("Selected titles have different backgrounds"));
+        let bg_color = Rc::new(Cell::new(first.background_color.unwrap_or(DEFAULT_TITLE_BG)));
+        let apply_bg: Rc<dyn Fn(Option<[u8; 4]>)> = {
+            let (state, busy, ids, badge) = (self.state.clone(), self.busy.clone(), ids, bg_badge.clone());
+            let last_bg = Cell::new(first.background_color);
+            let is_mixed = Cell::new(bg_mixed);
+            Rc::new(move |next| {
+                if !is_mixed.get() && last_bg.get() == next {
+                    return;
+                }
+                if apply_title(&state, &busy, &ids, "Title Background", |_, t| t.background_color = next) {
+                    last_bg.set(next);
+                    is_mixed.set(false);
+                    if let Some(badge) = &badge {
+                        badge.set_visible(false);
+                    }
+                }
+            })
+        };
+        let pick_bg = {
+            let (apply, color, toggle) = (apply_bg.clone(), bg_color.clone(), bg_toggle.clone());
+            move |c: [u8; 4]| {
+                color.set(c);
+                if toggle.is_active() {
+                    apply(Some(c));
+                }
+            }
+        };
+        let bg_btn: gtk::Widget = if bg_mixed && first.background_color.is_some() {
+            mixed_color_button(bg_color.get(), "Title background color", pick_bg).upcast()
+        } else {
+            let btn = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+            btn.set_rgba(&rgba_from_bytes(bg_color.get()));
+            btn.update_property(&[gtk::accessible::Property::Label("Title background color")]);
+            btn.connect_rgba_notify(move |b| pick_bg(bytes_from_rgba(&b.rgba())));
+            btn.upcast()
+        };
+        bg_btn.set_sensitive(first.background_color.is_some());
         let bg_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bg_row.append(&bg_toggle);
         bg_row.append(&bg_btn);
@@ -951,62 +1036,12 @@ impl Inspector {
             bg_row.append(badge);
         }
         grid.attach(&bg_row, 1, 5, 1, 1);
-
-        let last_bg: Rc<Cell<Option<[u8; 4]>>> = Rc::new(Cell::new(first.background_color));
-        let is_mixed_bg: Rc<Cell<bool>> = Rc::new(Cell::new(bg_mixed));
-        {
-            let (state, busy, ids, bg_btn_t, last_bg_t, mixed_t, badge_t) = (
-                self.state.clone(),
-                self.busy.clone(),
-                ids.clone(),
-                bg_btn.clone(),
-                last_bg.clone(),
-                is_mixed_bg.clone(),
-                bg_badge.clone(),
-            );
-            bg_toggle.connect_toggled(move |chk| {
-                let on = chk.is_active();
-                bg_btn_t.set_sensitive(on);
-                let next = on.then(|| bytes_from_rgba(&bg_btn_t.rgba()));
-                if !mixed_t.get() && last_bg_t.get() == next {
-                    return;
-                }
-                if apply_title(&state, &busy, &ids, "Title Background", |_, t| t.background_color = next) {
-                    last_bg_t.set(next);
-                    mixed_t.set(false);
-                    if let Some(badge) = &badge_t {
-                        badge.set_visible(false);
-                    }
-                }
-            });
-        }
-        {
-            let (state, busy, ids, bg_toggle_b, last_bg_b, mixed_b, badge_b) = (
-                self.state.clone(),
-                self.busy.clone(),
-                ids,
-                bg_toggle,
-                last_bg,
-                is_mixed_bg,
-                bg_badge,
-            );
-            bg_btn.connect_rgba_notify(move |b| {
-                if !bg_toggle_b.is_active() {
-                    return;
-                }
-                let next = Some(bytes_from_rgba(&b.rgba()));
-                if !mixed_b.get() && last_bg_b.get() == next {
-                    return;
-                }
-                if apply_title(&state, &busy, &ids, "Title Background", |_, t| t.background_color = next) {
-                    last_bg_b.set(next);
-                    mixed_b.set(false);
-                    if let Some(badge) = &badge_b {
-                        badge.set_visible(false);
-                    }
-                }
-            });
-        }
+        bg_toggle.connect_toggled(move |chk| {
+            chk.set_inconsistent(false);
+            let on = chk.is_active();
+            bg_btn.set_sensitive(on);
+            apply_bg(on.then(|| bg_color.get()));
+        });
     }
 }
 
@@ -1040,10 +1075,7 @@ fn bind_title_entry(entry: &gtk::Entry, initial: String, mixed: bool, commit: im
         let (last, dirty, commit) = (last.clone(), dirty.clone(), commit);
         move |e: &gtk::Entry| {
             let text = e.text().to_string();
-            if !dirty.get() && last.borrow().is_none() {
-                return;
-            }
-            if last.borrow().as_deref() == Some(text.as_str()) {
+            if !title_entry_has_edit(last.borrow().as_deref(), dirty.get(), &text) {
                 dirty.set(false);
                 return;
             }
@@ -1459,6 +1491,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_number_field_starts_at_the_value_it_shows_so_leaving_it_writes_nothing() {
+        let opacity = f64::from(0.7f32) * 100.0;
+        assert_ne!(opacity, 70.0);
+        assert_eq!(round_to_digits(opacity, 0), 70.0);
+        assert_eq!(round_to_digits(f64::from(1.1f32), 2), 1.1);
+        assert_eq!(round_to_digits(0.625, 1), 0.6);
+        assert_eq!(round_to_digits(50.0, 0), 50.0);
+    }
+
+    #[test]
+    fn an_empty_mixed_title_entry_commits_nothing() {
+        assert!(!title_entry_has_edit(None, true, ""));
+        assert!(!title_entry_has_edit(None, false, "Hi"));
+        assert!(title_entry_has_edit(None, true, "Hi"));
+        assert!(title_entry_has_edit(Some("Old"), true, ""));
+        assert!(!title_entry_has_edit(Some("Old"), true, "Old"));
+    }
+
+    #[test]
+    fn a_mixed_place_dropdown_shows_no_choice_so_any_pick_applies() {
+        assert_eq!(place_selection(TitleType::CenterTitle, true), gtk::INVALID_LIST_POSITION);
+        assert_eq!(place_selection(TitleType::LowerThird, true), gtk::INVALID_LIST_POSITION);
+        assert_eq!(place_selection(TitleType::LowerThird, false), 1);
+        assert_eq!(place_selection(TitleType::CenterTitle, false), 0);
+    }
 
     #[test]
     fn graph_pixels_map_both_ways_and_clamp() {
