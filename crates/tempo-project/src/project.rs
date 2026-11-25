@@ -5,10 +5,11 @@ use rusqlite::params;
 use uuid::Uuid;
 use tempfile::NamedTempFile;
 
-use tempo_timeline::types::{AudioTrackType, 
-    Clip, ClipProperties, ClipType, Marker, MarkerColor, MediaSource, MediaType,
-    Project, RationalFps, Timeline, TitleData, Track, TrackKind, Transition, TransitionAlignment,
-    TransitionEase, TransitionEdge, TransitionKind, UiState,
+use tempo_timeline::types::{
+    AudioChannelMap, AudioTrackType, Bin, Clip, ClipProperties, ClipType, Marker, MarkerColor,
+    MediaSource, MediaType, Project, RationalFps, Timeline, TitleData, Track, TrackKind,
+    Transition, TransitionAlignment, TransitionEase, TransitionEdge, TransitionKind, UiState,
+    MASTER_BIN_ID,
 };
 
 use crate::db::open_connection;
@@ -74,14 +75,33 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
     tx.execute("DELETE FROM project_meta WHERE id <> ?1", params![project.id.to_string()])?;
 
     // 2. Clear dynamic tables to overwrite with current project state in transaction
+    let master_bin_id = MASTER_BIN_ID.to_string();
     tx.execute("DELETE FROM media_sources", [])?;
+    tx.execute("DELETE FROM bin_sources", [])?;
+    tx.execute("DELETE FROM bins WHERE id <> ?1", params![master_bin_id])?;
+    tx.execute(
+        "INSERT OR IGNORE INTO bins (id, name, parent_id, sort_order) VALUES (?1, 'Master', NULL, 0)",
+        params![master_bin_id],
+    )?;
     tx.execute("DELETE FROM tracks", [])?;
     tx.execute("DELETE FROM clips", [])?;
     tx.execute("DELETE FROM transitions", [])?;
     tx.execute("DELETE FROM markers", [])?;
     tx.execute("DELETE FROM timelines", [])?;
 
-    // 3. Save media sources
+    // 2b. Save Media Pool bins (excluding Master)
+    for bin in &project.bins {
+        if bin.id == MASTER_BIN_ID {
+            continue;
+        }
+        let parent_id = bin.parent_id.filter(|id| *id != MASTER_BIN_ID).map(|id| id.to_string());
+        tx.execute(
+            "INSERT INTO bins (id, name, parent_id, sort_order) VALUES (?1, ?2, ?3, ?4)",
+            params![bin.id.to_string(), bin.name, parent_id, bin.sort_order],
+        )?;
+    }
+
+    // 3. Save media sources and their bin memberships
     for source in project.sources.values() {
         let media_type_int: i32 = match source.media_type {
             MediaType::Video => 0,
@@ -90,6 +110,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
         };
 
         let (fps_num, fps_den) = source.video_fps.map(|f| (Some(f.num), Some(f.den))).unwrap_or((None, None));
+        let (cfps_num, cfps_den) = source.conform_fps.map(|f| (Some(f.num), Some(f.den))).unwrap_or((None, None));
 
         tx.execute(
             "INSERT INTO media_sources (
@@ -97,8 +118,9 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 video_width, video_height, video_fps_num, video_fps_den, video_codec,
                 video_color_range, video_color_space, video_bit_depth, video_has_alpha,
                 audio_sample_rate, audio_channels, audio_codec, audio_bit_rate,
-                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data,
+                display_name, conform_fps_num, conform_fps_den, audio_channel_map
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 source.id.to_string(),
                 source.path.to_string_lossy().to_string(),
@@ -124,15 +146,26 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
                 source.imported_at,
                 source.import_order,
                 source.thumbnail_data,
+                source.display_name,
+                cfps_num,
+                cfps_den,
+                source.audio_channel_map.to_db_str(),
             ],
+        )?;
+
+        let bin_id = source.bin_id.filter(|id| *id != MASTER_BIN_ID).unwrap_or(MASTER_BIN_ID).to_string();
+        tx.execute(
+            "INSERT INTO bin_sources (bin_id, source_id, sort_order) VALUES (?1, ?2, ?3)",
+            params![bin_id, source.id.to_string(), source.import_order as i32],
         )?;
     }
 
     // 4. Save every timeline: its tracks, clips, transitions and markers
     for (timeline, open) in std::iter::once((&project.timeline, true)).chain(project.timelines.iter().map(|t| (t, false))) {
     let timeline_id = timeline.id.to_string();
+    let timeline_bin_id = timeline.bin_id.filter(|id| *id != MASTER_BIN_ID).map(|id| id.to_string());
     tx.execute(
-        "INSERT INTO timelines (id, name, is_open, start_tc_us, width, height, fps_num, fps_den) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO timelines (id, name, is_open, start_tc_us, width, height, fps_num, fps_den, bin_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             timeline_id,
             timeline.name,
@@ -142,6 +175,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<()> {
             timeline.resolution.map(|r| r.1),
             timeline.fps.map(|f| f.num),
             timeline.fps.map(|f| f.den),
+            timeline_bin_id,
         ],
     )?;
     for track in &timeline.tracks {
@@ -348,14 +382,54 @@ pub fn load_project(path: &Path) -> Result<Project> {
     let proxy_dir = PathBuf::from(proxy_dir_str);
     let ui_state: UiState = serde_json::from_str(&ui_state_json).unwrap_or_default();
 
-    // 2. Load media sources
+    // 2. Load bins and source->bin memberships
+    let master_bin_id = MASTER_BIN_ID.to_string();
+    let mut bins = Vec::new();
+    let mut bin_stmt = conn.prepare(
+        "SELECT id, name, parent_id, sort_order FROM bins WHERE id <> ?1 ORDER BY sort_order ASC, rowid ASC",
+    )?;
+    let bin_rows = bin_stmt.query_map(params![master_bin_id], |row| {
+        let id_str: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let parent_str: Option<String> = row.get(2)?;
+        let sort_order: i32 = row.get(3)?;
+        let bin_id = Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        let parent_id = parent_str
+            .map(|s| Uuid::parse_str(&s))
+            .transpose()
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?
+            .filter(|pid| *pid != MASTER_BIN_ID);
+        Ok(Bin { id: bin_id, name, parent_id, sort_order })
+    })?;
+    for bin in bin_rows {
+        bins.push(bin?);
+    }
+
+    let mut source_bins: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut bs_stmt = conn.prepare("SELECT bin_id, source_id FROM bin_sources")?;
+    let bs_rows = bs_stmt.query_map([], |row| {
+        let bin_str: String = row.get(0)?;
+        let src_str: String = row.get(1)?;
+        let bin_id = Uuid::parse_str(&bin_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        let src_id = Uuid::parse_str(&src_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+        Ok((src_id, bin_id))
+    })?;
+    for row in bs_rows {
+        let (src_id, bin_id) = row?;
+        if bin_id != MASTER_BIN_ID {
+            source_bins.insert(src_id, bin_id);
+        }
+    }
+
+    // 2b. Load media sources
     let mut sources = HashMap::new();
     let mut source_stmt = conn.prepare(
         "SELECT id, path, relative_path, media_type, duration_us, is_missing,
                 video_width, video_height, video_fps_num, video_fps_den, video_codec,
                 video_color_range, video_color_space, video_bit_depth, video_has_alpha,
                 audio_sample_rate, audio_channels, audio_codec, audio_bit_rate,
-                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data
+                proxy_path, proxy_ready, imported_at, import_order, thumbnail_data,
+                display_name, conform_fps_num, conform_fps_den, audio_channel_map
          FROM media_sources ORDER BY import_order ASC",
     )?;
 
@@ -384,6 +458,10 @@ pub fn load_project(path: &Path) -> Result<Project> {
         let imported_at: i64 = row.get(21)?;
         let import_order: u32 = row.get(22)?;
         let thumbnail_data: Option<Vec<u8>> = row.get(23)?;
+        let display_name: Option<String> = row.get(24)?;
+        let conform_fps_num: Option<u32> = row.get(25)?;
+        let conform_fps_den: Option<u32> = row.get(26)?;
+        let audio_channel_map_str: Option<String> = row.get(27)?;
 
         let media_type = match media_type_int {
             0 => MediaType::Video,
@@ -393,6 +471,10 @@ pub fn load_project(path: &Path) -> Result<Project> {
 
         let video_fps = match (video_fps_num, video_fps_den) {
             (Some(num), Some(den)) => Some(RationalFps { num, den }),
+            _ => None,
+        };
+        let conform_fps = match (conform_fps_num, conform_fps_den) {
+            (Some(num), Some(den)) if num > 0 && den > 0 => Some(RationalFps { num, den }),
             _ => None,
         };
 
@@ -421,11 +503,16 @@ pub fn load_project(path: &Path) -> Result<Project> {
             thumbnail_data,
             imported_at,
             import_order,
+            bin_id: None,
+            display_name,
+            conform_fps,
+            audio_channel_map: audio_channel_map_str.as_deref().map(AudioChannelMap::from_db_str).unwrap_or_default(),
         })
     })?;
 
     for src in source_rows {
-        let src = src?;
+        let mut src = src?;
+        src.bin_id = source_bins.get(&src.id).copied();
         sources.insert(src.id, src);
     }
 
@@ -705,6 +792,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
         proxy_dir,
         timeline,
         timelines,
+        bins,
         sources,
         ui_state,
     })
@@ -733,7 +821,7 @@ fn group_timelines(
     tracks: impl Iterator<Item = (Track, Option<String>)>,
     markers: impl Iterator<Item = (Marker, Option<String>)>,
 ) -> Result<(Timeline, Vec<Timeline>)> {
-    let mut stmt = conn.prepare("SELECT id, name, is_open, start_tc_us, width, height, fps_num, fps_den FROM timelines ORDER BY rowid")?;
+    let mut stmt = conn.prepare("SELECT id, name, is_open, start_tc_us, width, height, fps_num, fps_den, bin_id FROM timelines ORDER BY rowid")?;
     let rows = stmt.query_map([], |row| {
         let size = (row.get::<_, Option<u32>>(4)?, row.get::<_, Option<u32>>(5)?);
         let resolution = match size {
@@ -744,17 +832,23 @@ fn group_timelines(
             (Some(num), Some(den)) if num > 0 && den > 0 => Some(RationalFps { num, den }),
             _ => None,
         };
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(3)?, resolution, fps))
+        let bin_id = row
+            .get::<_, Option<String>>(8)?
+            .map(|s| Uuid::parse_str(&s))
+            .transpose()
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?
+            .filter(|id| *id != MASTER_BIN_ID);
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(3)?, resolution, fps, bin_id))
     })?;
     let mut all: Vec<(String, Timeline)> = Vec::new();
     let mut open = 0;
     for row in rows {
-        let (id, name, is_open, start_tc_us, resolution, fps) = row?;
+        let (id, name, is_open, start_tc_us, resolution, fps, bin_id) = row?;
         let uuid = Uuid::parse_str(&id).map_err(|e| ProjectError::InvalidProject(format!("timeline id {id}: {e}")))?;
         if is_open {
             open = all.len();
         }
-        all.push((id, Timeline { id: uuid, name, start_tc_us, resolution, fps, ..Timeline::new() }));
+        all.push((id, Timeline { id: uuid, name, start_tc_us, resolution, fps, bin_id, ..Timeline::new() }));
     }
     if all.is_empty() {
         let t = Timeline::new();
@@ -880,8 +974,8 @@ mod tests {
         project.sources.insert(src_id, source);
 
         // Add 10 clips across 3 tracks
-        for track_idx in 0..3 {
-            let track_id = project.timeline.tracks[track_idx].id;
+        for (track_idx, track) in project.timeline.tracks.iter_mut().enumerate().take(3) {
+            let track_id = track.id;
             for clip_idx in 0..3 {
                 let start = clip_idx * 5_000_000;
                 let end = start + 4_000_000;
@@ -896,7 +990,7 @@ mod tests {
                     4_000_000,
                 );
                 clip.properties.opacity = 0.85;
-                project.timeline.tracks[track_idx].clips.push(clip);
+                track.clips.push(clip);
             }
         }
 
@@ -1418,6 +1512,9 @@ mod tests {
              ALTER TABLE tracks DROP COLUMN audio_type; ALTER TABLE markers DROP COLUMN keyword;
              ALTER TABLE transitions DROP COLUMN start_ratio; ALTER TABLE transitions DROP COLUMN end_ratio; ALTER TABLE transitions DROP COLUMN curve;
              ALTER TABLE timelines DROP COLUMN fps_num; ALTER TABLE timelines DROP COLUMN fps_den; ALTER TABLE transitions DROP COLUMN enabled;
+             ALTER TABLE timelines DROP COLUMN bin_id;
+             ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
              INSERT INTO transitions (id, clip_id, edge, kind, duration_us, alignment) SELECT '6f1c3b8e-7d2a-4b8e-9a3c-1d2e3f4a5b6c', id, 1, 1, 500000, 2 FROM clips;",
         );
         let loaded = load_project(file.path()).unwrap();
@@ -1430,6 +1527,67 @@ mod tests {
         // Schema 6 defaults: the timeline follows the project's rate and transitions are on.
         assert_eq!(loaded.timeline.fps, None);
         assert!(loaded.timeline.tracks.iter().flat_map(|t| &t.transitions).all(|t| t.enabled));
+        // Schema 7 defaults: no user bins, open timeline in Master.
+        assert!(loaded.bins.is_empty());
+        assert_eq!(loaded.timeline.bin_id, None);
+    }
+
+    #[test]
+    fn v6_files_upgrade_to_v7_with_bin_id_none() {
+        let (file, _) = tampered(
+            "ALTER TABLE timelines DROP COLUMN bin_id;
+             ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
+             DELETE FROM schema_version WHERE version >= 7;",
+        );
+        let loaded = load_project(file.path()).unwrap();
+        assert!(loaded.bins.is_empty());
+        assert_eq!(loaded.timeline.bin_id, None);
+        let conn = open_connection(file.path()).unwrap();
+        let ver: u32 = conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(ver, crate::CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn bins_sources_and_timelines_round_trip() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Bins", 1920, 1080, RationalFps::FPS_30);
+        let b_root = project.create_bin("Footage", None).unwrap();
+        let b_sub = project.create_bin("Selects", Some(b_root)).unwrap();
+
+        let s_master = MediaSource::new(PathBuf::from("/media/a.mp4"), MediaType::Video, 1_000_000);
+        let mut s_sub = MediaSource::new(PathBuf::from("/media/b.mp4"), MediaType::Video, 2_000_000);
+        s_sub.import_order = 1;
+        let (sm_id, ss_id) = (s_master.id, s_sub.id);
+        project.sources.insert(sm_id, s_master);
+        project.sources.insert(ss_id, s_sub);
+        assert!(project.move_source_to_bin(ss_id, Some(b_sub)));
+
+        let mut t2 = Timeline::with_tracks("Cut B", 1, 1);
+        t2.bin_id = Some(b_root);
+        let t2_id = t2.id;
+        project.timelines.push(t2);
+        assert!(project.move_timeline_to_bin(project.timeline.id, Some(b_sub)));
+
+        save_project(&project, file.path()).unwrap();
+        let mut loaded = load_project(file.path()).unwrap();
+        assert_eq!(loaded.bins.len(), 2);
+        assert_eq!(loaded.bins[0].name, "Footage");
+        assert_eq!(loaded.bins[0].parent_id, None);
+        assert_eq!(loaded.bins[1].name, "Selects");
+        assert_eq!(loaded.bins[1].parent_id, Some(b_root));
+        assert_eq!(loaded.sources[&sm_id].bin_id, None);
+        assert_eq!(loaded.sources[&ss_id].bin_id, Some(b_sub));
+        assert_eq!(loaded.timeline.bin_id, Some(b_sub));
+        assert_eq!(loaded.timelines.iter().find(|t| t.id == t2_id).unwrap().bin_id, Some(b_root));
+
+        // Verify MASTER_BIN_ID in SQLite maps back to None on load, and deleting a bin persists cleanly.
+        assert!(loaded.delete_bin(b_sub));
+        save_project(&loaded, file.path()).unwrap();
+        let reloaded = load_project(file.path()).unwrap();
+        assert_eq!(reloaded.bins.len(), 1);
+        assert_eq!(reloaded.sources[&ss_id].bin_id, Some(b_root));
+        assert_eq!(reloaded.timeline.bin_id, Some(b_root));
     }
 
     #[test]
@@ -1464,5 +1622,42 @@ mod tests {
         save_project(&project, file.path()).unwrap();
         let loaded = load_project(file.path()).unwrap();
         assert_eq!(loaded.timeline.tracks[0].transitions[0].kind, TransitionKind::Crossfade);
+    }
+
+    #[test]
+    fn clip_attributes_round_trip_and_v7_upgrade() {
+        let file = NamedTempFile::new().unwrap();
+        let mut project = Project::new("Attrs", 1920, 1080, RationalFps::FPS_24);
+        let mut src = MediaSource::new(PathBuf::from("/media/take.mp4"), MediaType::Video, 4_000_000);
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.display_name = Some("Interview Cam A".into());
+        src.conform_fps = Some(RationalFps::FPS_24);
+        src.audio_channel_map = AudioChannelMap::LeftToBoth;
+        let src_id = src.id;
+        project.sources.insert(src_id, src);
+
+        let a_track = project.timeline.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id;
+        let mut a_clip = Clip::new(a_track, src_id, ClipType::Audio, "Interview Cam A", 0, 2_000_000, 0, 2_000_000);
+        a_clip.properties.audio_channel_map = AudioChannelMap::SwapLeftRight;
+        project.timeline.find_track_mut(a_track).unwrap().clips.push(a_clip);
+
+        save_project(&project, file.path()).unwrap();
+        let loaded = load_project(file.path()).unwrap();
+        let ls = &loaded.sources[&src_id];
+        assert_eq!(ls.display_name.as_deref(), Some("Interview Cam A"));
+        assert_eq!(ls.conform_fps, Some(RationalFps::FPS_24));
+        assert_eq!(ls.audio_channel_map, AudioChannelMap::LeftToBoth);
+        assert_eq!(
+            loaded.timeline.find_track(a_track).unwrap().clips[0].properties.audio_channel_map,
+            AudioChannelMap::SwapLeftRight
+        );
+
+        let (v7_file, _) = tampered(
+            "ALTER TABLE media_sources DROP COLUMN display_name; ALTER TABLE media_sources DROP COLUMN conform_fps_num;
+             ALTER TABLE media_sources DROP COLUMN conform_fps_den; ALTER TABLE media_sources DROP COLUMN audio_channel_map;
+             DELETE FROM schema_version WHERE version >= 8;",
+        );
+        let upgraded = load_project(v7_file.path()).unwrap();
+        assert!(upgraded.sources.values().all(|s| s.display_name.is_none() && s.conform_fps.is_none() && s.audio_channel_map == AudioChannelMap::Stereo));
     }
 }

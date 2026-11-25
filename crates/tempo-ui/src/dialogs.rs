@@ -7,7 +7,12 @@ use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_timeline::{AudioTrackType, ClipType, Command, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED, MIN_SPEED};
+use tempo_timeline::{
+    scale_us, AudioChannelMap, AudioTrackType, Clip, ClipType, Command, CompositeCommand,
+    EditClipCommand, Marker, MarkerColor, RationalFps, SetClipSpeedCommand, Timeline, MAX_SPEED,
+    MIN_SPEED,
+};
+use uuid::Uuid;
 
 use crate::actions;
 use crate::keybinds;
@@ -47,6 +52,40 @@ const RATES: [(&str, RationalFps); 8] = [
     ("60", RationalFps::FPS_60),
 ];
 
+/// The `RATES` that every one of `natives` can be conformed to within the clip speed limits.
+fn conform_rates(natives: &[RationalFps]) -> Vec<(&'static str, RationalFps)> {
+    let natives: Vec<f64> = natives.iter().map(|n| n.to_f64()).filter(|n| *n > 0.0).collect();
+    if natives.is_empty() {
+        return Vec::new();
+    }
+    RATES
+        .iter()
+        .copied()
+        .filter(|(_, r)| natives.iter().all(|n| (MIN_SPEED..=MAX_SPEED).contains(&(r.to_f64() / n))))
+        .collect()
+}
+
+/// The speed each clip needs so it plays its own frames at `target` (None: native).
+/// A linked group counts once, as `SetClipSpeedCommand` retimes the whole group;
+/// clips whose source has no frame rate (music, stills) are left alone.
+fn conform_speeds(
+    clips: &[Clip],
+    target: Option<RationalFps>,
+    src_fps: &std::collections::HashMap<Uuid, RationalFps>,
+) -> Vec<(Uuid, f64)> {
+    let mut seen_links = std::collections::HashSet::new();
+    clips
+        .iter()
+        .filter(|c| matches!(c.clip_type, ClipType::Video | ClipType::Audio))
+        .filter_map(|clip| {
+            let native = src_fps.get(&clip.source_id).filter(|f| f.to_f64() > 0.0)?;
+            let speed = target.map_or(1.0, |t| (t.to_f64() / native.to_f64()).clamp(MIN_SPEED, MAX_SPEED));
+            let first = seen_links.insert(clip.properties.link.unwrap_or(clip.id));
+            (first && (clip.properties.speed - speed).abs() > 1e-4).then_some((clip.id, speed))
+        })
+        .collect()
+}
+
 /// Index of `fps` in `RATES`, or of 30 when the rate is not listed.
 fn rate_index(fps: RationalFps) -> u32 {
     RATES.iter().position(|r| r.1 == fps).or_else(|| RATES.iter().position(|r| r.1 == RationalFps::FPS_30)).unwrap_or(0) as u32
@@ -85,44 +124,334 @@ fn stored_marker_duration_us(typed_us: i64, floored_us: i64, fps: RationalFps) -
     if frame_count(typed_us, fps) <= 1 { 0 } else { floored_us }
 }
 
-pub fn new_project(parent: &impl IsA<gtk::Widget>, on_create: impl Fn(NewProject) + 'static) {
-    let name = gtk::Entry::builder().text("Untitled Project").activates_default(true).build();
+fn default_project_dir() -> PathBuf {
+    glib::user_special_dir(glib::UserDirectory::Videos)
+        .unwrap_or_else(|| glib::home_dir().join("Videos"))
+        .join("Tempo")
+}
+
+fn project_has_clips(project: &tempo_timeline::Project) -> bool {
+    std::iter::once(&project.timeline)
+        .chain(&project.timelines)
+        .any(|t| t.tracks.iter().any(|tr| !tr.clips.is_empty()))
+}
+
+fn shape_size_match(width: u32, height: u32) -> Option<(usize, usize)> {
+    for (si, &(_, (rw, rh))) in SHAPES.iter().enumerate() {
+        for (zi, &(_, short)) in SIZES.iter().enumerate() {
+            let expected = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
+            if expected == (width, height) {
+                return Some((si, zi));
+            }
+        }
+    }
+    None
+}
+
+pub fn new_project(parent: &impl IsA<gtk::Widget>, existing_names: Vec<String>, on_create: impl Fn(NewProject) + 'static) {
+    let default_name = crate::project_manager::next_default_project_name(&existing_names);
+    let name = gtk::Entry::builder().text(&default_name).activates_default(true).build();
     let shape = gtk::DropDown::from_strings(&SHAPES.map(|s| s.0));
     let size = gtk::DropDown::from_strings(&SIZES.map(|s| s.0));
     size.set_selected(1);
     let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
     rate.set_selected(rate_index(RationalFps::FPS_30));
 
+    let location = gtk::Entry::builder()
+        .text(&*default_project_dir().to_string_lossy())
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let browse = gtk::Button::with_label("Browse…");
+    let loc_entry = location.clone();
+    browse.connect_clicked(move |b| {
+        let chooser = gtk::FileDialog::builder().title("Project Location").modal(true).build();
+        let current = PathBuf::from(loc_entry.text().trim());
+        if !current.as_os_str().is_empty() {
+            chooser.set_initial_folder(Some(&gtk::gio::File::for_path(&current)));
+        }
+        let entry = loc_entry.clone();
+        chooser.select_folder(b.root().and_downcast::<gtk::Window>().as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let loc_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    loc_row.append(&location);
+    loc_row.append(&browse);
+
     let grid = form_grid();
     form_row(&grid, 0, "Name", &name);
     form_row(&grid, 1, "Shape", &shape);
     form_row(&grid, 2, "Resolution", &size);
     form_row(&grid, 3, "Frame rate", &rate);
+    form_row(&grid, 4, "Location", &loc_row);
+    grid.set_margin_start(24);
+    grid.set_margin_end(24);
+    grid.set_margin_top(12);
+    grid.set_margin_bottom(12);
 
-    let dialog = adw::AlertDialog::builder().heading("New Project").extra_child(&grid).build();
-    dialog.add_responses(&[("cancel", "Cancel"), ("create", "Create")]);
-    dialog.set_default_response(Some("create"));
-    dialog.set_close_response("cancel");
-    dialog.connect_response(None, move |_, response| {
-        if response != "create" {
+    let cancel = gtk::Button::with_label("Cancel");
+    let create = gtk::Button::with_label("Create");
+    create.add_css_class("suggested-action");
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    let bar = gtk::Box::builder().spacing(8).margin_start(24).margin_end(24).margin_top(8).margin_bottom(12).build();
+    bar.append(&spacer);
+    bar.append(&cancel);
+    bar.append(&create);
+
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&grid));
+    view.add_bottom_bar(&bar);
+    let dialog = adw::Dialog::builder().title("New Project").child(&view).build();
+    dialog.set_default_widget(Some(&create));
+
+    let closer = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(d) = closer.upgrade() {
+            d.close();
+        }
+    });
+
+    let dialog_ref = dialog.downgrade();
+    let name_ref = name.clone();
+    create.connect_clicked(move |_| {
+        let typed = name_ref.text().trim().to_string();
+        let title = if typed.is_empty() { default_name.clone() } else { typed };
+        if crate::project_manager::is_duplicate_name(&existing_names, &title) {
+            let alert = adw::AlertDialog::builder()
+                .heading("Name Already Exists")
+                .body("A project with the same name is already in use.")
+                .build();
+            alert.add_responses(&[("ok", "OK")]);
+            alert.set_default_response(Some("ok"));
+            alert.set_close_response("ok");
+            let n = name_ref.clone();
+            alert.connect_response(None, move |_, _| {
+                n.grab_focus();
+                n.select_region(0, -1);
+            });
+            if let Some(d) = dialog_ref.upgrade() {
+                alert.present(Some(&d));
+            }
             return;
         }
-        let title = name.text().trim().to_string();
-        let title = if title.is_empty() { "Untitled Project".to_string() } else { title };
-        let (rw, rh) = SHAPES[shape.selected() as usize].1;
-        let short = SIZES[size.selected() as usize].1;
+        let (rw, rh) = SHAPES.get(shape.selected() as usize).unwrap_or(&SHAPES[0]).1;
+        let short = SIZES.get(size.selected() as usize).unwrap_or(&SIZES[1]).1;
         // The chosen size is the short side; the long side follows the shape.
         let (width, height) = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
-        let dir = glib::user_special_dir(glib::UserDirectory::Videos).unwrap_or_else(glib::home_dir).join("Tempo");
+        let loc_text = location.text().trim().to_string();
+        let dir = if loc_text.is_empty() { default_project_dir() } else { PathBuf::from(loc_text) };
         let safe: String = title.chars().map(|c| if c == '/' || c == '\0' { '_' } else { c }).collect();
-        // Never overwrite an existing project of the same name.
-        let mut path = dir.join(format!("{safe}.tempo"));
-        let mut n = 2;
-        while path.exists() {
-            path = dir.join(format!("{safe} {n}.tempo"));
-            n += 1;
+        let path = dir.join(format!("{safe}.tempo"));
+        let fps = RATES.get(rate.selected() as usize).unwrap_or(&RATES[4]).1;
+        if let Some(d) = dialog_ref.upgrade() {
+            d.close();
         }
-        on_create(NewProject { name: title, width, height, fps: RATES[rate.selected() as usize].1, path });
+        on_create(NewProject { name: title, width, height, fps, path });
+    });
+
+    dialog.present(Some(parent));
+    name.grab_focus();
+    name.select_region(0, -1);
+}
+
+/// Choose a new `.tempo` path for Save Project As.
+pub fn save_project_as(
+    parent: &impl IsA<gtk::Window>,
+    current_path: Option<&std::path::Path>,
+    current_name: &str,
+    on_choose: impl Fn(PathBuf) + 'static,
+) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Tempo projects"));
+    filter.add_pattern("*.tempo");
+    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    let safe_stem: String = current_name.chars().map(|c| if c == '/' || c == '\0' { '_' } else { c }).collect();
+    let initial_name = if safe_stem.trim().is_empty() {
+        "Untitled Project.tempo".to_string()
+    } else {
+        format!("{safe_stem}.tempo")
+    };
+    let mut builder = gtk::FileDialog::builder()
+        .title("Save Project As")
+        .modal(true)
+        .filters(&filters)
+        .default_filter(&filter)
+        .initial_name(&initial_name);
+    if let Some(dir) = current_path.and_then(|p| p.parent()) {
+        builder = builder.initial_folder(&gtk::gio::File::for_path(dir));
+    }
+    let dialog = builder.build();
+    dialog.save(Some(parent.as_ref()), gtk::gio::Cancellable::NONE, move |result| {
+        if let Some(path) = result.ok().and_then(|f| f.path()) {
+            on_choose(crate::project_manager::with_tempo_extension(path));
+        }
+    });
+}
+
+/// Project Settings (Shift+9): resolution, frame rate (locked when clips exist), proxy folder.
+pub fn project_settings(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let Some((cur_w, cur_h, cur_fps, cur_proxy_dir, has_clips)) =
+        state.with_project(|p| (p.width, p.height, p.fps, p.proxy_dir.clone(), project_has_clips(p)))
+    else {
+        return;
+    };
+
+    let shape = gtk::DropDown::from_strings(&["Landscape 16:9", "Vertical 9:16", "Square 1:1", "Custom"]);
+    let size = gtk::DropDown::from_strings(&SIZES.map(|s| s.0));
+    let width = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    width.set_value(cur_w as f64);
+    let height = gtk::SpinButton::with_range(16.0, 16384.0, 2.0);
+    height.set_value(cur_h as f64);
+
+    if let Some((si, zi)) = shape_size_match(cur_w, cur_h) {
+        shape.set_selected(si as u32);
+        size.set_selected(zi as u32);
+    } else {
+        shape.set_selected(3);
+        size.set_selected(1);
+        size.set_sensitive(false);
+    }
+
+    let syncing = Rc::new(std::cell::Cell::new(false));
+    let apply_preset = {
+        let (shape, size, width, height, syncing) = (shape.clone(), size.clone(), width.clone(), height.clone(), syncing.clone());
+        move || {
+            if syncing.get() {
+                return;
+            }
+            let si = shape.selected() as usize;
+            let custom = si >= SHAPES.len();
+            size.set_sensitive(!custom);
+            if custom {
+                return;
+            }
+            let (rw, rh) = SHAPES[si].1;
+            let short = SIZES.get(size.selected() as usize).unwrap_or(&SIZES[1]).1;
+            let (w, h) = if rw >= rh { (short * rw / rh, short) } else { (short, short * rh / rw) };
+            syncing.set(true);
+            width.set_value(w as f64);
+            height.set_value(h as f64);
+            syncing.set(false);
+        }
+    };
+    let ap = apply_preset.clone();
+    shape.connect_selected_notify(move |_| ap());
+    let ap = apply_preset.clone();
+    size.connect_selected_notify(move |_| ap());
+
+    let on_dim = {
+        let (shape, size, width, height, syncing) = (shape.clone(), size.clone(), width.clone(), height.clone(), syncing.clone());
+        move || {
+            if syncing.get() {
+                return;
+            }
+            syncing.set(true);
+            let (w, h) = (width.value_as_int().max(16) as u32, height.value_as_int().max(16) as u32);
+            if let Some((si, zi)) = shape_size_match(w, h) {
+                shape.set_selected(si as u32);
+                size.set_selected(zi as u32);
+                size.set_sensitive(true);
+            } else {
+                shape.set_selected(3);
+                size.set_sensitive(false);
+            }
+            syncing.set(false);
+        }
+    };
+    let od = on_dim.clone();
+    width.connect_value_changed(move |_| od());
+    height.connect_value_changed(move |_| on_dim());
+
+    let rate = gtk::DropDown::from_strings(&RATES.map(|r| r.0));
+    rate.set_selected(rate_index(cur_fps));
+    if has_clips {
+        rate.set_sensitive(false);
+    }
+
+    let proxy_entry = gtk::Entry::builder()
+        .text(&*cur_proxy_dir.to_string_lossy())
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let browse = gtk::Button::with_label("Browse…");
+    let pe = proxy_entry.clone();
+    browse.connect_clicked(move |b| {
+        let chooser = gtk::FileDialog::builder().title("Proxy Folder").modal(true).build();
+        let current = PathBuf::from(pe.text().trim());
+        if !current.as_os_str().is_empty() {
+            chooser.set_initial_folder(Some(&gtk::gio::File::for_path(&current)));
+        }
+        let entry = pe.clone();
+        chooser.select_folder(b.root().and_downcast::<gtk::Window>().as_ref(), gtk::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+    });
+    let proxy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    proxy_row.append(&proxy_entry);
+    proxy_row.append(&browse);
+
+    let grid = form_grid();
+    let mut row = 0;
+    form_row(&grid, row, "Shape", &shape);
+    row += 1;
+    form_row(&grid, row, "Resolution", &size);
+    row += 1;
+    form_row(&grid, row, "Width", &width);
+    row += 1;
+    form_row(&grid, row, "Height", &height);
+    row += 1;
+    form_row(&grid, row, "Frame rate", &rate);
+    row += 1;
+    if has_clips {
+        let note = label("Cannot be changed once clips are on the timeline", &["tempo-dim", "tempo-small"]);
+        note.set_xalign(0.0);
+        grid.attach(&note, 1, row, 1, 1);
+        row += 1;
+    }
+    form_row(&grid, row, "Proxy folder", &proxy_row);
+
+    let dialog = adw::AlertDialog::builder().heading("Project Settings").extra_child(&grid).build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Apply")]);
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let state = state.clone();
+    dialog.connect_response(Some("apply"), move |_, _| {
+        let w = (width.value_as_int().max(16) as u32) & !1;
+        let h = (height.value_as_int().max(16) as u32) & !1;
+        let chosen_fps = RATES.get(rate.selected() as usize).unwrap_or(&RATES[4]).1;
+        let proxy_text = proxy_entry.text().trim().to_string();
+        let updated = if let Some(p) = state.project.borrow_mut().as_mut() {
+            let locked = project_has_clips(p);
+            let new_proxy = if proxy_text.is_empty() {
+                p.proxy_dir.clone()
+            } else {
+                PathBuf::from(proxy_text)
+            };
+            let changed = (p.width, p.height) != (w, h) || (!locked && p.fps != chosen_fps) || p.proxy_dir != new_proxy;
+            p.width = w;
+            p.height = h;
+            if !locked {
+                p.fps = chosen_fps;
+            }
+            p.proxy_dir = new_proxy;
+            changed
+        } else {
+            false
+        };
+        if updated {
+            state.sync_player();
+            state.set_dirty(true);
+            state.emit(crate::state::Change::Project);
+        }
     });
     dialog.present(Some(parent));
 }
@@ -267,7 +596,7 @@ fn marks_available(selected: Option<uuid::Uuid>, source: Option<uuid::Uuid>, src
 
 /// Resolve's Create New Timeline (Ctrl+N, or right-click in the Media Pool): a name and
 /// how many tracks. The new timeline opens; the others stay in the menu above the viewer.
-pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, bin_id: Option<uuid::Uuid>) {
     let Some(default) = state.with_project(|p| p.next_timeline_name()) else { return };
     let name = gtk::Entry::builder().text(&default).activates_default(true).build();
     let tracks = |label| {
@@ -395,7 +724,9 @@ pub fn new_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         let timeline_fps = (!use_project.is_active()).then(|| timeline_fps_choice(RATES[rate.selected() as usize].1, project_fps)).flatten();
         let resolution = (!use_project.is_active()).then(|| (width.value_as_int() as u32, height.value_as_int() as u32));
         let kind = if audio_type.selected() == 0 { AudioTrackType::Mono } else { AudioTrackType::Stereo };
-        state.add_timeline(timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps));
+        let mut tl = timeline_from_form(title, video.value_as_int() as u32, audio.value_as_int() as u32, kind, start_tc_us, resolution, timeline_fps);
+        tl.bin_id = bin_id;
+        state.add_timeline(tl);
         if !empty.is_active() {
             match state.media_selection.get() {
                 Some(source) => {
@@ -476,6 +807,389 @@ pub fn change_clip_speed(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
         state.execute(Box::new(command()));
     });
     dialog.present(Some(parent));
+}
+
+struct ClipAttributesSpec {
+    subtitle: String,
+    initial_name: String,
+    file_name: String,
+    has_video: bool,
+    video_summary: String,
+    native_fps: Option<RationalFps>,
+    /// Native rates of every source the conform retimes; the dropdown offers only rates all can honour.
+    conform_natives: Vec<RationalFps>,
+    initial_conform_fps: Option<RationalFps>,
+    source_duration_us: i64,
+    preview_fps: RationalFps,
+    has_audio: bool,
+    audio_summary: String,
+    initial_channel_map: AudioChannelMap,
+}
+
+struct ClipAttributesPatch {
+    display_name: String,
+    conform_fps: Option<RationalFps>,
+    fps_changed: bool,
+    channel_map: AudioChannelMap,
+    channel_map_changed: bool,
+}
+
+fn present_clip_attributes_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    spec: ClipAttributesSpec,
+    on_apply: impl FnOnce(ClipAttributesPatch) + 'static,
+) {
+    let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).vhomogeneous(false).build();
+    let switcher = gtk::StackSwitcher::builder().stack(&stack).halign(gtk::Align::Center).build();
+
+    // ---- Video tab
+    let video_grid = form_grid();
+    let src_vid = label(&spec.video_summary, &[]);
+    src_vid.set_xalign(0.0);
+    form_row(&video_grid, 0, "Source", &src_vid);
+
+    let native_label = match spec.native_fps {
+        Some(f) => format!("Native ({:.2} fps)", f.to_f64()),
+        None => "Native".to_string(),
+    };
+    // Only rates the speed limits can honour, so the label never promises a rate that is not played.
+    let rates = conform_rates(&spec.conform_natives);
+    let mut fps_labels = vec![native_label];
+    for (r_label, _) in &rates {
+        fps_labels.push(format!("{r_label} fps"));
+    }
+    let fps_refs: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
+    let fps_drop = gtk::DropDown::from_strings(&fps_refs);
+    let initial_fps_idx = spec
+        .initial_conform_fps
+        .and_then(|cf| rates.iter().position(|(_, r)| r.num == cf.num && r.den == cf.den))
+        .map(|i| (i + 1) as u32)
+        .unwrap_or(0);
+    fps_drop.set_selected(initial_fps_idx);
+    fps_drop.set_sensitive(spec.has_video && spec.native_fps.is_some());
+    form_row(&video_grid, 1, "Video Frame Rate", &fps_drop);
+
+    let speed_preview = label("", &["tempo-dim"]);
+    speed_preview.set_xalign(0.0);
+    form_row(&video_grid, 2, "Playback", &speed_preview);
+
+    let update_preview = {
+        let (fps_drop, speed_preview, rates) = (fps_drop.clone(), speed_preview.clone(), rates.clone());
+        let (native_fps, source_dur, preview_fps, has_video) =
+            (spec.native_fps, spec.source_duration_us, spec.preview_fps, spec.has_video);
+        move || {
+            if !has_video || native_fps.is_none() {
+                speed_preview.set_text("Video frame rate conform applies to video clips.");
+                return;
+            }
+            let sel = fps_drop.selected() as usize;
+            let spd = match (native_fps, sel) {
+                (Some(n), idx) if idx > 0 => rates
+                    .get(idx - 1)
+                    .map(|(_, t)| (t.to_f64() / n.to_f64().max(1.0)).clamp(MIN_SPEED, MAX_SPEED))
+                    .unwrap_or(1.0),
+                _ => 1.0,
+            };
+            let dur = if (spd - 1.0).abs() < 1e-6 {
+                source_dur
+            } else {
+                scale_us(source_dur, 1.0 / spd).max(1)
+            };
+            speed_preview.set_text(&format!("{spd:.2}× speed · {}", timecode(dur, preview_fps.to_f64())));
+        }
+    };
+    update_preview();
+    let up = update_preview.clone();
+    fps_drop.connect_selected_notify(move |_| up());
+    stack.add_titled(&video_grid, Some("video"), "Video");
+
+    // ---- Audio tab
+    let audio_grid = form_grid();
+    let src_aud = label(&spec.audio_summary, &[]);
+    src_aud.set_xalign(0.0);
+    form_row(&audio_grid, 0, "Source", &src_aud);
+
+    let ch_labels: Vec<&str> = AudioChannelMap::ALL.iter().map(|m| m.label()).collect();
+    let ch_drop = gtk::DropDown::from_strings(&ch_labels);
+    let initial_ch_idx = AudioChannelMap::ALL
+        .iter()
+        .position(|m| *m == spec.initial_channel_map)
+        .unwrap_or(0) as u32;
+    ch_drop.set_selected(initial_ch_idx);
+    ch_drop.set_sensitive(spec.has_audio);
+    form_row(&audio_grid, 1, "Channel Mapping", &ch_drop);
+
+    let audio_hint = label(
+        if spec.has_audio {
+            "Tip: Pick Channel 1 (Left -> Both) if a mic only plays on one side."
+        } else {
+            "This clip has no audio stream."
+        },
+        &["tempo-small", "tempo-dim"],
+    );
+    audio_hint.set_xalign(0.0);
+    audio_hint.set_wrap(true);
+    audio_grid.attach(&audio_hint, 1, 2, 1, 1);
+    stack.add_titled(&audio_grid, Some("audio"), "Audio");
+
+    // ---- Name tab
+    let name_grid = form_grid();
+    let name_entry = gtk::Entry::builder().text(&spec.initial_name).activates_default(true).build();
+    name_entry.update_property(&[gtk::accessible::Property::Label("Clip Name")]);
+    form_row(&name_grid, 0, "Clip Name", &name_entry);
+    let file_lbl = label(&spec.file_name, &["tempo-dim"]);
+    file_lbl.set_xalign(0.0);
+    file_lbl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    form_row(&name_grid, 1, "Disk File", &file_lbl);
+    let disk_note = label("Renaming here changes project display only, not the file on disk.", &["tempo-small", "tempo-dim"]);
+    disk_note.set_xalign(0.0);
+    disk_note.set_wrap(true);
+    name_grid.attach(&disk_note, 1, 2, 1, 1);
+    stack.add_titled(&name_grid, Some("name"), "Name");
+
+    let body = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).width_request(400).build();
+    body.append(&switcher);
+    body.append(&stack);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Clip Attributes")
+        .body(&spec.subtitle)
+        .extra_child(&body)
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Apply")]);
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let on_apply = std::cell::Cell::new(Some(on_apply));
+    dialog.connect_response(Some("apply"), move |_, _| {
+        let sel_fps = fps_drop.selected();
+        let conform_fps = if sel_fps > 0 {
+            rates.get((sel_fps - 1) as usize).map(|(_, f)| *f)
+        } else {
+            None
+        };
+        let sel_ch = ch_drop.selected();
+        let channel_map = AudioChannelMap::ALL.get(sel_ch as usize).copied().unwrap_or_default();
+        if let Some(cb) = on_apply.take() {
+            cb(ClipAttributesPatch {
+                display_name: name_entry.text().trim().to_string(),
+                conform_fps,
+                fps_changed: sel_fps != initial_fps_idx,
+                channel_map,
+                channel_map_changed: sel_ch != initial_ch_idx,
+            });
+        }
+    });
+    dialog.present(Some(parent));
+}
+
+/// Resolve-style Clip Attributes for a Media Pool item (Video FPS Conform, Audio Mapping, Clip Name).
+pub fn clip_attributes_source(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>, source_id: Uuid) {
+    let Some(spec) = state.with_project(|p| {
+        p.sources.get(&source_id).map(|s| {
+            let file_name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let has_video = s.media_type == tempo_timeline::MediaType::Video;
+            let video_summary = match (s.video_width, s.video_height, s.video_fps) {
+                (Some(w), Some(h), Some(fps)) => format!("{w} × {h}, Native {:.2} fps", fps.to_f64()),
+                _ if s.media_type == tempo_timeline::MediaType::Image => format!(
+                    "{} × {} Still Image",
+                    s.video_width.unwrap_or(0),
+                    s.video_height.unwrap_or(0)
+                ),
+                _ => "Audio only".to_string(),
+            };
+            let has_audio = s.audio_channels.is_some();
+            let audio_summary = match (s.audio_channels, s.audio_sample_rate) {
+                (Some(ch), Some(sr)) => format!("{ch} ch · {sr} Hz"),
+                (Some(ch), None) => format!("{ch} ch"),
+                _ => "No audio stream".to_string(),
+            };
+            ClipAttributesSpec {
+                subtitle: format!("Media Pool · {file_name}"),
+                initial_name: s.display_name(),
+                file_name,
+                has_video,
+                video_summary,
+                native_fps: s.video_fps,
+                conform_natives: s.video_fps.into_iter().collect(),
+                initial_conform_fps: s.conform_fps,
+                source_duration_us: s.duration_us,
+                preview_fps: p.timeline_fps(),
+                has_audio,
+                audio_summary,
+                initial_channel_map: s.audio_channel_map,
+            }
+        })
+    }).flatten() else {
+        return;
+    };
+
+    let state = state.clone();
+    present_clip_attributes_dialog(parent, spec, move |patch| {
+        let changed = {
+            let mut guard = state.project.borrow_mut();
+            guard
+                .as_mut()
+                .and_then(|p| p.sources.get_mut(&source_id))
+                .is_some_and(|src| {
+                    let disk_name = src.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let next_name = if patch.display_name.is_empty() || patch.display_name == disk_name {
+                        None
+                    } else {
+                        Some(patch.display_name)
+                    };
+                    // Keep a stored conform the dropdown no longer offers unless the user changed the rate.
+                    let next_fps = if patch.fps_changed { patch.conform_fps } else { src.conform_fps };
+                    if src.display_name == next_name && src.conform_fps == next_fps && src.audio_channel_map == patch.channel_map {
+                        return false;
+                    }
+                    src.display_name = next_name;
+                    src.conform_fps = next_fps;
+                    src.audio_channel_map = patch.channel_map;
+                    true
+                })
+        };
+        if changed {
+            state.set_dirty(true);
+            if state.source_clip.get() == Some(source_id) {
+                state.show_source(Some(source_id));
+            }
+            state.emit(crate::state::Change::Media);
+            state.emit(crate::state::Change::Options);
+        }
+    });
+}
+
+/// Resolve-style Clip Attributes for selected Timeline clip(s) (undoable via `CommandLog`).
+pub fn clip_attributes_timeline(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
+    let selected = state.selected_ids();
+    if selected.is_empty() {
+        state.message("Select a clip on the timeline first, then open Clip Attributes…");
+        return;
+    }
+
+    let Some((clips, spec, timeline_fps, source_limits, src_fps)) = state.with_project(|p| {
+        let mut collected: Vec<Clip> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in &selected {
+            if let Some((_, clip)) = p.timeline.find_clip(*id) {
+                if seen.insert(clip.id) {
+                    collected.push(clip.clone());
+                }
+                if let Some(link_id) = clip.properties.link {
+                    for t in &p.timeline.tracks {
+                        for c in t.clips.iter().filter(|c| c.properties.link == Some(link_id)) {
+                            if seen.insert(c.id) {
+                                collected.push(c.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let primary = collected.first()?.clone();
+        let src = p.sources.get(&primary.source_id);
+        let native_fps = src.and_then(|s| s.video_fps);
+        let has_video = collected.iter().any(|c| c.clip_type == ClipType::Video);
+        let has_audio = collected.iter().any(|c| c.clip_type == ClipType::Audio);
+        let first_audio = collected.iter().find(|c| c.clip_type == ClipType::Audio);
+        let file_name = src
+            .and_then(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| primary.name.clone());
+        let video_summary = match (src.and_then(|s| s.video_width), src.and_then(|s| s.video_height), native_fps) {
+            (Some(w), Some(h), Some(fps)) => format!("{w} × {h}, Native {:.2} fps", fps.to_f64()),
+            _ if primary.clip_type == ClipType::Title => "Title Overlay".to_string(),
+            _ if primary.clip_type == ClipType::Image => "Still Image".to_string(),
+            _ => "Audio Clip".to_string(),
+        };
+        let audio_summary = match src.and_then(|s| Some((s.audio_channels?, s.audio_sample_rate))) {
+            Some((ch, Some(sr))) => format!("{ch} ch · {sr} Hz"),
+            Some((ch, None)) => format!("{ch} ch"),
+            None if has_audio => "Timeline Audio".to_string(),
+            None => "No audio stream".to_string(),
+        };
+        let initial_conform_fps = native_fps.and_then(|nf| {
+            let eff = nf.to_f64() * primary.properties.speed;
+            RATES
+                .iter()
+                .map(|(_, r)| *r)
+                .find(|r| (r.to_f64() - eff).abs() < 0.05 && (r.to_f64() - nf.to_f64()).abs() >= 0.05)
+        });
+        let mut conform_natives: Vec<RationalFps> = Vec::new();
+        for c in collected.iter().filter(|c| matches!(c.clip_type, ClipType::Video | ClipType::Audio)) {
+            if let Some(f) = p.sources.get(&c.source_id).and_then(|s| s.video_fps) {
+                if !conform_natives.contains(&f) {
+                    conform_natives.push(f);
+                }
+            }
+        }
+        let subtitle = if collected.len() == 1 {
+            format!("Timeline Clip · {}", primary.name)
+        } else {
+            format!("Timeline Selection · {} clips", collected.len())
+        };
+        let spec = ClipAttributesSpec {
+            subtitle,
+            initial_name: primary.name.clone(),
+            file_name,
+            has_video,
+            video_summary,
+            native_fps,
+            conform_natives,
+            initial_conform_fps,
+            source_duration_us: (primary.source_out - primary.source_in).max(1),
+            preview_fps: p.timeline_fps(),
+            has_audio,
+            audio_summary,
+            initial_channel_map: first_audio.map(|c| c.properties.audio_channel_map).unwrap_or_default(),
+        };
+        let limits = p
+            .sources
+            .iter()
+            .filter(|(_, s)| s.duration_us > 0)
+            .map(|(id, s)| (*id, s.duration_us))
+            .collect::<std::collections::HashMap<_, _>>();
+        let src_fps = p.sources.iter().filter_map(|(id, s)| Some((*id, s.video_fps?))).collect();
+        Some((collected, spec, p.timeline_fps(), limits, src_fps))
+    }).flatten() else {
+        return;
+    };
+
+    let state = state.clone();
+    let initial_name = spec.initial_name.clone();
+    present_clip_attributes_dialog(parent, spec, move |patch| {
+        let mut cmds: Vec<Box<dyn Command>> = Vec::new();
+        let rename_to = (!patch.display_name.is_empty() && patch.display_name != initial_name).then_some(patch.display_name);
+
+        for clip in &clips {
+            let mut next = clip.clone();
+            let mut edited = false;
+            if let Some(ref new_name) = rename_to {
+                if next.name != *new_name {
+                    next.name = new_name.clone();
+                    edited = true;
+                }
+            }
+            if patch.channel_map_changed && next.clip_type == ClipType::Audio && next.properties.audio_channel_map != patch.channel_map {
+                next.properties.audio_channel_map = patch.channel_map;
+                edited = true;
+            }
+            if edited {
+                cmds.push(Box::new(EditClipCommand::new("Clip Attributes", next)));
+            }
+        }
+
+        if patch.fps_changed {
+            for (id, speed) in conform_speeds(&clips, patch.conform_fps, &src_fps) {
+                cmds.push(Box::new(SetClipSpeedCommand::new(id, speed, true, timeline_fps, source_limits.clone())));
+            }
+        }
+
+        if !cmds.is_empty() {
+            state.execute(Box::new(CompositeCommand::new("Clip Attributes", cmds)));
+        }
+    });
 }
 
 /// Ask for the details of an upload, then run the plugin's uploader on a worker.
@@ -770,6 +1484,14 @@ pub fn preferences(parent: &impl IsA<gtk::Widget>, state: &Rc<AppState>) {
     let c = change.clone();
     autosave.connect_selected_notify(move |row| c(&|s| s.autosave_seconds = AUTOSAVE[row.selected() as usize].1));
     general.add(&autosave);
+    let show_splash = adw::SwitchRow::builder()
+        .title("Show startup splash screen")
+        .subtitle("Behind-the-scenes cards and tips while loading (press any key to skip)")
+        .active(current.show_splash)
+        .build();
+    let c = change.clone();
+    show_splash.connect_active_notify(move |row| c(&|s| s.show_splash = row.is_active()));
+    general.add(&show_splash);
 
     let playback = adw::PreferencesGroup::builder()
         .title("Playback")
@@ -1034,5 +1756,50 @@ mod marker_time_tests {
         assert_eq!(parse_timecode("00:75:00:00", 24.0), None);
         assert_eq!(parse_timecode("-1:00", 24.0), None);
         assert_eq!(parse_timecode("5", 24.0), None);
+    }
+}
+
+#[cfg(test)]
+mod clip_attributes_tests {
+    use super::{conform_rates, conform_speeds};
+    use tempo_timeline::{Clip, ClipType, RationalFps};
+    use uuid::Uuid;
+
+    #[test]
+    fn each_clip_is_conformed_from_its_own_frame_rate() {
+        // Arrange: a 60 fps clip, a 30 fps clip and a music clip with no frame rate.
+        let (s60, s30, music) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let fps = [(s60, RationalFps::FPS_60), (s30, RationalFps::FPS_30)].into_iter().collect();
+        let t = Uuid::new_v4();
+        let clips = [
+            Clip::new(t, s60, ClipType::Video, "a", 0, 1, 0, 1),
+            Clip::new(t, s30, ClipType::Video, "b", 1, 2, 0, 1),
+            Clip::new(t, music, ClipType::Audio, "m", 0, 1, 0, 1),
+        ];
+
+        // Act
+        let speeds = conform_speeds(&clips, Some(RationalFps::FPS_24), &fps);
+
+        // Assert
+        assert_eq!(speeds.len(), 2);
+        assert_eq!(speeds[0].0, clips[0].id);
+        assert!((speeds[0].1 - 0.4).abs() < 1e-9);
+        assert_eq!(speeds[1].0, clips[1].id);
+        assert!((speeds[1].1 - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_rates_within_the_speed_limits_are_offered() {
+        // 120 fps footage cannot slow below 0.25x, so 30 fps is the lowest it can be conformed to.
+        let fps_120 = RationalFps { num: 120, den: 1 };
+        let rates: Vec<RationalFps> = conform_rates(&[fps_120]).into_iter().map(|r| r.1).collect();
+        assert_eq!(rates.first(), Some(&RationalFps::FPS_30));
+        assert!(!rates.contains(&RationalFps::FPS_24));
+        assert_eq!(conform_rates(&[RationalFps::FPS_30]).len(), super::RATES.len());
+        assert!(conform_rates(&[]).is_empty());
+        // A 30 fps clip selected with a 120 fps clip: 24 would clamp the 120 fps one, so it is not offered.
+        let mixed: Vec<RationalFps> = conform_rates(&[RationalFps::FPS_30, fps_120]).into_iter().map(|r| r.1).collect();
+        assert!(!mixed.contains(&RationalFps::FPS_24));
+        assert!(mixed.contains(&RationalFps::FPS_30));
     }
 }

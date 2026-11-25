@@ -1,7 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Root Master bin identifier used in SQLite persistence (`bins` and `bin_sources`).
+/// In-memory `Project` fields represent the Master bin as `None`.
+pub const MASTER_BIN_ID: Uuid = Uuid::nil();
+
+/// A folder in the Media Pool that groups media sources, timelines, and nested bins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bin {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    #[serde(default)]
+    pub sort_order: i32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind {
@@ -86,6 +101,87 @@ pub struct Keyframe {
     pub value: f32,
 }
 
+/// How stereo source channels map into the left and right output channels of a clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioChannelMap {
+    #[default]
+    Stereo,
+    MonoMix,
+    LeftToBoth,
+    RightToBoth,
+    SwapLeftRight,
+    Mute,
+}
+
+impl AudioChannelMap {
+    pub const ALL: [Self; 6] = [
+        Self::Stereo,
+        Self::MonoMix,
+        Self::LeftToBoth,
+        Self::RightToBoth,
+        Self::SwapLeftRight,
+        Self::Mute,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo (L / R)",
+            Self::MonoMix => "Mono Mix (L+R -> Both)",
+            Self::LeftToBoth => "Channel 1 (Left -> Both)",
+            Self::RightToBoth => "Channel 2 (Right -> Both)",
+            Self::SwapLeftRight => "Swap Left / Right",
+            Self::Mute => "Mute",
+        }
+    }
+
+    pub fn apply_stereo(self, l: f32, r: f32) -> (f32, f32) {
+        match self {
+            Self::Stereo => (l, r),
+            Self::MonoMix => {
+                let c = (l + r) * 0.5;
+                (c, c)
+            }
+            Self::LeftToBoth => (l, l),
+            Self::RightToBoth => (r, r),
+            Self::SwapLeftRight => (r, l),
+            Self::Mute => (0.0, 0.0),
+        }
+    }
+
+    pub fn ffmpeg_pan_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Stereo => None,
+            Self::MonoMix => Some("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1"),
+            Self::LeftToBoth => Some("pan=stereo|c0=c0|c1=c0"),
+            Self::RightToBoth => Some("pan=stereo|c0=c1|c1=c1"),
+            Self::SwapLeftRight => Some("pan=stereo|c0=c1|c1=c0"),
+            Self::Mute => Some("pan=stereo|c0=0*c0|c1=0*c1"),
+        }
+    }
+
+    pub fn to_db_str(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::MonoMix => "mono_mix",
+            Self::LeftToBoth => "left_to_both",
+            Self::RightToBoth => "right_to_both",
+            Self::SwapLeftRight => "swap_lr",
+            Self::Mute => "mute",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "mono_mix" => Self::MonoMix,
+            "left_to_both" => Self::LeftToBoth,
+            "right_to_both" => Self::RightToBoth,
+            "swap_lr" => Self::SwapLeftRight,
+            "mute" => Self::Mute,
+            _ => Self::Stereo,
+        }
+    }
+}
+
 /// Fields missing from saved data take their default value, so older and newer files load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -141,6 +237,9 @@ pub struct ClipProperties {
     /// Playback speed: 1.0 is normal, 0.5 half speed (slow motion), 2.0 double.
     /// Source time = timeline time × speed. Kept within 0.25–4.0 by the commands.
     pub speed: f64,
+    /// Embedded source audio channel routing applied before track mono downmix and pan.
+    #[serde(default)]
+    pub audio_channel_map: AudioChannelMap,
 }
 
 fn enabled_by_default() -> bool {
@@ -174,6 +273,7 @@ impl Default for ClipProperties {
             link: None,
             effects: Vec::new(),
             speed: 1.0,
+            audio_channel_map: AudioChannelMap::Stereo,
         }
     }
 }
@@ -835,6 +935,9 @@ pub struct Timeline {
     /// The frame rate when "Use Project Settings" was off; `None` uses the project's.
     #[serde(default)]
     pub fps: Option<RationalFps>,
+    /// Media Pool bin containing this timeline (`None` = Master).
+    #[serde(default)]
+    pub bin_id: Option<Uuid>,
 }
 
 /// Resolve's default Start Timecode, 01:00:00:00.
@@ -861,6 +964,7 @@ impl Timeline {
             start_tc_us: 0,
             resolution: None,
             fps: None,
+            bin_id: None,
         }
     }
 
@@ -1023,6 +1127,18 @@ pub struct MediaSource {
     pub thumbnail_data: Option<Vec<u8>>,
     pub imported_at: i64,
     pub import_order: u32,
+    /// Media Pool bin containing this source (`None` = Master).
+    #[serde(default)]
+    pub bin_id: Option<Uuid>,
+    /// Optional Clip Attributes display name (does not rename the file on disk).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Optional Clip Attributes video frame rate conform override.
+    #[serde(default)]
+    pub conform_fps: Option<RationalFps>,
+    /// Clip Attributes default audio channel mapping for clips placed from this source.
+    #[serde(default)]
+    pub audio_channel_map: AudioChannelMap,
 }
 
 impl MediaSource {
@@ -1051,6 +1167,39 @@ impl MediaSource {
             thumbnail_data: None,
             imported_at: 0,
             import_order: 0,
+            bin_id: None,
+            display_name: None,
+            conform_fps: None,
+            audio_channel_map: AudioChannelMap::Stereo,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        if let Some(custom) = self.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return custom.to_string();
+        }
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    pub fn effective_fps(&self) -> Option<RationalFps> {
+        self.conform_fps.or(self.video_fps)
+    }
+
+    pub fn conform_speed(&self) -> f64 {
+        match (self.video_fps, self.conform_fps) {
+            (Some(native), Some(target)) if native.to_f64() > 0.0 && target.to_f64() > 0.0 => {
+                (target.to_f64() / native.to_f64()).clamp(crate::MIN_SPEED, crate::MAX_SPEED)
+            }
+            _ => 1.0,
+        }
+    }
+
+    pub fn effective_duration_us(&self) -> i64 {
+        let speed = self.conform_speed();
+        if (speed - 1.0).abs() < 1e-9 {
+            self.duration_us
+        } else {
+            scale_us(self.duration_us, 1.0 / speed).max(1)
         }
     }
 }
@@ -1097,6 +1246,9 @@ pub struct Project {
     /// The project's other timelines, waiting to be opened.
     #[serde(default)]
     pub timelines: Vec<Timeline>,
+    /// Media Pool bins (excluding Master).
+    #[serde(default)]
+    pub bins: Vec<Bin>,
     pub sources: HashMap<Uuid, MediaSource>,
     pub ui_state: UiState,
 }
@@ -1203,6 +1355,163 @@ impl Project {
         (1..).map(|n| format!("Timeline {n}")).find(|c| !names.iter().any(|(_, n)| n.eq_ignore_ascii_case(c))).unwrap_or_default()
     }
 
+    fn normalize_bin_id(bin_id: Option<Uuid>) -> Option<Uuid> {
+        bin_id.filter(|id| *id != MASTER_BIN_ID)
+    }
+
+    /// "Bin N" with the first N no sibling bin under `parent_id` uses yet.
+    pub fn next_bin_name(&self, parent_id: Option<Uuid>) -> String {
+        let parent_id = Self::normalize_bin_id(parent_id);
+        (1..)
+            .map(|n| format!("Bin {n}"))
+            .find(|c| !self.bins.iter().any(|b| b.parent_id == parent_id && b.name.eq_ignore_ascii_case(c)))
+            .unwrap_or_default()
+    }
+
+    /// Creates a new Media Pool bin under `parent_id` (`None` = Master).
+    /// Returns `None` if `name` is blank, `parent_id` does not exist, or a sibling already uses `name`.
+    pub fn create_bin(&mut self, name: &str, parent_id: Option<Uuid>) -> Option<Uuid> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let parent_id = Self::normalize_bin_id(parent_id);
+        if let Some(pid) = parent_id {
+            if !self.bins.iter().any(|b| b.id == pid) {
+                return None;
+            }
+        }
+        if self.bins.iter().any(|b| b.parent_id == parent_id && b.name.eq_ignore_ascii_case(name)) {
+            return None;
+        }
+        let sort_order = self
+            .bins
+            .iter()
+            .filter(|b| b.parent_id == parent_id)
+            .map(|b| b.sort_order)
+            .max()
+            .map_or(0, |m| m + 1);
+        let id = Uuid::new_v4();
+        self.bins.push(Bin {
+            id,
+            name: name.to_string(),
+            parent_id,
+            sort_order,
+        });
+        Some(id)
+    }
+
+    /// Renames bin `id`. False for Master, unknown id, blank name, or sibling name conflict.
+    pub fn rename_bin(&mut self, id: Uuid, name: &str) -> bool {
+        if id == MASTER_BIN_ID {
+            return false;
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(parent_id) = self.bins.iter().find(|b| b.id == id).map(|b| Self::normalize_bin_id(b.parent_id)) else {
+            return false;
+        };
+        if self.bins.iter().any(|b| b.id != id && Self::normalize_bin_id(b.parent_id) == parent_id && b.name.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        let Some(bin) = self.bins.iter_mut().find(|b| b.id == id) else {
+            return false;
+        };
+        bin.name = name.to_string();
+        true
+    }
+
+    /// Deletes bin `id`, reparenting its child bins, sources, and timelines to its `parent_id`.
+    pub fn delete_bin(&mut self, id: Uuid) -> bool {
+        if id == MASTER_BIN_ID {
+            return false;
+        }
+        let Some(idx) = self.bins.iter().position(|b| b.id == id) else {
+            return false;
+        };
+        let parent_id = Self::normalize_bin_id(self.bins[idx].parent_id);
+        self.bins.remove(idx);
+        for bin in &mut self.bins {
+            if bin.parent_id == Some(id) {
+                bin.parent_id = parent_id;
+            }
+        }
+        for source in self.sources.values_mut() {
+            if source.bin_id == Some(id) {
+                source.bin_id = parent_id;
+            }
+        }
+        for timeline in std::iter::once(&mut self.timeline).chain(&mut self.timelines) {
+            if timeline.bin_id == Some(id) {
+                timeline.bin_id = parent_id;
+            }
+        }
+        true
+    }
+
+    /// Moves `source_id` into `bin_id` (`None` = Master).
+    pub fn move_source_to_bin(&mut self, source_id: Uuid, bin_id: Option<Uuid>) -> bool {
+        let bin_id = Self::normalize_bin_id(bin_id);
+        if let Some(bid) = bin_id {
+            if !self.bins.iter().any(|b| b.id == bid) {
+                return false;
+            }
+        }
+        let Some(source) = self.sources.get_mut(&source_id) else {
+            return false;
+        };
+        source.bin_id = bin_id;
+        true
+    }
+
+    /// Moves `timeline_id` into `bin_id` (`None` = Master).
+    pub fn move_timeline_to_bin(&mut self, timeline_id: Uuid, bin_id: Option<Uuid>) -> bool {
+        let bin_id = Self::normalize_bin_id(bin_id);
+        if let Some(bid) = bin_id {
+            if !self.bins.iter().any(|b| b.id == bid) {
+                return false;
+            }
+        }
+        let Some(timeline) = self.timeline_mut(timeline_id) else {
+            return false;
+        };
+        timeline.bin_id = bin_id;
+        true
+    }
+
+    /// Returns the breadcrumb path from Master to `bin_id`, guard-railed against cycles.
+    pub fn bin_ancestors(&self, bin_id: Option<Uuid>) -> Vec<(Option<Uuid>, String)> {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = Self::normalize_bin_id(bin_id);
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some(bin) = self.bins.iter().find(|b| b.id == id) else {
+                break;
+            };
+            chain.push((Some(bin.id), bin.name.clone()));
+            current = Self::normalize_bin_id(bin.parent_id);
+        }
+        chain.reverse();
+        let mut out = Vec::with_capacity(chain.len() + 1);
+        out.push((None, "Master".to_string()));
+        out.extend(chain);
+        out
+    }
+
+    /// True if `source_id` appears in at least one clip on the currently open timeline.
+    pub fn source_used_in_open_timeline(&self, source_id: Uuid) -> bool {
+        self.timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .any(|c| c.source_id == source_id)
+    }
+
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: RationalFps) -> Self {
         let now = 0; // will be populated with unix us timestamp
         Self {
@@ -1218,6 +1527,7 @@ impl Project {
             proxy_dir: PathBuf::from("/tmp/tempo_proxies"),
             timeline: Timeline::new_default(),
             timelines: Vec::new(),
+            bins: Vec::new(),
             sources: HashMap::new(),
             ui_state: UiState::default(),
         }
@@ -1269,7 +1579,7 @@ impl Project {
 /// The start or end of a clip, where its fade handles sit.
 /// `us × factor`, rounded. Exactly `us` at normal speed (and for a nonsense factor), so
 /// clips that are not retimed keep their exact times.
-fn scale_us(us: i64, factor: f64) -> i64 {
+pub fn scale_us(us: i64, factor: f64) -> i64 {
     if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
         us
     } else {
@@ -1945,5 +2255,112 @@ mod tests {
             assert_eq!(TransitionKind::from_effect_id(kind.effect_id().unwrap()), Some(kind));
         }
         assert_eq!(TransitionKind::from_effect_id("fade-in"), None);
+    }
+
+    #[test]
+    fn bin_crud_reparenting_ancestors_and_usage() {
+        let mut p = project();
+        assert_eq!(p.next_bin_name(None), "Bin 1");
+        assert_eq!(p.create_bin("   ", None), None);
+        let b1 = p.create_bin("Footage", None).unwrap();
+        assert_eq!(p.create_bin("footage", None), None);
+        assert_eq!(p.create_bin("InvalidParent", Some(Uuid::new_v4())), None);
+
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 1");
+        let b2 = p.create_bin("B-Roll", Some(b1)).unwrap();
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 1");
+        let _b3 = p.create_bin("Bin 1", Some(b1)).unwrap();
+        assert_eq!(p.next_bin_name(Some(b1)), "Bin 2");
+
+        // Rename validation
+        assert!(!p.rename_bin(MASTER_BIN_ID, "Root"));
+        assert!(!p.rename_bin(b2, "  "));
+        assert!(!p.rename_bin(b2, "bin 1"));
+        assert!(p.rename_bin(b2, "  Selects  "));
+
+        // Ancestors
+        assert_eq!(p.bin_ancestors(None), vec![(None, "Master".into())]);
+        assert_eq!(p.bin_ancestors(Some(MASTER_BIN_ID)), vec![(None, "Master".into())]);
+        assert_eq!(
+            p.bin_ancestors(Some(b2)),
+            vec![(None, "Master".into()), (Some(b1), "Footage".into()), (Some(b2), "Selects".into())]
+        );
+
+        // Cycle safety in bin_ancestors
+        let ca = Uuid::new_v4();
+        let cb = Uuid::new_v4();
+        p.bins.push(Bin { id: ca, name: "CA".into(), parent_id: Some(cb), sort_order: 0 });
+        p.bins.push(Bin { id: cb, name: "CB".into(), parent_id: Some(ca), sort_order: 0 });
+        assert_eq!(p.bin_ancestors(Some(cb)), vec![(None, "Master".into()), (Some(ca), "CA".into()), (Some(cb), "CB".into())]);
+
+        // Move sources & timelines
+        let s_used = MediaSource::new(PathBuf::from("used.mp4"), MediaType::Video, 2_000_000);
+        let s_unused = MediaSource::new(PathBuf::from("unused.mp4"), MediaType::Video, 2_000_000);
+        let (su_id, sn_id) = (s_used.id, s_unused.id);
+        p.sources.insert(su_id, s_used);
+        p.sources.insert(sn_id, s_unused);
+        let track = p.timeline.tracks[0].id;
+        p.timeline.tracks[0].clips.push(Clip::new(track, su_id, ClipType::Video, "u", 0, 1_000_000, 0, 1_000_000));
+        assert!(p.source_used_in_open_timeline(su_id));
+        assert!(!p.source_used_in_open_timeline(sn_id));
+
+        assert!(p.move_source_to_bin(su_id, Some(b2)));
+        assert!(!p.move_source_to_bin(su_id, Some(Uuid::new_v4())));
+        assert!(!p.move_source_to_bin(Uuid::new_v4(), Some(b2)));
+        assert_eq!(p.sources[&su_id].bin_id, Some(b2));
+
+        let t2 = Timeline::with_tracks("T2", 1, 1);
+        let t2_id = t2.id;
+        p.add_timeline(t2);
+        // After switching to T2, su_id is no longer in the open timeline
+        assert!(!p.source_used_in_open_timeline(su_id));
+        assert!(p.move_timeline_to_bin(t2_id, Some(b2)));
+        let dup_id = p.duplicate_timeline(t2_id).unwrap();
+        assert_eq!(p.timelines.iter().find(|t| t.id == dup_id).unwrap().bin_id, Some(b2));
+
+        // Deleting b2 reparents source and timelines to b1
+        assert!(!p.delete_bin(MASTER_BIN_ID));
+        assert!(p.delete_bin(b2));
+        assert_eq!(p.sources[&su_id].bin_id, Some(b1));
+        assert_eq!(p.timeline.bin_id, Some(b1));
+        assert_eq!(p.timelines.iter().find(|t| t.id == dup_id).unwrap().bin_id, Some(b1));
+
+        // Deleting b1 reparents everything to Master (None)
+        assert!(p.delete_bin(b1));
+        assert_eq!(p.sources[&su_id].bin_id, None);
+        assert_eq!(p.timeline.bin_id, None);
+    }
+
+    #[test]
+    fn clip_attributes_channel_map_and_conform_helpers_behave_as_expected() {
+        assert_eq!(AudioChannelMap::Stereo.ffmpeg_pan_filter(), None);
+        assert_eq!(
+            AudioChannelMap::LeftToBoth.ffmpeg_pan_filter(),
+            Some("pan=stereo|c0=c0|c1=c0")
+        );
+        assert_eq!(AudioChannelMap::LeftToBoth.apply_stereo(0.8, -0.4), (0.8, 0.8));
+        assert_eq!(AudioChannelMap::RightToBoth.apply_stereo(0.8, -0.4), (-0.4, -0.4));
+        assert_eq!(AudioChannelMap::SwapLeftRight.apply_stereo(0.8, -0.4), (-0.4, 0.8));
+        assert_eq!(AudioChannelMap::MonoMix.apply_stereo(0.8, -0.4), (0.2, 0.2));
+        assert_eq!(AudioChannelMap::Mute.apply_stereo(0.8, -0.4), (0.0, 0.0));
+        for map in AudioChannelMap::ALL {
+            assert_eq!(AudioChannelMap::from_db_str(map.to_db_str()), map);
+        }
+
+        let mut src = MediaSource::new(PathBuf::from("/tmp/footage.mp4"), MediaType::Video, 4_000_000);
+        assert_eq!(src.display_name(), "footage.mp4");
+        src.display_name = Some("  Interview A  ".into());
+        assert_eq!(src.display_name(), "Interview A");
+
+        src.video_fps = Some(RationalFps::FPS_60);
+        src.conform_fps = Some(RationalFps::FPS_24);
+        assert_eq!(src.effective_fps(), Some(RationalFps::FPS_24));
+        assert!((src.conform_speed() - 0.4).abs() < 1e-6);
+        assert_eq!(src.effective_duration_us(), 10_000_000);
+
+        src.video_fps = Some(RationalFps::FPS_30);
+        src.conform_fps = Some(RationalFps::FPS_60);
+        assert!((src.conform_speed() - 2.0).abs() < 1e-6);
+        assert_eq!(src.effective_duration_us(), 2_000_000);
     }
 }

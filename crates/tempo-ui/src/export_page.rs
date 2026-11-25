@@ -13,7 +13,10 @@ use gtk4::prelude::*;
 use gtk4::gio;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use tempo_export::{bitrate_for_size, chapters_from_markers, export_timeline, format_chapter_list, youtube_problems, Chapter, Fit, TimelineExport};
+use tempo_export::{
+    bitrate_for_size, chapters_from_markers, export_timeline, format_chapter_list, youtube_problems, AudioCodec, Chapter, ContainerFormat, Fit, TimelineExport,
+    VideoCodec,
+};
 use tempo_plugin::UploadInput;
 use tempo_timeline::Project;
 
@@ -31,15 +34,23 @@ struct Format {
     max_bytes: Option<u64>,
 }
 
-const FORMATS: [Format; 6] = [
-    Format { ratio: "16:9", width: 1920, height: 1080, best_for: "YouTube, Vimeo", max_bytes: None },
-    Format { ratio: "16:9 4K", width: 3840, height: 2160, best_for: "YouTube 4K", max_bytes: None },
+const CUSTOM_INDEX: usize = 6;
+
+const FORMATS: [Format; 7] = [
+    Format { ratio: "16:9", width: 1920, height: 1080, best_for: "YouTube 1080p, Vimeo", max_bytes: None },
+    Format { ratio: "16:9 4K", width: 3840, height: 2160, best_for: "YouTube 2160p", max_bytes: None },
     Format { ratio: "9:16", width: 1080, height: 1920, best_for: "TikTok, Reels, Shorts", max_bytes: None },
     Format { ratio: "1:1", width: 1080, height: 1080, best_for: "Instagram feed", max_bytes: None },
     Format { ratio: "4:5", width: 1080, height: 1350, best_for: "Instagram portrait", max_bytes: None },
     // Discord's limit for accounts without Nitro.
     Format { ratio: "≤ 10 MB", width: 1920, height: 1080, best_for: "Discord, email", max_bytes: Some(10_000_000) },
+    Format { ratio: "Custom", width: 1920, height: 1080, best_for: "Set your own", max_bytes: None },
 ];
+
+const CONTAINERS: [(&str, ContainerFormat); 3] = [("MP4", ContainerFormat::Mp4), ("MOV", ContainerFormat::Mov), ("MKV", ContainerFormat::Mkv)];
+const VIDEO_CODECS: [(&str, VideoCodec); 2] = [("H.264", VideoCodec::H264), ("H.265", VideoCodec::H265)];
+const AUDIO_CODECS: [(&str, AudioCodec); 3] = [("AAC", AudioCodec::Aac), ("FLAC", AudioCodec::Flac), ("PCM", AudioCodec::Pcm)];
+const NORMALIZE_MODES: [(&str, Option<f32>); 2] = [("Off", None), ("YouTube (-14 LUFS)", Some(-14.0))];
 
 /// Sound bitrate for size-limited exports: clear speech, more room for the picture.
 const SIZE_LIMITED_AUDIO_KBPS: u32 = 96;
@@ -111,19 +122,31 @@ pub struct ExportPage {
     file_name: gtk::Entry,
     location: gtk::Entry,
     free_space: gtk::Label,
+    format_dd: gtk::DropDown,
+    video_codec_dd: gtk::DropDown,
+    audio_codec_dd: gtk::DropDown,
     quality: gtk::DropDown,
+    normalize_dd: gtk::DropDown,
+    width_label: gtk::Label,
+    custom_width: gtk::SpinButton,
+    height_label: gtk::Label,
+    custom_height: gtk::SpinButton,
     fit: gtk::DropDown,
     fit_row: gtk::Box,
     chapters: gtk::CheckButton,
     upload: UploadForm,
     range: gtk::DropDown,
     format_index: Cell<usize>,
+    /// Prevents signal loops between preset cards and codec/container dropdowns.
+    syncing: Cell<bool>,
     /// The format toggles, in the order of `FORMATS`.
     format_buttons: RefCell<Vec<gtk::ToggleButton>>,
     /// When the current run was started, to ignore a double click on the button.
     started: Cell<Option<std::time::Instant>>,
     jobs: RefCell<Vec<Job>>,
     queue_box: gtk::Box,
+    selected_job: Cell<Option<usize>>,
+    render_only: Cell<Option<usize>>,
     render_all: gtk::Button,
     /// One line describing the running job, for the page bar.
     activity: RefCell<Option<Box<dyn Fn(Option<String>)>>>,
@@ -132,10 +155,24 @@ pub struct ExportPage {
 impl ExportPage {
     pub fn new(state: &Rc<AppState>) -> Rc<Self> {
         // ---- Left: render settings ------------------------------------------
-        let title = label("Render Settings", &["panel-title"]);
+        let title = label("Render Settings", &[]);
         title.set_xalign(0.0);
+        title.set_hexpand(true);
+        let export_help = crate::help::panel_guide_button(
+            "Render Settings & Queue",
+            "Deliver Page",
+            "Choose a preset (like YouTube 1080p) or pick Custom to change format, codecs, and -14 LUFS loudness normalization.",
+            &[
+                ("Ctrl+Return", "Add job to Render Queue"),
+                ("Click a Job Card", "Switch Render All -> Render 1"),
+                ("Ctrl+Shift+Return", "Start rendering"),
+            ],
+        );
+        let settings_header = gtk::Box::builder().css_classes(["panel-title"]).build();
+        settings_header.append(&title);
+        settings_header.append(&export_help);
 
-        let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).margin_top(8).margin_bottom(4).margin_start(8).margin_end(8).build();
+        let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).margin_top(4).margin_bottom(2).margin_start(8).margin_end(8).build();
         let strip_scroll = gtk::ScrolledWindow::builder().child(&strip).vscrollbar_policy(gtk::PolicyType::Never).build();
 
         let file_name = gtk::Entry::builder().hexpand(true).build();
@@ -143,17 +180,32 @@ impl ExportPage {
         let browse = pill("Browse");
         let free_space = label("", &["tempo-small", "tempo-dim"]);
         free_space.set_xalign(0.0);
+        let format_dd = gtk::DropDown::from_strings(&CONTAINERS.map(|c| c.0));
+        let video_codec_dd = gtk::DropDown::from_strings(&VIDEO_CODECS.map(|c| c.0));
+        let audio_codec_dd = gtk::DropDown::from_strings(&AUDIO_CODECS.map(|c| c.0));
         let quality = gtk::DropDown::from_strings(&QUALITIES.map(|q| q.0));
+        let normalize_dd = gtk::DropDown::from_strings(&NORMALIZE_MODES.map(|n| n.0));
+        let custom_width = gtk::SpinButton::with_range(16.0, 7680.0, 2.0);
+        custom_width.set_digits(0);
+        custom_width.set_value(1920.0);
+        custom_width.set_increments(2.0, 16.0);
+        custom_width.set_visible(false);
+        let custom_height = gtk::SpinButton::with_range(16.0, 7680.0, 2.0);
+        custom_height.set_digits(0);
+        custom_height.set_value(1080.0);
+        custom_height.set_increments(2.0, 16.0);
+        custom_height.set_visible(false);
         let fit = gtk::DropDown::from_strings(&["Fit (black bars)", "Fill (crop)"]);
         let chapters = gtk::CheckButton::with_label("Chapters from markers");
         chapters.set_active(true);
 
-        let grid = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(10).margin_start(12).margin_end(12).build();
-        let row = |r: i32, name: &str, w: &gtk::Widget| {
+        let grid = gtk::Grid::builder().row_spacing(5).column_spacing(10).margin_top(6).margin_start(12).margin_end(12).build();
+        let row = |r: i32, name: &str, w: &gtk::Widget| -> gtk::Label {
             let l = label(name, &["tempo-dim"]);
             l.set_xalign(1.0);
             grid.attach(&l, 0, r, 1, 1);
             grid.attach(w, 1, r, 1, 1);
+            l
         };
         row(0, "File Name", file_name.upcast_ref());
         let loc_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -161,29 +213,37 @@ impl ExportPage {
         loc_box.append(&browse);
         row(1, "Location", loc_box.upcast_ref());
         grid.attach(&free_space, 1, 2, 1, 1);
-        row(3, "Quality", quality.upcast_ref());
+        row(3, "Format", format_dd.upcast_ref());
+        row(4, "Video Codec", video_codec_dd.upcast_ref());
+        row(5, "Audio Codec", audio_codec_dd.upcast_ref());
+        row(6, "Quality", quality.upcast_ref());
+        row(7, "Normalize", normalize_dd.upcast_ref());
+        let width_label = row(8, "Width", custom_width.upcast_ref());
+        width_label.set_visible(false);
+        let height_label = row(9, "Height", custom_height.upcast_ref());
+        height_label.set_visible(false);
         // The Fit / Fill choice only matters when the shapes differ.
         let fit_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let fit_label = label("Shape", &["tempo-dim"]);
         fit_label.set_xalign(1.0);
         fit_row.append(&fit_label);
         fit_row.append(&fit);
-        grid.attach(&fit_row, 0, 4, 2, 1);
-        grid.attach(&chapters, 1, 5, 1, 1);
+        grid.attach(&fit_row, 0, 10, 2, 1);
+        grid.attach(&chapters, 1, 11, 1, 1);
 
         let add = pill("Add to Render Queue");
         add.set_tooltip_text(Some("Add to Render Queue (Ctrl+Return)"));
         add.set_halign(gtk::Align::End);
-        add.set_margin_top(16);
+        add.set_margin_top(10);
         add.set_margin_end(12);
-        add.set_margin_bottom(12);
+        add.set_margin_bottom(8);
 
         let upload = UploadForm::new();
         let settings = gtk::Box::new(gtk::Orientation::Vertical, 0);
         settings.append(&grid);
         settings.append(&upload.section);
         let left = gtk::Box::builder().orientation(gtk::Orientation::Vertical).width_request(360).css_classes(["tempo-surface", "tempo-sep-right"]).build();
-        left.append(&title);
+        left.append(&settings_header);
         left.append(&strip_scroll);
         left.append(&gtk::ScrolledWindow::builder().child(&settings).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
         left.append(&add);
@@ -202,6 +262,7 @@ impl ExportPage {
         let queue_title = label("Render Queue", &["panel-title"]);
         queue_title.set_xalign(0.0);
         let queue_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(8).margin_start(8).margin_end(8).build();
+        let queue_scroll = gtk::ScrolledWindow::builder().child(&queue_box).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build();
         let render_all = pill("Render All");
         render_all.set_tooltip_text(Some("Render All (Ctrl+Shift+Return)"));
         render_all.set_halign(gtk::Align::End);
@@ -210,7 +271,7 @@ impl ExportPage {
         render_all.set_margin_bottom(12);
         let right = gtk::Box::builder().orientation(gtk::Orientation::Vertical).width_request(360).css_classes(["tempo-surface", "tempo-sep-left"]).build();
         right.append(&queue_title);
-        right.append(&gtk::ScrolledWindow::builder().child(&queue_box).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
+        right.append(&queue_scroll);
         right.append(&render_all);
 
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -226,17 +287,28 @@ impl ExportPage {
             file_name,
             location,
             free_space,
+            format_dd,
+            video_codec_dd,
+            audio_codec_dd,
             quality,
+            normalize_dd,
+            width_label,
+            custom_width,
+            height_label,
+            custom_height,
             fit,
             fit_row,
             chapters,
             upload,
             range,
             format_index: Cell::new(0),
+            syncing: Cell::new(false),
             format_buttons: RefCell::new(Vec::new()),
             started: Cell::new(None),
             jobs: RefCell::new(Vec::new()),
             queue_box,
+            selected_job: Cell::new(None),
+            render_only: Cell::new(None),
             render_all,
             activity: RefCell::new(None),
         });
@@ -259,12 +331,49 @@ impl ExportPage {
                     if f.height > f.width && p.state.with_project(|pr| { let (w, h) = pr.output_size(); w > h }).unwrap_or(false) {
                         p.fit.set_selected(1);
                     }
+                    if i < CUSTOM_INDEX && !p.syncing.get() {
+                        p.syncing.set(true);
+                        p.format_dd.set_selected(0);
+                        p.video_codec_dd.set_selected(0);
+                        p.audio_codec_dd.set_selected(0);
+                        p.normalize_dd.set_selected(0);
+                        p.custom_width.set_value(f.width as f64);
+                        p.custom_height.set_value(f.height as f64);
+                        p.syncing.set(false);
+                    }
                     p.refresh_settings();
                 }
             });
             strip.append(&button);
             page.format_buttons.borrow_mut().push(button);
         }
+
+        for dd in [&page.format_dd, &page.video_codec_dd, &page.audio_codec_dd] {
+            let p = page.clone();
+            dd.connect_selected_notify(move |_| p.switch_to_custom());
+        }
+        for spin in [&page.custom_width, &page.custom_height] {
+            let p = page.clone();
+            spin.connect_value_changed(move |_| {
+                if !p.syncing.get() && p.format_index.get() == CUSTOM_INDEX {
+                    p.refresh_settings();
+                }
+            });
+        }
+
+        let empty_click = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_PRIMARY).build();
+        let p = page.clone();
+        empty_click.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = gesture.widget() else { return };
+            if inside_job_card(widget.pick(x, y, gtk::PickFlags::DEFAULT)) {
+                return;
+            }
+            if p.selected_job.get().is_some() {
+                p.selected_job.set(None);
+                p.refresh_selection_ui();
+            }
+        });
+        queue_scroll.add_controller(empty_click);
 
         let p = page.clone();
         add.connect_clicked(move |_| {
@@ -383,7 +492,7 @@ impl ExportPage {
         // vertical, a 4K one in 4K. Shapes are compared by cross-multiplying.
         if let Some((w, h)) = self.state.with_project(|p| { let (w, h) = p.output_size(); (w as u64, h as u64) }) {
             let same_shape = |f: &Format| f.width as u64 * h == f.height as u64 * w;
-            let best = FORMATS
+            let best = FORMATS[..CUSTOM_INDEX]
                 .iter()
                 .enumerate()
                 .filter(|(_, f)| same_shape(f))
@@ -394,6 +503,45 @@ impl ExportPage {
             }
         }
         self.update_free_space();
+        self.refresh_settings();
+    }
+
+    fn selected_container(&self) -> ContainerFormat {
+        CONTAINERS.get(self.format_dd.selected() as usize).map(|c| c.1).unwrap_or_default()
+    }
+
+    fn selected_video_codec(&self) -> VideoCodec {
+        VIDEO_CODECS.get(self.video_codec_dd.selected() as usize).map(|c| c.1).unwrap_or_default()
+    }
+
+    fn selected_audio_codec(&self) -> AudioCodec {
+        AUDIO_CODECS.get(self.audio_codec_dd.selected() as usize).map(|c| c.1).unwrap_or_default()
+    }
+
+    fn selected_normalize_lufs(&self) -> Option<f32> {
+        NORMALIZE_MODES.get(self.normalize_dd.selected() as usize).and_then(|n| n.1)
+    }
+
+    fn current_output_size(&self) -> (u32, u32) {
+        if self.format_index.get() == CUSTOM_INDEX {
+            let w = ((self.custom_width.value_as_int().clamp(16, 7680) as u32) + 1) & !1;
+            let h = ((self.custom_height.value_as_int().clamp(16, 7680) as u32) + 1) & !1;
+            (w.min(7680), h.min(7680))
+        } else {
+            let f = &FORMATS[self.format_index.get().min(CUSTOM_INDEX)];
+            (f.width, f.height)
+        }
+    }
+
+    fn switch_to_custom(&self) {
+        if self.syncing.get() {
+            return;
+        }
+        self.syncing.set(true);
+        if let Some(btn) = self.format_buttons.borrow().get(CUSTOM_INDEX) {
+            btn.set_active(true);
+        }
+        self.syncing.set(false);
         self.refresh_settings();
     }
 
@@ -417,12 +565,19 @@ impl ExportPage {
     }
 
     fn refresh_settings(&self) {
-        let f = &FORMATS[self.format_index.get()];
-        self.title.set_text(&format!("Render Settings - {} - {} × {}", f.ratio, f.width, f.height));
+        let idx = self.format_index.get().min(CUSTOM_INDEX);
+        let f = &FORMATS[idx];
+        let (w, h) = self.current_output_size();
+        self.title.set_text(&format!("Render Settings - {} - {} × {}", f.ratio, w, h));
+        let is_custom = idx == CUSTOM_INDEX;
+        self.width_label.set_visible(is_custom);
+        self.custom_width.set_visible(is_custom);
+        self.height_label.set_visible(is_custom);
+        self.custom_height.set_visible(is_custom);
         // Compare shapes by cross-multiplying; no rounding trouble.
         let same_shape = self
             .state
-            .with_project(|p| { let (w, h) = p.output_size(); w as u64 * f.height as u64 == h as u64 * f.width as u64 })
+            .with_project(|p| { let (pw, ph) = p.output_size(); pw as u64 * h as u64 == ph as u64 * w as u64 })
             .unwrap_or(true);
         self.fit_row.set_visible(!same_shape);
     }
@@ -461,9 +616,24 @@ impl ExportPage {
         let (r0, r1) = range.unwrap_or((0, timeline_end));
         let name = self.file_name.text().trim().to_string();
         let name = if name.is_empty() { default_file_name(&project) } else { name };
-        let f = &FORMATS[self.format_index.get()];
-        let (_, crf, mut audio_kbps) = QUALITIES[self.quality.selected() as usize];
-        let (mut width, mut height, mut max_video_kbps) = (f.width, f.height, None);
+        let idx = self.format_index.get().min(CUSTOM_INDEX);
+        let f = &FORMATS[idx];
+        let container = self.selected_container();
+        let video_codec = self.selected_video_codec();
+        let audio_codec = self.selected_audio_codec();
+        let normalize_lufs = self.selected_normalize_lufs();
+        if container == ContainerFormat::Mp4 && audio_codec == AudioCodec::Pcm {
+            self.state.message("PCM audio is not supported in MP4; select MOV or MKV.");
+            return false;
+        }
+        if container == ContainerFormat::Mov && audio_codec == AudioCodec::Flac {
+            self.state.message("FLAC audio is not supported in MOV; select MP4 or MKV.");
+            return false;
+        }
+
+        let (_, crf, mut audio_kbps) = QUALITIES.get(self.quality.selected() as usize).copied().unwrap_or(QUALITIES[1]);
+        let (mut width, mut height) = self.current_output_size();
+        let mut max_video_kbps = None;
         if let Some(max) = f.max_bytes {
             let Some(kbps) = bitrate_for_size(max, r1 - r0, SIZE_LIMITED_AUDIO_KBPS) else {
                 self.state.message("This is too long to fit in 10 MB and still look good. Set In and Out around a shorter part.");
@@ -480,10 +650,11 @@ impl ExportPage {
         // Do not silently replace an existing file or an output already queued.
         let dir = PathBuf::from(self.location.text().as_str());
         let taken = |p: &PathBuf| p.exists() || self.jobs.borrow().iter().any(|j| &j.settings.output == p);
-        let mut output = dir.join(format!("{name}.mp4"));
+        let ext = container.extension();
+        let mut output = dir.join(format!("{name}.{ext}"));
         let mut n = 2;
         while taken(&output) {
-            output = dir.join(format!("{name} {n}.mp4"));
+            output = dir.join(format!("{name} {n}.{ext}"));
             n += 1;
         }
 
@@ -500,6 +671,11 @@ impl ExportPage {
             // A size limit needs the processor's encoder, which keeps to a bitrate exactly.
             hardware: self.state.settings.borrow().hardware_encode && max_video_kbps.is_none(),
             max_video_kbps,
+            container,
+            video_codec,
+            audio_codec,
+            fps: None,
+            normalize_lufs,
         };
         let upload = match self.upload_plan(&settings.output, &settings.chapters) {
             Ok(plan) => plan,
@@ -508,13 +684,18 @@ impl ExportPage {
                 return false;
             }
         };
+        let format = if normalize_lufs.is_some() {
+            format!("{} · {} × {} · {} · -14 LUFS", f.ratio, width, height, ext.to_uppercase())
+        } else {
+            format!("{} · {} × {} · {}", f.ratio, width, height, ext.to_uppercase())
+        };
         // Like Resolve: the next job starts without the last cover image.
         self.upload.thumbnail.set_text("");
         self.jobs.borrow_mut().push(Job {
             upload,
             label: job_label(&project),
             name,
-            format: format!("{} · {} × {}", f.ratio, width, height),
+            format,
             settings,
             // A copy of the project as it is now: later edits do not change this job.
             project: Arc::new(project),
@@ -524,6 +705,8 @@ impl ExportPage {
             cancel: Arc::new(AtomicBool::new(false)),
         });
         self.rebuild_queue();
+        crate::help::tick_step(&self.state.checklist_queued, "queued");
+        self.state.emit(Change::Options);
         true
     }
 
@@ -535,6 +718,16 @@ impl ExportPage {
         self.is_rendering()
     }
 
+    fn begin_render(self: &Rc<Self>) {
+        let only = self
+            .selected_job
+            .get()
+            .filter(|&i| self.jobs.borrow().get(i).is_some_and(|j| j.status == Status::Waiting));
+        self.render_only.set(only);
+        self.started.set(Some(std::time::Instant::now()));
+        self.start_next();
+    }
+
     fn render_all_clicked(self: &Rc<Self>) {
         if self.is_rendering() {
             // The button reads "Stop" while a job runs. The second click of a
@@ -544,13 +737,13 @@ impl ExportPage {
             }
             self.cancel_all();
         } else {
-            self.started.set(Some(std::time::Instant::now()));
-            self.start_next();
+            self.begin_render();
         }
     }
 
     /// Stop the running job and drop the ones waiting.
     pub fn cancel_all(self: &Rc<Self>) {
+        self.render_only.set(None);
         for job in self.jobs.borrow().iter().filter(|j| j.status == Status::Rendering) {
             job.cancel.store(true, Ordering::Relaxed);
         }
@@ -562,8 +755,7 @@ impl ExportPage {
 
     pub fn render_all(self: &Rc<Self>) {
         if !self.is_rendering() {
-            self.started.set(Some(std::time::Instant::now()));
-            self.start_next();
+            self.begin_render();
         }
     }
 
@@ -571,13 +763,20 @@ impl ExportPage {
     fn start_next(self: &Rc<Self>) {
         let next = {
             let mut jobs = self.jobs.borrow_mut();
-            jobs.iter_mut().enumerate().find(|(_, j)| j.status == Status::Waiting).map(|(i, job)| {
-                job.status = Status::Rendering;
-                job.cancel.store(false, Ordering::Relaxed);
-                (i, job.project.clone(), job.settings.clone(), job.progress.clone(), job.cancel.clone())
+            let idx = match self.render_only.get() {
+                Some(i) => jobs.get(i).is_some_and(|j| j.status == Status::Waiting).then_some(i),
+                None => jobs.iter().position(|j| j.status == Status::Waiting),
+            };
+            idx.and_then(|i| {
+                jobs.get_mut(i).map(|job| {
+                    job.status = Status::Rendering;
+                    job.cancel.store(false, Ordering::Relaxed);
+                    (i, job.project.clone(), job.settings.clone(), job.progress.clone(), job.cancel.clone())
+                })
             })
         };
         let Some((index, project, settings, progress, cancel)) = next else {
+            self.render_only.set(None);
             self.rebuild_queue();
             self.report_activity();
             return;
@@ -696,11 +895,55 @@ impl ExportPage {
         }
     }
 
+    fn refresh_render_button(&self) {
+        let jobs = self.jobs.borrow();
+        let rendering = jobs.iter().any(|j| j.status == Status::Rendering);
+        let waiting = jobs.iter().any(|j| j.status == Status::Waiting);
+        let selected_waiting = !rendering && self.selected_job.get().is_some_and(|i| jobs.get(i).is_some_and(|j| j.status == Status::Waiting));
+        let label = if rendering {
+            "Stop"
+        } else if selected_waiting {
+            "Render 1"
+        } else {
+            "Render All"
+        };
+        self.render_all.set_label(label);
+        self.render_all.set_tooltip_text(Some(if rendering {
+            "Stop rendering"
+        } else if selected_waiting {
+            "Render selected job (Ctrl+Shift+Return)"
+        } else {
+            "Render All (Ctrl+Shift+Return)"
+        }));
+        self.render_all.set_sensitive(rendering || waiting);
+    }
+
+    fn refresh_selection_ui(&self) {
+        let selected = self.selected_job.get();
+        let mut child = self.queue_box.first_child();
+        let mut idx = 0usize;
+        while let Some(c) = child {
+            if c.has_css_class("job-card") {
+                if selected == Some(idx) {
+                    c.add_css_class("selected");
+                } else {
+                    c.remove_css_class("selected");
+                }
+                idx += 1;
+            }
+            child = c.next_sibling();
+        }
+        self.refresh_render_button();
+    }
+
     fn rebuild_queue(self: &Rc<Self>) {
         while let Some(child) = self.queue_box.first_child() {
             self.queue_box.remove(&child);
         }
         let jobs = self.jobs.borrow();
+        if self.selected_job.get().is_some_and(|i| i >= jobs.len()) {
+            self.selected_job.set(None);
+        }
         if jobs.is_empty() {
             let hint = label("No jobs yet.\nPick a shape, then Add to Render Queue.", &["empty-hint"]);
             hint.set_justify(gtk::Justification::Center);
@@ -710,14 +953,29 @@ impl ExportPage {
         for (index, job) in jobs.iter().enumerate() {
             self.queue_box.append(&self.job_card(index, job));
         }
-        let rendering = jobs.iter().any(|j| j.status == Status::Rendering);
-        let waiting = jobs.iter().any(|j| j.status == Status::Waiting);
-        self.render_all.set_label(if rendering { "Stop" } else { "Render All" });
-        self.render_all.set_sensitive(rendering || waiting);
+        drop(jobs);
+        self.refresh_render_button();
     }
 
     fn job_card(self: &Rc<Self>, index: usize, job: &Job) -> gtk::Box {
         let card = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["job-card"]).build();
+        if self.selected_job.get() == Some(index) {
+            card.add_css_class("selected");
+        }
+        let click = gtk::GestureClick::builder().button(gtk::gdk::BUTTON_PRIMARY).build();
+        let page = self.clone();
+        click.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = gesture.widget() else { return };
+            if widget.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|hit| {
+                hit.ancestor(gtk::Button::static_type()).is_some() || hit.ancestor(gtk::MenuButton::static_type()).is_some()
+            }) {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            page.selected_job.set(Some(index));
+            page.refresh_selection_ui();
+        });
+        card.add_controller(click);
 
         let header = gtk::Box::builder().css_classes(["job-header"]).build();
         let job_title = label(&format!("Job {}", index + 1), &[]);
@@ -735,6 +993,13 @@ impl ExportPage {
             } else if !page.is_rendering() {
                 // Indexes are stable while a job runs, so only remove when idle.
                 page.jobs.borrow_mut().remove(index);
+                if let Some(sel) = page.selected_job.get() {
+                    if sel == index {
+                        page.selected_job.set(None);
+                    } else if sel > index {
+                        page.selected_job.set(Some(sel - 1));
+                    }
+                }
                 page.rebuild_queue();
             } else {
                 page.state.message("Wait for the running job to finish, or stop it first.");
@@ -941,7 +1206,7 @@ impl UploadForm {
         let pick = gtk::DropDown::builder().model(&pick_model).visible(false).margin_start(12).margin_end(12).build();
         let title = gtk::Entry::builder().hexpand(true).build();
         let text = gtk::TextView::builder().wrap_mode(gtk::WrapMode::WordChar).top_margin(6).bottom_margin(6).left_margin(8).right_margin(8).build();
-        let description = gtk::ScrolledWindow::builder().child(&text).min_content_height(90).css_classes(["card"]).build();
+        let description = gtk::ScrolledWindow::builder().child(&text).min_content_height(48).css_classes(["card"]).build();
         let thumbnail_on = gtk::CheckButton::with_label("Upload Thumbnail");
         let thumbnail = gtk::Entry::builder().hexpand(true).placeholder_text("Thumbnail path").sensitive(false).build();
         let pick_file = gtk::Button::with_label("…");
@@ -953,7 +1218,7 @@ impl UploadForm {
         let thumb_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         thumb_row.append(&thumbnail);
         thumb_row.append(&pick_file);
-        let fields = gtk::Grid::builder().row_spacing(8).column_spacing(10).margin_top(8).margin_start(12).margin_end(12).visible(false).build();
+        let fields = gtk::Grid::builder().row_spacing(5).column_spacing(10).margin_top(6).margin_start(12).margin_end(12).visible(false).build();
         let row = |r: i32, name: &str, w: &gtk::Widget| {
             let l = label(name, &["tempo-dim"]);
             l.set_xalign(1.0);
@@ -968,7 +1233,7 @@ impl UploadForm {
         row(4, "Privacy", privacy.upcast_ref());
         row(5, "Category", category.upcast_ref());
 
-        let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(14).margin_bottom(8).visible(false).build();
+        let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(8).margin_bottom(6).visible(false).build();
         let head = gtk::Box::builder().margin_start(12).margin_end(12).build();
         head.append(&enabled);
         section.append(&head);
@@ -1041,6 +1306,16 @@ fn job_label(p: &Project) -> String {
 fn default_file_name(p: &Project) -> String {
     let name = if p.timelines.is_empty() { p.name.clone() } else { format!("{} {}", p.name, p.timeline.name) };
     name.replace(['/', '\\'], "-")
+}
+
+fn inside_job_card(mut widget: Option<gtk::Widget>) -> bool {
+    while let Some(cur) = widget {
+        if cur.has_css_class("job-card") {
+            return true;
+        }
+        widget = cur.parent();
+    }
+    false
 }
 
 fn find_named_label(root: &gtk::Widget, name: &str) -> Option<gtk::Label> {

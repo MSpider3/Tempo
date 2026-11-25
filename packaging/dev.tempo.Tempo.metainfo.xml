@@ -32,6 +32,11 @@
   </requires>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-11-25" type="development">
+      <description>
+        <p>Alpha. Project Manager folders, Save Project As and Project Settings, Media Pool bins and hover scrubbing, multi-clip editing in the Inspector, more Export formats and codecs, Clip Attributes, more Resolve shortcuts, a startup splash and beginner help.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-11-20" type="development">
       <description>
         <p>Alpha. Resolve-style transitions (Additive, Blur, Cross, Dip To Color and Non-Additive Dissolve) with the full Inspector, transition copy and paste, timelines in the Media Pool, a Resolve-style Create New Timeline dialog, marker colours, zoom presets and upload fields on the Export page.</p>

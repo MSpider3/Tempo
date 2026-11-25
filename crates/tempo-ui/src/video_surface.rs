@@ -178,6 +178,8 @@ mod imp {
         pub(super) layers: RefCell<Vec<Drawn>>,
         /// Project frame size; the picture is letterboxed to this shape.
         pub frame: Cell<(u32, u32)>,
+        /// Optional fixed zoom factor (`None` = Fit, `Some(1.0)` = 100% actual size).
+        pub zoom: Cell<Option<f64>>,
     }
 
     #[glib::object_subclass]
@@ -194,20 +196,36 @@ mod imp {
             let widget = self.obj();
             let (w, h) = (widget.width() as f32, widget.height() as f32);
             let (pw, ph) = self.frame.get();
-            if w <= 0.0 || h <= 0.0 || pw == 0 || ph == 0 {
+            let Some((x0, y0, fw, fh, scale)) = super::compute_frame_rect(w, h, pw, ph, self.zoom.get()) else {
                 return;
-            }
-            let scale = (w / pw as f32).min(h / ph as f32);
-            let (fw, fh) = (pw as f32 * scale, ph as f32 * scale);
-            let (x0, y0) = ((w - fw) / 2.0, (h - fh) / 2.0);
+            };
             let frame_rect = graphene::Rect::new(x0, y0, fw, fh);
+            let widget_rect = graphene::Rect::new(0.0, 0.0, w, h);
+            let Some(clip_rect) = frame_rect.intersection(&widget_rect) else {
+                return;
+            };
 
             let frame = Frame { widget: &widget, x0, y0, fw, fh, scale, rect: frame_rect };
-            snapshot.push_clip(&frame_rect);
+            snapshot.push_clip(&clip_rect);
             draw_stack(snapshot, &self.layers.borrow(), &frame);
             snapshot.pop();
         }
     }
+}
+
+/// Placed frame `(x0, y0, fw, fh, scale)` centered in `(w, h)` for `zoom` (`None` = Fit).
+fn compute_frame_rect(w: f32, h: f32, pw: u32, ph: u32, zoom: Option<f64>) -> Option<(f32, f32, f32, f32, f32)> {
+    if w <= 0.0 || h <= 0.0 || pw == 0 || ph == 0 {
+        return None;
+    }
+    let fit = (w / pw as f32).min(h / ph as f32);
+    let scale = match zoom {
+        Some(z) if z > 0.0 && z.is_finite() => z as f32,
+        _ => fit,
+    };
+    let (fw, fh) = (pw as f32 * scale, ph as f32 * scale);
+    let (x0, y0) = ((w - fw) / 2.0, (h - fh) / 2.0);
+    Some((x0, y0, fw, fh, scale))
 }
 
 /// Draw a title with its centre at the origin (or in the lower third).
@@ -257,6 +275,7 @@ impl VideoSurface {
         let obj: Self = glib::Object::builder().build();
         obj.set_hexpand(true);
         obj.set_vexpand(true);
+        obj.set_focusable(true);
         obj.imp().frame.set((1920, 1080));
         obj.update_property(&[gtk::accessible::Property::Label("Viewer")]);
         obj
@@ -265,6 +284,12 @@ impl VideoSurface {
     pub fn set_frame_size(&self, width: u32, height: u32) {
         self.imp().frame.set((width.max(1), height.max(1)));
         self.queue_draw();
+    }
+
+    pub fn set_zoom(&self, zoom: Option<f64>) {
+        if self.imp().zoom.replace(zoom) != zoom {
+            self.queue_draw();
+        }
     }
 
     pub fn set_layers(&self, layers: Vec<Layer>) {
@@ -297,6 +322,21 @@ impl AsRef<[u8]> for SharedPixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rect_centers_fit_and_fixed_zooms() {
+        let (x0, y0, fw, fh, scale) = compute_frame_rect(1000.0, 500.0, 1920, 1080, None).unwrap();
+        assert!((scale - 500.0 / 1080.0).abs() < 1e-5);
+        assert!((y0 - 0.0).abs() < 1e-4 && (x0 + fw / 2.0 - 500.0).abs() < 1e-3 && (fh - 500.0).abs() < 1e-3);
+
+        let (x0, y0, fw, fh, scale) = compute_frame_rect(1000.0, 500.0, 1920, 1080, Some(1.0)).unwrap();
+        assert_eq!((fw, fh, scale), (1920.0, 1080.0, 1.0));
+        assert_eq!((x0, y0), (-460.0, -290.0));
+
+        let (x0, y0, fw, fh, scale) = compute_frame_rect(1000.0, 500.0, 1920, 1080, Some(0.25)).unwrap();
+        assert_eq!((fw, fh, scale), (480.0, 270.0, 0.25));
+        assert_eq!((x0, y0), (260.0, 115.0));
+    }
 
     #[test]
     fn additive_screens_and_non_additive_lightens_as_in_the_export() {

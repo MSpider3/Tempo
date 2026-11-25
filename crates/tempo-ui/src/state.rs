@@ -72,6 +72,8 @@ impl EditSelection {
 
 pub struct AppState {
     pub project: RefCell<Option<Project>>,
+    /// Bumped by each open or close; Save As and Project Settings keep it (they may change the id).
+    pub project_generation: Cell<u64>,
     pub path: RefCell<Option<PathBuf>>,
     log: RefCell<CommandLog>,
     /// The undo history of each timeline that is not open, so each keeps its own.
@@ -115,6 +117,17 @@ pub struct AppState {
     pub settings: RefCell<crate::settings::Settings>,
     /// True while the source clip has its own viewer beside the timeline viewer.
     pub dual_viewer: Cell<bool>,
+    /// The dual Source Viewer's own player, once that viewer has been built.
+    pub source_player: RefCell<Option<Player>>,
+    /// When on, playback loops over In..Out (if both set) or the whole timeline/source.
+    pub loop_playback: Cell<bool>,
+    /// When on, scrubbing or stepping plays a short snippet of audio at the playhead.
+    pub scrub_audio: Cell<bool>,
+    /// Viewer picture zoom: `None` fits the frame to the viewer, `Some(s)` scales by `s` (1.0 = 100%).
+    pub viewer_zoom: Cell<Option<f64>>,
+    /// The user's First-Edit Checklist steps 3 & 5, kept in marker files (`help::tick_step`).
+    pub checklist_split: Cell<bool>,
+    pub checklist_queued: Cell<bool>,
     /// Filters offered by the enabled plugins, kept current by `Plugins`.
     pub filters: RefCell<Vec<tempo_timeline::ClipEffect>>,
     /// Upload targets offered by the enabled plugins, kept current by `Plugins`.
@@ -133,6 +146,7 @@ impl AppState {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             project: RefCell::new(None),
+            project_generation: Cell::new(0),
             path: RefCell::new(None),
             log: RefCell::new(CommandLog::new()),
             parked_logs: RefCell::new(Default::default()),
@@ -158,6 +172,12 @@ impl AppState {
             transition_clipboard: RefCell::new(None),
             settings: RefCell::new(Default::default()),
             dual_viewer: Cell::new(false),
+            source_player: RefCell::new(None),
+            loop_playback: Cell::new(false),
+            scrub_audio: Cell::new(false),
+            viewer_zoom: Cell::new(None),
+            checklist_split: Cell::new(false),
+            checklist_queued: Cell::new(false),
             filters: RefCell::new(Vec::new()),
             uploaders: RefCell::new(Vec::new()),
             open_source: RefCell::new(None),
@@ -173,11 +193,37 @@ impl AppState {
     }
 
     pub fn emit(&self, change: Change) {
+        if matches!(change, Change::Options) {
+            self.sync_loop_range();
+        }
         // Clone the list first: a listener may register another listener.
         let listeners: Vec<_> = self.listeners.borrow().clone();
         for l in listeners {
             l(&change);
         }
+    }
+
+    pub fn set_loop_playback(&self, on: bool) {
+        if self.loop_playback.replace(on) != on {
+            self.player.set_looping(on);
+            self.sync_loop_range();
+            self.emit(Change::Options);
+        }
+    }
+
+    pub fn set_viewer_zoom(&self, zoom: Option<f64>) {
+        if self.viewer_zoom.replace(zoom) != zoom {
+            self.emit(Change::Options);
+        }
+    }
+
+    pub fn sync_loop_range(&self) {
+        let (in_us, out_us) = if self.source_mode() {
+            (self.src_in.get(), self.src_out.get())
+        } else {
+            (self.mark_in.get(), self.mark_out.get())
+        };
+        self.player.set_loop_range(in_us, out_us);
     }
 
     pub fn message(&self, text: impl Into<String>) {
@@ -198,6 +244,11 @@ impl AppState {
     /// True when In/Out and the transport act on a source clip shown in the single viewer.
     pub fn source_mode(&self) -> bool {
         self.source_clip.get().is_some() && !self.dual_viewer.get()
+    }
+
+    /// The player of whichever viewer shows source clips right now.
+    pub fn shown_source_player(&self) -> Player {
+        self.source_player.borrow().clone().filter(|_| self.dual_viewer.get()).unwrap_or_else(|| self.player.clone())
     }
 
     pub fn show_source(&self, source: Option<Uuid>) {
@@ -269,6 +320,7 @@ impl AppState {
         self.player.set_source(None);
         *self.project.borrow_mut() = project;
         *self.path.borrow_mut() = path;
+        self.project_generation.set(self.project_generation.get() + 1);
         self.log.borrow_mut().clear();
         self.parked_logs.borrow_mut().clear();
         self.selection.set(None);
@@ -285,10 +337,18 @@ impl AppState {
         self.mark_out.set(None);
         self.dest_video.set(1);
         self.dest_audio.set(1);
+        self.loop_playback.set(false);
+        self.scrub_audio.set(false);
+        self.viewer_zoom.set(None);
+        self.player.set_looping(false);
+        self.player.set_scrub_audio(false);
+        self.sync_loop_range();
         self.dirty.set(false);
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Project);
+        // Loop, scrub and zoom were reset above: let the viewers show and apply that.
+        self.emit(Change::Options);
     }
 
     /// Opens timeline `id`, as Resolve's timeline menu above the viewer does.
@@ -361,6 +421,7 @@ impl AppState {
         self.mark_out.set(None);
         self.dest_video.set(1);
         self.dest_audio.set(1);
+        self.sync_loop_range();
         self.sync_player();
         self.player.seek(0, true);
         self.emit(Change::Timeline);
@@ -518,6 +579,23 @@ impl AppState {
         }
     }
 
+    /// Select an explicit list of clips (first is primary), clearing any gap or edit selection.
+    pub fn select_ids(&self, ids: Vec<Uuid>) {
+        let mut unique = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        let before = self.selected_ids();
+        let had_special = self.gap.take().is_some() | self.edit_selection.take().is_some();
+        self.selection.set(if unique.is_empty() { None } else { Some(unique.remove(0)) });
+        *self.extra_selection.borrow_mut() = unique;
+        if had_special || before != self.selected_ids() {
+            self.emit(Change::Selection);
+        }
+    }
+
     /// Select an empty stretch of a track instead of a clip.
     pub fn select_gap(&self, gap: Gap) {
         self.selection.set(None);
@@ -639,6 +717,53 @@ mod tests {
         assert_eq!(state.fps(), 25.0);
         assert_eq!(state.frame_step(0, 25), 1_000_000);
         assert_eq!(state.frame_floor(1_030_000), 1_000_000);
+    }
+
+    #[test]
+    fn shown_source_player_is_the_source_viewers_only_in_dual_mode() {
+        let state = AppState::new();
+        let source = Player::new();
+        *state.source_player.borrow_mut() = Some(source.clone());
+        state.shown_source_player().seek(1_000_000, false);
+        assert_eq!(state.player.position_us(), 1_000_000);
+        assert_eq!(source.position_us(), 0);
+
+        state.dual_viewer.set(true);
+        state.shown_source_player().seek(2_000_000, false);
+        assert_eq!(source.position_us(), 2_000_000);
+        assert_eq!(state.player.position_us(), 1_000_000);
+    }
+
+    #[test]
+    fn only_opening_or_closing_changes_the_project_generation() {
+        let state = AppState::new();
+        state.set_project(Some(Project::new("t", 1920, 1080, tempo_timeline::RationalFps::FPS_30)), None);
+        let opened = state.project_generation.get();
+        // Save As gives a new file its own id; it is still the same open project.
+        if let Some(p) = state.project.borrow_mut().as_mut() {
+            p.id = Uuid::new_v4();
+        }
+        state.emit(Change::Project);
+        assert_eq!(state.project_generation.get(), opened);
+        state.set_project(None, None);
+        assert_eq!(state.project_generation.get(), opened + 1);
+    }
+
+    #[test]
+    fn opening_a_project_announces_the_reset_viewer_options() {
+        let state = AppState::new();
+        state.loop_playback.set(true);
+        state.viewer_zoom.set(Some(1.0));
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let s = state.clone();
+        let log = seen.clone();
+        state.connect(move |change| {
+            if matches!(change, Change::Options) {
+                log.borrow_mut().push((s.loop_playback.get(), s.viewer_zoom.get()));
+            }
+        });
+        state.set_project(None, None);
+        assert_eq!(*seen.borrow(), vec![(false, None)]);
     }
 
     #[test]

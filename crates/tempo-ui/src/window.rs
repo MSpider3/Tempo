@@ -38,6 +38,9 @@ pub struct MainWindow {
     viewer: Rc<Viewer>,
     /// The second viewer of dual-viewer mode, made the first time it is switched on.
     source_viewer: std::cell::RefCell<Option<Rc<Viewer>>>,
+    /// Dual viewer: the source viewer is the active one (Ctrl+3, or a click on it), so the
+    /// transport and mark keys act on it; Ctrl+5 or a click on the timeline viewer hands them back.
+    source_active: Cell<bool>,
     pub(crate) edit: Rc<EditPage>,
     export: Rc<ExportPage>,
     proxies: Rc<Proxies>,
@@ -54,10 +57,14 @@ pub struct MainWindow {
     edit_only: gtk::Box,
     speed: Cell<f64>,
     cinema: Cell<bool>,
+    full_viewer: Cell<bool>,
     /// When the last rolling backup was started, and whether a failure was already reported.
     last_backup: Cell<std::time::Instant>,
     backup_warned: Cell<bool>,
-    loading_status: gtk::Label,
+    splash: Rc<crate::splash::SplashScreen>,
+    splash_skipped: Rc<Cell<bool>>,
+    splash_finish: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>>,
+    checklist: Rc<crate::help::FirstEditChecklist>,
 }
 
 impl MainWindow {
@@ -92,6 +99,8 @@ impl MainWindow {
         file.append(Some("Import Media…"), Some("win.import-media"));
         file.append(Some("Relink Missing Media…"), Some("win.relink-media"));
         file.append(Some("Save"), Some("win.save"));
+        file.append(Some("Save As…"), Some("win.save-as"));
+        file.append(Some("Project Settings…"), Some("win.project-settings"));
         menu.append_section(None, &file);
         let edit_menu = gio::Menu::new();
         edit_menu.append(Some("Undo"), Some("win.undo"));
@@ -102,13 +111,23 @@ impl MainWindow {
         let plugin_menu = gio::Menu::new();
         menu.append_section(Some("Plugins"), &plugin_menu);
         let help = gio::Menu::new();
+        help.append(Some("How Do I…? Guide"), Some("win.how-do-i"));
+        help.append(Some("First-Edit Checklist"), Some("win.show-checklist"));
+        help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("Plugins…"), Some("win.plugins"));
         help.append(Some("Preferences"), Some("win.preferences"));
-        help.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
         help.append(Some("About Tempo"), Some("win.about"));
         help.append(Some("Quit"), Some("win.quit"));
         menu.append_section(None, &help);
         let menu_btn = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("Menu").menu_model(&menu).css_classes(["tool"]).build();
+        let how_do_i_btn = gtk::Button::builder()
+            .label("?")
+            .tooltip_text("How Do I…? Beginner Guide")
+            .css_classes(["tool", "panel-help-btn"])
+            .build();
+        how_do_i_btn.update_property(&[gtk::accessible::Property::Label("How Do I…? Guide")]);
+        how_do_i_btn.set_action_name(Some("win.how-do-i"));
+        let checklist = crate::help::FirstEditChecklist::new(&state);
 
         // Buttons that only make sense on the Edit page.
         let edit_only = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -118,6 +137,8 @@ impl MainWindow {
         header.pack_start(&media_btn);
         header.pack_start(&effects_btn);
         header.pack_end(&menu_btn);
+        header.pack_end(&how_do_i_btn);
+        header.pack_end(&checklist.button);
         header.pack_end(&edit_only);
 
         // ---- Pages and page bar -----------------------------------------------
@@ -151,7 +172,8 @@ impl MainWindow {
         left.append(&logo_box);
         left.append(&activity);
         let home = tool_button("go-home-symbolic", "Project Manager (Shift+1)");
-        home.set_margin_end(8);
+        let settings_btn = tool_button("emblem-system-symbolic", "Project Settings (Shift+9)");
+        settings_btn.set_margin_end(8);
         // Shortcut hints for what is under the pointer, from the keybind table.
         let hint = label("", &["tempo-small", "tempo-dim"]);
         hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -159,9 +181,10 @@ impl MainWindow {
         // Takes the free space beside the page switcher without pushing it off centre.
         hint.set_max_width_chars(8);
         hint.set_hexpand(true);
-        let right = gtk::Box::builder().spacing(14).margin_start(24).build();
+        let right = gtk::Box::builder().spacing(6).margin_start(24).build();
         right.append(&hint);
         right.append(&home);
+        right.append(&settings_btn);
         let binds = crate::keybinds::load();
         let shown = Cell::new(None);
         *state.show_hint.borrow_mut() = Some(Rc::new(move |zone| {
@@ -203,13 +226,23 @@ impl MainWindow {
         project_view.add_bottom_bar(&page_bar);
 
         // ---- Loading -----------------------------------------------------------
-        let loading_status = label("STARTING UP", &["tempo-small", "tempo-dim"]);
-        loading_status.set_xalign(0.0);
-        let loading = loading_view(&loading_status);
+        let splash_skipped = Rc::new(Cell::new(false));
+        let splash_finish = Rc::new(std::cell::RefCell::new(None::<Rc<dyn Fn()>>));
+        let splash = crate::splash::SplashScreen::new({
+            let skipped = splash_skipped.clone();
+            let finish = splash_finish.clone();
+            move || {
+                skipped.set(true);
+                let cb = finish.borrow_mut().take();
+                if let Some(cb) = cb {
+                    cb();
+                }
+            }
+        });
 
         let root = gtk::Stack::new();
         root.add_named(&gtk::Box::builder().css_classes(["loading"]).build(), Some("blank"));
-        root.add_named(&loading, Some("loading"));
+        root.add_named(&splash.root, Some("loading"));
         root.add_named(&project_view, Some("project"));
 
         let toasts = adw::ToastOverlay::new();
@@ -236,6 +269,7 @@ impl MainWindow {
             pages,
             viewer,
             source_viewer: Default::default(),
+            source_active: Cell::new(false),
             edit,
             export,
             proxies: Proxies::new(&state_for_proxies),
@@ -251,19 +285,23 @@ impl MainWindow {
             edit_only,
             speed: Cell::new(0.0),
             cinema: Cell::new(false),
+            full_viewer: Cell::new(false),
             last_backup: Cell::new(std::time::Instant::now()),
             backup_warned: Cell::new(false),
-            loading_status,
+            splash,
+            splash_skipped,
+            splash_finish,
+            checklist,
         });
 
         // Project Manager needs callbacks into the window, so it is built last.
         let w = win.clone();
         let w2 = win.clone();
-        let manager = ProjectManager::new(move |path| w.open_project(path), move || w2.new_project());
+        let manager = ProjectManager::new(move |path| w.open_project(path), move |folder| w2.new_project(folder));
         win.root.add_named(&manager.root, Some("projects"));
         *win.manager.borrow_mut() = Some(manager);
 
-        win.connect_signals(&home, &quick_export);
+        win.connect_signals(&home, &settings_btn, &quick_export);
         win.install_actions();
         let w = win.clone();
         keybinds::install(&win.window, move |action| {
@@ -275,11 +313,43 @@ impl MainWindow {
             }
             used
         });
+        let splash_keys = gtk::EventControllerKey::new();
+        splash_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let w = win.clone();
+        splash_keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            let modifier = matches!(
+                key,
+                Key::Shift_L
+                    | Key::Shift_R
+                    | Key::Control_L
+                    | Key::Control_R
+                    | Key::Alt_L
+                    | Key::Alt_R
+                    | Key::Super_L
+                    | Key::Super_R
+                    | Key::Meta_L
+                    | Key::Meta_R
+                    | Key::Caps_Lock
+                    | Key::Num_Lock
+            );
+            if w.root.visible_child_name().as_deref() == Some("loading") && !modifier {
+                w.splash_skipped.set(true);
+                let cb = w.splash_finish.borrow_mut().take();
+                if let Some(cb) = cb {
+                    cb();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        win.window.add_controller(splash_keys);
+
         win.start();
         win
     }
 
-    fn connect_signals(self: &Rc<Self>, home: &gtk::Button, quick_export: &gtk::Button) {
+    fn connect_signals(self: &Rc<Self>, home: &gtk::Button, settings_btn: &gtk::Button, quick_export: &gtk::Button) {
         let w = self.clone();
         self.panel_buttons[0].connect_toggled(move |b| w.edit.set_media_pool_open(b.is_active()));
         let w = self.clone();
@@ -302,6 +372,8 @@ impl MainWindow {
 
         let w = self.clone();
         home.connect_clicked(move |_| w.run_action("app.project-manager"));
+        let w = self.clone();
+        settings_btn.connect_clicked(move |_| w.run_action("win.project-settings"));
         let w = self.clone();
         quick_export.connect_clicked(move |_| w.run_action("win.quick-export"));
 
@@ -397,11 +469,28 @@ impl MainWindow {
         self.plugins.connect_changed(move || w.refresh_plugin_menu());
         self.refresh_plugin_menu();
 
-        for name in ["import-media", "relink-media", "save", "undo", "redo", "copy-chapters", "plugins", "preferences", "show-shortcuts", "about", "quit"] {
+        for name in [
+            "import-media",
+            "relink-media",
+            "save",
+            "save-as",
+            "project-settings",
+            "undo",
+            "redo",
+            "copy-chapters",
+            "how-do-i",
+            "show-checklist",
+            "clip-attributes",
+            "plugins",
+            "preferences",
+            "show-shortcuts",
+            "about",
+            "quit",
+        ] {
             let action = gio::SimpleAction::new(name, None);
             let w = self.clone();
             let full = match name {
-                "save" | "quit" | "preferences" => format!("app.{name}"),
+                "save" | "save-as" | "quit" | "preferences" => format!("app.{name}"),
                 _ => format!("win.{name}"),
             };
             action.connect_activate(move |_, _| w.run_action(&full));
@@ -412,21 +501,45 @@ impl MainWindow {
     // ---- Start-up ----------------------------------------------------------------
 
     fn start(self: &Rc<Self>) {
-        self.root.set_visible_child_name("blank");
-        // Show the loading screen only if start-up is not instant.
-        let w = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(300), move || {
-            if w.root.visible_child_name().as_deref() == Some("blank") {
-                w.root.set_visible_child_name("loading");
-            }
-        });
+        let force_splash = std::env::var_os("TEMPO_SHOW_SPLASH").is_some();
+        let automated = std::env::var_os("TEMPO_SMOKE_TEST").is_some()
+            || std::env::var_os("TEMPO_TEST_CONTROL").is_some()
+            || std::env::var_os("TEMPO_ACTIONS").is_some()
+            || std::env::var_os("TEMPO_SCREENSHOT").is_some()
+            || std::env::var_os("TEMPO_OPEN").is_some();
+        let started_at = std::time::Instant::now();
+        // Whether a slow start-up may show the splash: only once the setting says so, and
+        // never after start-up has finished (release() would not run again to stop it).
+        let splash_wanted = Rc::new(Cell::new(false));
+
+        if force_splash {
+            self.splash.activate();
+            self.splash.set_progress(0.15);
+            self.splash.set_status("STARTING UP");
+            self.root.set_visible_child_name("loading");
+        } else {
+            self.root.set_visible_child_name("blank");
+            // Show the loading screen only if start-up is not instant.
+            let w = self.clone();
+            let wanted = splash_wanted.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                if wanted.get() && w.root.visible_child_name().as_deref() == Some("blank") {
+                    w.splash.activate();
+                    w.root.set_visible_child_name("loading");
+                }
+            });
+        }
 
         let w = self.clone();
         glib::MainContext::default().spawn_local(async move {
-            w.loading_status.set_text("STARTING MEDIA ENGINE");
-            let (settings, hardware, turned_off) = gio::spawn_blocking(|| {
+            w.splash.set_status("STARTING MEDIA ENGINE");
+            w.splash.set_progress(0.35);
+            // The settings first (a small file), so the slow-start splash knows whether it is wanted.
+            let settings = gio::spawn_blocking(crate::settings::Settings::load).await.unwrap_or_default();
+            splash_wanted.set(force_splash || (!automated && settings.show_splash));
+            let (settings, hardware, turned_off) = gio::spawn_blocking(move || {
                 tempo_media::ensure_ffmpeg_init();
-                let mut settings = crate::settings::Settings::load();
+                let mut settings = settings;
                 let hardware = (tempo_media::hardware_decode_available(), tempo_export::ffmpeg::vaapi_h264_available());
                 // A saved setting the machine can't do is switched off, as Resolve resets
                 // an invalid GPU configuration, and the user is told once.
@@ -448,14 +561,55 @@ impl MainWindow {
             }
             w.state.player.set_max_height(settings.playback_height);
             tempo_media::set_hardware_decode(settings.hardware_decode);
+            let show_splash = force_splash || (!automated && settings.show_splash);
             *w.state.settings.borrow_mut() = settings;
             // The viewer shows the saved preview quality.
             w.state.emit(Change::Options);
             w.plugins.reload();
-            w.loading_status.set_text("OPENING PROJECTS");
-            match std::env::var_os("TEMPO_OPEN").map(PathBuf::from) {
-                Some(path) => w.open_project(path),
-                None => w.show_manager(),
+            w.splash.set_status("OPENING PROJECTS");
+            w.splash.set_progress(0.75);
+
+            let open_target = std::env::var_os("TEMPO_OPEN").map(PathBuf::from);
+            let completed = Rc::new(Cell::new(false));
+            let finish: Rc<dyn Fn()> = {
+                let w = w.clone();
+                let completed = completed.clone();
+                Rc::new(move || {
+                    if completed.replace(true) {
+                        return;
+                    }
+                    splash_wanted.set(false);
+                    *w.splash_finish.borrow_mut() = None;
+                    w.splash.release();
+                    match open_target.as_ref() {
+                        Some(path) => w.open_project(path.clone()),
+                        None => w.show_manager(),
+                    }
+                })
+            };
+
+            if show_splash && !w.splash_skipped.get() {
+                w.splash.set_progress(1.0);
+                w.splash.set_status("READY — CLICK OR PRESS ANY KEY TO CONTINUE");
+                if w.root.visible_child_name().as_deref() != Some("loading") {
+                    w.splash.activate();
+                    w.root.set_visible_child_name("loading");
+                }
+                *w.splash_finish.borrow_mut() = Some(finish.clone());
+                let hold_ms: u64 = if force_splash && automated {
+                    20_000
+                } else if force_splash {
+                    4_500
+                } else {
+                    2_400
+                };
+                let remaining_ms = hold_ms.saturating_sub(started_at.elapsed().as_millis() as u64);
+                let finish_timer = finish;
+                glib::timeout_add_local_once(Duration::from_millis(remaining_ms.max(150)), move || {
+                    finish_timer();
+                });
+            } else {
+                finish();
             }
         });
     }
@@ -470,28 +624,50 @@ impl MainWindow {
 
     // ---- Projects ------------------------------------------------------------------
 
-    fn new_project(self: &Rc<Self>) {
+    /// New Project dialog; the project is filed in `folder` of the Project Manager.
+    fn new_project(self: &Rc<Self>, folder: Option<String>) {
         let w = self.clone();
-        dialogs::new_project(&self.window, move |np| {
-            let w = w.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let path = np.path.clone();
-                let created = gio::spawn_blocking(move || -> Result<Project, String> {
-                    if let Some(dir) = np.path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        glib::MainContext::default().spawn_local(async move {
+            let existing_names = gio::spawn_blocking(|| {
+                project_manager::load_list().into_iter().map(|e| e.name).collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let w2 = w.clone();
+            dialogs::new_project(&w.window, existing_names, move |np| {
+                let w = w2.clone();
+                let folder = folder.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let created = gio::spawn_blocking(move || -> Result<(Project, PathBuf), String> {
+                        let mut target_path = np.path.clone();
+                        if let Some(dir) = target_path.parent().map(std::path::Path::to_path_buf) {
+                            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                            if target_path.exists() {
+                                let stem = target_path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "Project".into());
+                                let mut n = 2;
+                                while target_path.exists() {
+                                    target_path = dir.join(format!("{stem} {n}.tempo"));
+                                    n += 1;
+                                }
+                            }
+                        }
+                        let mut project =
+                            tempo_project::create_new_project(&np.name, np.width, np.height, np.fps, &target_path)
+                                .map_err(|e| e.to_string())?;
+                        project.proxy_dir = glib::user_cache_dir().join("tempo").join("proxies");
+                        project_manager::remember_in(&project.name, &target_path, folder.as_deref());
+                        Ok((project, target_path))
+                    })
+                    .await;
+                    match created {
+                        Ok(Ok((project, path))) => w.enter_project(project, path),
+                        Ok(Err(e)) => w.state.message(format!("Could not create the project: {e}")),
+                        Err(_) => w.state.message("Could not create the project."),
                     }
-                    let mut project =
-                        tempo_project::create_new_project(&np.name, np.width, np.height, np.fps, &np.path).map_err(|e| e.to_string())?;
-                    project.proxy_dir = glib::user_cache_dir().join("tempo").join("proxies");
-                    project_manager::remember(&project.name, &np.path);
-                    Ok(project)
-                })
-                .await;
-                match created {
-                    Ok(Ok(project)) => w.enter_project(project, path),
-                    Ok(Err(e)) => w.state.message(format!("Could not create the project: {e}")),
-                    Err(_) => w.state.message("Could not create the project."),
-                }
+                });
             });
         });
     }
@@ -572,8 +748,17 @@ impl MainWindow {
     }
 
     fn enter_project(self: &Rc<Self>, project: Project, path: PathBuf) {
+        self.full_viewer.set(false);
+        if let Some(lower) = self.edit.timeline.root.parent() {
+            lower.set_visible(true);
+        }
         self.state.set_project(Some(project), Some(path));
         self.viewer.show_source(None);
+        // The source viewer still holds the old project's clip: empty it and give the keys back.
+        self.source_active.set(false);
+        if let Some(source) = self.source_viewer.borrow().as_ref() {
+            source.show_source(None);
+        }
         self.show_page("edit");
         self.page_buttons[0].set_active(true);
         self.root.set_visible_child_name("project");
@@ -596,6 +781,51 @@ impl MainWindow {
         self.save_then(false, then);
     }
 
+    /// Save the open project to a chosen path (`Ctrl+Shift+S`).
+    fn save_as(self: &Rc<Self>) {
+        let current_path = self.state.path.borrow().clone();
+        let Some(current_name) = self.state.with_project(|p| p.name.clone()) else { return };
+        let w = self.clone();
+        let old_path = current_path.clone();
+        dialogs::save_project_as(&self.window, current_path.as_deref(), &current_name, move |new_path| {
+            let Some(mut project) = w.state.project.borrow().clone() else { return };
+            let w2 = w.clone();
+            let path_for_state = new_path.clone();
+            let old_path = old_path.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let res = gio::spawn_blocking(move || -> Result<(String, uuid::Uuid), String> {
+                    let (name, id) =
+                        project_manager::save_as_identity(&project.name, project.id, old_path.as_deref(), &new_path)?;
+                    project.name = name;
+                    project.id = id;
+                    if let Some(dir) = new_path.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    }
+                    tempo_project::save_project(&project, &new_path).map_err(|e| e.to_string())?;
+                    tempo_project::remove_autosave(&new_path);
+                    project_manager::remember(&project.name, &new_path);
+                    project_manager::save_project_thumbnail(&project);
+                    Ok((project.name, project.id))
+                })
+                .await;
+                match res {
+                    Ok(Ok((saved_name, saved_id))) => {
+                        *w2.state.path.borrow_mut() = Some(path_for_state);
+                        if let Some(p) = w2.state.project.borrow_mut().as_mut() {
+                            p.name = saved_name;
+                            p.id = saved_id;
+                        }
+                        w2.state.set_dirty(false);
+                        w2.state.emit(Change::Project);
+                        w2.flash_activity("Saved");
+                    }
+                    Ok(Err(e)) => w2.state.message(format!("Could not save: {e}")),
+                    Err(_) => w2.state.message("Could not save: the save stopped unexpectedly"),
+                }
+            });
+        });
+    }
+
     /// Save, then do `then`. With `leaving` (closing the window or the project),
     /// a failed save asks whether to leave anyway instead of trapping the user
     /// in a project that cannot be written.
@@ -610,6 +840,7 @@ impl MainWindow {
                 let saved = tempo_project::save_project(&project, &path);
                 if saved.is_ok() {
                     tempo_project::remove_autosave(&path);
+                    project_manager::save_project_thumbnail(&project);
                 }
                 saved
             })
@@ -779,10 +1010,24 @@ impl MainWindow {
         // Leave single-viewer source mode before switching.
         self.viewer.show_source(None);
         self.state.dual_viewer.set(on);
+        self.source_active.set(false);
         if on && self.source_viewer.borrow().is_none() {
             let player = crate::player::Player::new();
             player.set_max_height(self.state.settings.borrow().playback_height);
+            *self.state.source_player.borrow_mut() = Some(player.clone());
             let source = Viewer::new_source(&self.state, player);
+            // Clicking a viewer's picture makes it the one the keys act on; a click in the timeline hands them back to the timeline viewer.
+            let targets: [(&gtk::Widget, bool); 3] = [
+                (source.surface.upcast_ref(), true),
+                (self.viewer.surface.upcast_ref(), false),
+                (self.edit.timeline.canvas.upcast_ref(), false),
+            ];
+            for (widget, active) in targets {
+                let click = gtk::GestureClick::new();
+                let w = self.clone();
+                click.connect_pressed(move |_, _, _, _| w.source_active.set(active));
+                widget.add_controller(click);
+            }
             self.edit.source_slot.append(&source.root);
             hint_over(&self.state, &source.root, crate::keybinds::HintZone::Viewer);
             *self.source_viewer.borrow_mut() = Some(source);
@@ -792,6 +1037,7 @@ impl MainWindow {
             v.show_source(if on { self.state.media_selection.get() } else { None });
         }
         self.state.source_clip.set(if on { self.state.media_selection.get() } else { None });
+        self.state.emit(Change::Options);
     }
 
     fn set_cinema(&self, on: bool) {
@@ -804,6 +1050,11 @@ impl MainWindow {
         } else {
             self.window.unfullscreen();
             self.edit.set_inspector_open(self.panel_buttons[2].is_active());
+            if self.full_viewer.get() {
+                if let Some(lower) = self.edit.timeline.root.parent() {
+                    lower.set_visible(false);
+                }
+            }
         }
     }
 
@@ -1025,7 +1276,12 @@ impl MainWindow {
 
     pub fn run_action(self: &Rc<Self>, action: &str) {
         let state = &self.state;
-        let player = &state.player;
+        // The viewer the transport and mark keys act on: the dual-mode source viewer after
+        // Ctrl+3, else the main one (which may show a source clip itself).
+        let source_viewer = self.source_viewer.borrow().clone().filter(|_| state.dual_viewer.get() && self.source_active.get());
+        let viewer = source_viewer.as_ref().unwrap_or(&self.viewer);
+        let player = viewer.player();
+        let source = source_viewer.is_some() || state.source_mode();
         match action {
             "app.quit" => {
                 self.window.close();
@@ -1033,6 +1289,20 @@ impl MainWindow {
             }
             "win.show-shortcuts" => {
                 dialogs::shortcuts(&self.window);
+                return;
+            }
+            "win.how-do-i" => {
+                let w = self.clone();
+                let w2 = self.clone();
+                crate::help::show_how_do_i(
+                    &self.window,
+                    move || w.checklist.show(),
+                    move || dialogs::shortcuts(&w2.window),
+                );
+                return;
+            }
+            "win.show-checklist" => {
+                self.checklist.show();
                 return;
             }
             "app.preferences" => {
@@ -1063,10 +1333,10 @@ impl MainWindow {
             // Playback
             "win.play-toggle" => {
                 self.speed.set(0.0);
-                self.viewer.toggle_play();
+                viewer.toggle_play();
             }
             "win.play-forward" | "win.play-reverse" => {
-                // Pressing the same direction again doubles the speed, up to 8×.
+                // Pressing the same direction again doubles the speed, up to 64×.
                 let dir = if action == "win.play-forward" { 1.0 } else { -1.0 };
                 // Playback started with Space or the on-screen button counts as 1×.
                 let cur = match (player.is_playing(), self.speed.get()) {
@@ -1077,7 +1347,7 @@ impl MainWindow {
                 if dir > 0.0 && !player.is_playing() && player.position_us() >= player.duration_us() {
                     player.seek(0, true);
                 }
-                let next = if player.is_playing() && cur * dir > 0.0 { (cur.abs() * 2.0).min(8.0) * dir } else { dir };
+                let next = if player.is_playing() && cur * dir > 0.0 { (cur.abs() * 2.0).min(64.0) * dir } else { dir };
                 self.speed.set(next);
                 player.play(next);
                 if next.abs() > 1.0 {
@@ -1087,11 +1357,11 @@ impl MainWindow {
             // Shift+L and Shift+J step through the speeds: each press of Shift+L is
             // one step faster forward, each press of Shift+J one step the other way.
             "win.fast-forward" | "win.fast-reverse" => {
-                const SPEEDS: [f64; 9] = [-8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0];
+                const SPEEDS: [f64; 15] = [-64.0, -32.0, -16.0, -8.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
                 let now = if player.is_playing() { self.speed.get() } else { 0.0 };
                 // A plain "play" (Space or the button) counts as 1×.
                 let now = if player.is_playing() && now == 0.0 { 1.0 } else { now };
-                let at = SPEEDS.iter().position(|s| *s == now).unwrap_or(4);
+                let at = SPEEDS.iter().position(|s| *s == now).unwrap_or(SPEEDS.len() / 2);
                 let first_press = !player.is_playing();
                 let next = match (action == "win.fast-forward", first_press) {
                     // From a stop, "fast" starts at double speed.
@@ -1114,31 +1384,54 @@ impl MainWindow {
                 player.play(0.5);
                 self.flash_activity("Playing at half speed");
             }
+            "win.play-again" => {
+                self.speed.set(1.0);
+                player.play_again();
+            }
+            "win.play-in-to-out" => {
+                if actions::play_in_to_out(state, player, source) {
+                    self.speed.set(1.0);
+                }
+            }
+            "win.play-around" => {
+                if actions::play_around(state, player, source) {
+                    self.speed.set(1.0);
+                }
+            }
+            "win.loop-toggle" => state.set_loop_playback(!state.loop_playback.get()),
+            "win.scrub-audio-toggle" => {
+                let on = !state.scrub_audio.get();
+                state.scrub_audio.set(on);
+                state.emit(Change::Options);
+                self.flash_activity(if on { "Audio scrubbing on" } else { "Audio scrubbing off" });
+            }
             "win.stop" => {
                 self.speed.set(0.0);
                 player.pause();
             }
-            "win.step-forward" => actions::step_frames(state, 1),
-            "win.step-reverse" => actions::step_frames(state, -1),
-            "win.large-step-forward" => actions::step_frames(state, state.fps().round() as i64),
-            "win.large-step-reverse" => actions::step_frames(state, -(state.fps().round() as i64)),
+            "win.step-forward" => actions::step_frames(state, player, 1),
+            "win.step-reverse" => actions::step_frames(state, player, -1),
+            "win.large-step-forward" => actions::step_frames(state, player, state.fps().round() as i64),
+            "win.large-step-reverse" => actions::step_frames(state, player, -(state.fps().round() as i64)),
             "win.clip-next" => actions::goto_edit(state, true),
             "win.clip-prev" => actions::goto_edit(state, false),
+            "win.first-frame" => actions::first_or_last_frame(state, player, source, false),
+            "win.last-frame" => actions::first_or_last_frame(state, player, source, true),
             "win.timeline-start" => player.seek(0, true),
             "win.timeline-end" => player.seek(player.duration_us(), true),
 
             // In and Out
-            "win.mark-in" => actions::set_mark(state, true, false),
-            "win.mark-out" => actions::set_mark(state, false, false),
-            "win.clear-in" => actions::set_mark(state, true, true),
-            "win.clear-out" => actions::set_mark(state, false, true),
+            "win.mark-in" => actions::set_mark(state, player, source, true, false),
+            "win.mark-out" => actions::set_mark(state, player, source, false, false),
+            "win.clear-in" => actions::set_mark(state, player, source, true, true),
+            "win.clear-out" => actions::set_mark(state, player, source, false, true),
             "win.clear-in-out" => {
-                actions::set_mark(state, true, true);
-                actions::set_mark(state, false, true);
+                actions::set_mark(state, player, source, true, true);
+                actions::set_mark(state, player, source, false, true);
             }
             "win.mark-clip" => actions::mark_clip(state),
+            "win.mark-selection" => actions::mark_selection(state),
             "win.goto-in" | "win.goto-out" => {
-                let source = state.source_mode();
                 let mark = match (source, action == "win.goto-in") {
                     (true, true) => state.src_in.get(),
                     (true, false) => state.src_out.get(),
@@ -1150,11 +1443,19 @@ impl MainWindow {
                 }
             }
 
-            "win.new-timeline" => dialogs::new_timeline(&self.window, state),
+            "win.new-timeline" => dialogs::new_timeline(&self.window, state, self.edit.media_pool.current_bin()),
+            "win.new-bin" => {
+                self.panel_buttons[0].set_active(true);
+                self.edit.media_pool.new_bin_dialog();
+            }
 
             // Markers
             "win.marker-add" => {
-                actions::add_marker(state, false);
+                if let Some(existing) = actions::marker_at_playhead(state) {
+                    dialogs::edit_marker(&self.window, state, existing);
+                } else {
+                    actions::add_marker(state, false);
+                }
             }
             "win.marker-add-modify" => {
                 if let Some(m) = actions::add_marker(state, true) {
@@ -1184,7 +1485,9 @@ impl MainWindow {
             }
             "win.page-edit" => self.page_buttons[0].set_active(true),
             "win.page-export" => self.page_buttons[1].set_active(true),
+            "win.project-settings" => dialogs::project_settings(&self.window, state),
             "app.save" => self.save(|| {}),
+            "app.save-as" => self.save_as(),
             // Only where the timeline can be seen: an undo nobody sees is a surprise later.
             "win.undo" if on_edit => state.undo(),
             "win.redo" if on_edit => state.redo(),
@@ -1208,6 +1511,8 @@ impl MainWindow {
             }
             "win.queue-render-all" if !on_edit => self.export.render_all(),
             "win.viewer-cinema" => self.set_cinema(!self.cinema.get()),
+            "win.viewer-fit" => state.set_viewer_zoom(None),
+            "win.viewer-actual-size" => state.set_viewer_zoom(Some(1.0)),
 
             // Everything below edits the timeline and belongs to the Edit page.
             _ if !on_edit => {}
@@ -1221,6 +1526,7 @@ impl MainWindow {
             }
             "win.edit-insert" => actions::place_current(state, Place::Insert),
             "win.edit-overwrite" => actions::place_current(state, Place::Overwrite),
+            "win.edit-ripple-overwrite" => actions::ripple_overwrite(state),
             "win.edit-place-on-top" => actions::place_current(state, Place::OnTop),
             "win.edit-append" => actions::place_current(state, Place::Append),
             "win.clip-enable-toggle" => actions::toggle_enabled(state),
@@ -1243,9 +1549,15 @@ impl MainWindow {
                     actions::paste(state);
                 }
             }
+            "win.paste-insert" => actions::paste_insert(state),
             "win.edit-replace" => actions::replace_selected(state),
             "win.select-all" => state.select_all(),
             "win.deselect-all" => state.select(None),
+            "win.select-track-after" => actions::select_range_relative(state, true, false),
+            "win.select-all-after" => actions::select_range_relative(state, true, true),
+            "win.select-track-before" => actions::select_range_relative(state, false, false),
+            "win.select-all-before" => actions::select_range_relative(state, false, true),
+            "win.select-edit-point" => actions::select_nearest_edit(state),
             "win.link-toggle" => actions::toggle_link(state),
             "win.linked-selection-toggle" => {
                 state.linked_selection.set(!state.linked_selection.get());
@@ -1256,10 +1568,12 @@ impl MainWindow {
             "win.transition-add-audio" => actions::add_standard_transitions(state, false, true),
             "win.transition-duration" => self.change_transition_duration(),
             "win.clip-speed" => dialogs::change_clip_speed(&self.window, state),
+            "win.clip-attributes" => dialogs::clip_attributes_timeline(&self.window, state),
             "win.fade-in" => actions::set_fade(state, true, actions::STANDARD_TRANSITION_S),
             "win.fade-out" => actions::set_fade(state, false, actions::STANDARD_TRANSITION_S),
             "win.razor" => actions::razor(state),
             "win.split-clip" => actions::split_selected(state),
+            "win.join-clip" => actions::join_clip(state),
             // A selected transition is deleted alone, whichever delete key was pressed.
             "win.delete" | "win.ripple-delete" if actions::delete_transition(state) => {}
             "win.delete" => actions::delete_selected(state, false),
@@ -1280,6 +1594,16 @@ impl MainWindow {
             "win.nudge-forward" => actions::nudge(state, 1),
             "win.nudge-multi-left" => actions::nudge(state, -5),
             "win.nudge-multi-right" => actions::nudge(state, 5),
+            "win.swap-reverse" => actions::swap_clips(state, false),
+            "win.swap-forward" => actions::swap_clips(state, true),
+            "win.volume-up-1" => actions::adjust_volume_db(state, 1.0),
+            "win.volume-down-1" => actions::adjust_volume_db(state, -1.0),
+            "win.volume-up-3" => actions::adjust_volume_db(state, 3.0),
+            "win.volume-down-3" => actions::adjust_volume_db(state, -3.0),
+            "win.video-track-toggle-1" => actions::toggle_video_track(state, 1),
+            "win.video-track-toggle-2" => actions::toggle_video_track(state, 2),
+            "win.video-track-toggle-3" => actions::toggle_video_track(state, 3),
+            "win.video-track-toggle-4" => actions::toggle_video_track(state, 4),
             "win.clip-move-up" => actions::move_track(state, 1),
             "win.clip-move-down" => actions::move_track(state, -1),
             "win.zoom-in" => {
@@ -1299,12 +1623,46 @@ impl MainWindow {
                     self.viewer.show_source(target);
                 }
             }
+            "win.viewer-full-page" => {
+                let on = !self.full_viewer.get();
+                self.full_viewer.set(on);
+                if let Some(lower) = self.edit.timeline.root.parent() {
+                    lower.set_visible(!on);
+                }
+            }
             "win.focus-media-pool" => {
                 self.panel_buttons[0].set_active(true);
                 self.edit.media_pool.focus();
             }
+            "win.focus-source-viewer" => {
+                let prev_source = state.media_selection.get().or_else(|| state.source_clip.get());
+                if !state.dual_viewer.get() {
+                    // One viewer: it switches to the source clip, as Q does; the layout stays.
+                    if !state.source_mode() && prev_source.is_some() {
+                        self.viewer.show_source(prev_source);
+                    }
+                    self.viewer.surface.grab_focus();
+                    return;
+                }
+                self.source_active.set(true);
+                if let Some(sv) = self.source_viewer.borrow().as_ref() {
+                    if state.source_clip.get().is_none() && prev_source.is_some() {
+                        sv.show_source(prev_source);
+                        state.source_clip.set(prev_source);
+                    }
+                    sv.surface.grab_focus();
+                }
+            }
             "win.focus-timeline" => {
+                self.source_active.set(false);
                 self.edit.timeline.canvas.grab_focus();
+            }
+            "win.focus-timeline-viewer" => {
+                self.source_active.set(false);
+                if !state.dual_viewer.get() && state.source_mode() {
+                    self.viewer.show_source(None);
+                }
+                self.viewer.surface.grab_focus();
             }
             "win.focus-inspector" => {
                 self.panel_buttons[2].set_active(true);
@@ -1366,48 +1724,4 @@ fn hint_over(state: &Rc<AppState>, widget: &impl IsA<gtk::Widget>, zone: crate::
     let s = state.clone();
     motion.connect_leave(move |_| s.hint(None));
     widget.add_controller(motion);
-}
-
-fn loading_view(status: &gtk::Label) -> gtk::Box {
-    let name = label("Tempo", &["tempo-title"]);
-    name.set_xalign(0.0);
-    let version = label(env!("CARGO_PKG_VERSION"), &["tempo-dim"]);
-    version.set_xalign(0.0);
-    let progress = gtk::ProgressBar::builder().width_request(280).halign(gtk::Align::Start).build();
-    progress.set_pulse_step(0.15);
-    // Animate only while the loading screen is on screen, then stop for good.
-    let pulsing = progress.clone();
-    let was_mapped = Cell::new(false);
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if pulsing.is_mapped() {
-            was_mapped.set(true);
-            pulsing.pulse();
-            glib::ControlFlow::Continue
-        } else if was_mapped.get() || pulsing.root().is_none() {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .valign(gtk::Align::Center)
-        .margin_start(96)
-        .build();
-    let app_icon = gtk::Image::builder()
-        .icon_name("dev.tempo.Tempo")
-        .pixel_size(64)
-        .halign(gtk::Align::Start)
-        .margin_bottom(12)
-        .build();
-    column.append(&app_icon);
-    column.append(&name);
-    column.append(&version);
-    column.append(&gtk::Box::builder().height_request(40).build());
-    column.append(status);
-    column.append(&progress);
-    let view = gtk::Box::builder().css_classes(["loading"]).build();
-    view.append(&column);
-    view
 }

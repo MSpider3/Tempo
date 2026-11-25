@@ -1593,16 +1593,23 @@ impl ReplaceTimelineCommand {
     pub fn new(description: impl Into<String>, after: Timeline) -> Self {
         Self { other: after, description: description.into() }
     }
+
+    /// Bin moves are not undo steps, so the timeline keeps the bin it is in now.
+    fn swap(&mut self, timeline: &mut Timeline) {
+        let bin_id = timeline.bin_id;
+        std::mem::swap(timeline, &mut self.other);
+        timeline.bin_id = bin_id;
+    }
 }
 
 impl Command for ReplaceTimelineCommand {
     fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
-        std::mem::swap(timeline, &mut self.other);
+        self.swap(timeline);
         Ok(())
     }
 
     fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
-        std::mem::swap(timeline, &mut self.other);
+        self.swap(timeline);
         Ok(())
     }
 
@@ -2678,6 +2685,24 @@ mod tests {
     }
 
     #[test]
+    fn replace_timeline_keeps_the_bin_the_timeline_is_in_now() {
+        let mut timeline = Timeline::new_default();
+        let stale = timeline.clone();
+        let bin = Some(Uuid::new_v4());
+        timeline.bin_id = bin;
+        let mut log = CommandLog::new();
+        log.execute(Box::new(ReplaceTimelineCommand::new("Script", stale)), &mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, bin);
+
+        let moved = Some(Uuid::new_v4());
+        timeline.bin_id = moved;
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, moved);
+        log.redo(&mut timeline).unwrap();
+        assert_eq!(timeline.bin_id, moved);
+    }
+
+    #[test]
     fn solo_is_an_undoable_track_flag() {
         let mut timeline = Timeline::new_default();
         let audio = timeline.tracks.iter().find(|t| t.kind == crate::TrackKind::Audio).unwrap().id;
@@ -3015,5 +3040,213 @@ mod add_track_tests {
         audio.undo(&mut timeline).unwrap();
         video.undo(&mut timeline).unwrap();
         assert_eq!(timeline, before);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DeleteTrackCommand — remove a track, keeping at least one video and one audio
+// ----------------------------------------------------------------------------
+
+/// Removes a track by id, storing the removed track, original index, renumbered
+/// kind indexes, and any single-partner links cleared on remaining clips for exact `undo()`.
+#[derive(Debug)]
+pub struct DeleteTrackCommand {
+    track_id: Uuid,
+    removed: Option<(usize, Track)>,
+    renumbered: Vec<(Uuid, u32, String)>,
+    cleared_links: Vec<(Uuid, Uuid)>,
+    description: String,
+}
+
+impl DeleteTrackCommand {
+    pub fn new(track_id: Uuid) -> Self {
+        Self {
+            track_id,
+            removed: None,
+            renumbered: Vec::new(),
+            cleared_links: Vec::new(),
+            description: "Delete track".to_string(),
+        }
+    }
+}
+
+impl Command for DeleteTrackCommand {
+    fn execute(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let pos = timeline
+            .tracks
+            .iter()
+            .position(|t| t.id == self.track_id)
+            .ok_or(TimelineError::TrackNotFound(self.track_id))?;
+
+        let kind = timeline.tracks[pos].kind;
+        if timeline.tracks.iter().filter(|t| t.kind == kind).count() <= 1 {
+            return Err(TimelineError::CommandFailed(match kind {
+                crate::types::TrackKind::Video => "Cannot delete the last video track.".to_string(),
+                crate::types::TrackKind::Audio => "Cannot delete the last audio track.".to_string(),
+            }));
+        }
+
+        self.renumbered.clear();
+        self.cleared_links.clear();
+
+        let removed = timeline.tracks.remove(pos);
+        self.description = format!("Delete {}", removed.name);
+
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order > removed.sort_order) {
+            t.sort_order -= 1;
+        }
+
+        let prefix = match removed.kind {
+            crate::types::TrackKind::Video => "Video",
+            crate::types::TrackKind::Audio => "Audio",
+        };
+        for t in timeline
+            .tracks
+            .iter_mut()
+            .filter(|t| t.kind == removed.kind && t.kind_index > removed.kind_index)
+        {
+            let old_idx = t.kind_index;
+            let old_name = t.name.clone();
+            self.renumbered.push((t.id, old_idx, old_name));
+            t.kind_index -= 1;
+            if t.name == format!("{prefix} {old_idx}") {
+                t.name = format!("{prefix} {}", t.kind_index);
+            }
+        }
+
+        // Clear links on remaining clips that have no partner left after this track is removed.
+        let removed_links: std::collections::HashSet<Uuid> = removed.clips.iter().filter_map(|c| c.properties.link).collect();
+        if !removed_links.is_empty() {
+            let mut counts: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+            for t in &timeline.tracks {
+                for c in &t.clips {
+                    if let Some(l) = c.properties.link.filter(|l| removed_links.contains(l)) {
+                        *counts.entry(l).or_insert(0) += 1;
+                    }
+                }
+            }
+            for t in &mut timeline.tracks {
+                for c in &mut t.clips {
+                    if let Some(l) = c.properties.link {
+                        if counts.get(&l).copied() == Some(1) {
+                            self.cleared_links.push((c.id, l));
+                            c.properties.link = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.removed = Some((pos, removed));
+        Ok(())
+    }
+
+    fn undo(&mut self, timeline: &mut Timeline) -> Result<()> {
+        let (pos, removed) = self
+            .removed
+            .take()
+            .ok_or_else(|| TimelineError::CommandFailed("No removed track to restore".to_string()))?;
+
+        for t in timeline.tracks.iter_mut().filter(|t| t.sort_order >= removed.sort_order) {
+            t.sort_order += 1;
+        }
+        for (tid, old_idx, old_name) in self.renumbered.drain(..) {
+            if let Some(t) = timeline.find_track_mut(tid) {
+                t.kind_index = old_idx;
+                t.name = old_name;
+            }
+        }
+
+        let insert_at = pos.min(timeline.tracks.len());
+        timeline.tracks.insert(insert_at, removed);
+
+        for (cid, link) in self.cleared_links.drain(..) {
+            if let Some(c) = timeline.find_clip_mut(cid) {
+                c.properties.link = Some(link);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(test)]
+mod delete_track_tests {
+    use super::*;
+    use crate::types::TrackKind;
+
+    #[test]
+    fn delete_extra_video_and_audio_tracks_and_undo_redo_restore_exactly() {
+        let mut timeline = Timeline::with_tracks("T", 2, 2);
+        let (v1_id, v2_id, a1_id, a2_id) = (
+            timeline.tracks[0].id,
+            timeline.tracks[1].id,
+            timeline.tracks[2].id,
+            timeline.tracks[3].id,
+        );
+        let link = Some(Uuid::new_v4());
+        let mut v2_clip = Clip::new(v2_id, Uuid::new_v4(), ClipType::Video, "v2", 0, 2_000_000, 0, 2_000_000);
+        let mut a1_clip = Clip::new(a1_id, v2_clip.source_id, ClipType::Audio, "a1", 0, 2_000_000, 0, 2_000_000);
+        (v2_clip.properties.link, a1_clip.properties.link) = (link, link);
+        let a1_clip_id = a1_clip.id;
+        timeline.tracks[1].clips.push(v2_clip);
+        timeline.tracks[2].clips.push(a1_clip);
+        let before = timeline.clone();
+
+        let mut log = CommandLog::new();
+        log.execute(Box::new(DeleteTrackCommand::new(v2_id)), &mut timeline).unwrap();
+        assert_eq!(timeline.tracks.iter().filter(|t| t.kind == TrackKind::Video).count(), 1);
+        assert!(timeline.find_track(v2_id).is_none());
+        assert_eq!(timeline.find_clip(a1_clip_id).unwrap().1.properties.link, None);
+
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        log.redo(&mut timeline).unwrap();
+        assert!(timeline.find_track(v2_id).is_none());
+        assert_eq!(timeline.find_clip(a1_clip_id).unwrap().1.properties.link, None);
+
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        // Deleting the first video track renumbers V2 -> Video 1 and restores cleanly on undo.
+        log.execute(Box::new(DeleteTrackCommand::new(v1_id)), &mut timeline).unwrap();
+        let remaining_v = timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
+        assert_eq!((remaining_v.id, remaining_v.kind_index, remaining_v.name.as_str()), (v2_id, 1, "Video 1"));
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+
+        // Deleting an extra audio track and undoing/redoing.
+        log.execute(Box::new(DeleteTrackCommand::new(a2_id)), &mut timeline).unwrap();
+        assert_eq!(timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count(), 1);
+        assert!(timeline.find_track(a2_id).is_none());
+        log.undo(&mut timeline).unwrap();
+        assert_eq!(timeline, before);
+        log.redo(&mut timeline).unwrap();
+        assert!(timeline.find_track(a2_id).is_none());
+    }
+
+    #[test]
+    fn delete_track_refuses_last_video_or_last_audio_and_missing_track() {
+        let mut timeline = Timeline::with_tracks("T", 1, 1);
+        let v1_id = timeline.tracks[0].id;
+        let a1_id = timeline.tracks[1].id;
+        let before = timeline.clone();
+
+        let err_v = DeleteTrackCommand::new(v1_id).execute(&mut timeline);
+        assert!(matches!(err_v, Err(TimelineError::CommandFailed(_))));
+        assert_eq!(timeline, before);
+
+        let err_a = DeleteTrackCommand::new(a1_id).execute(&mut timeline);
+        assert!(matches!(err_a, Err(TimelineError::CommandFailed(_))));
+        assert_eq!(timeline, before);
+
+        let missing = Uuid::new_v4();
+        let err_missing = DeleteTrackCommand::new(missing).execute(&mut timeline);
+        assert_eq!(err_missing, Err(TimelineError::TrackNotFound(missing)));
     }
 }

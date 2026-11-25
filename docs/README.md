@@ -11,7 +11,7 @@ footage on import.
 
 | | |
 |---|---|
-| Version | 0.3.0 alpha (2026-11-20) |
+| Version | 0.4.0 alpha (2026-11-25) |
 | Language | Rust |
 | UI | GTK 4 + libadwaita, dark only |
 | Screens | Loading, Project Manager, Edit page, Export page |
@@ -47,7 +47,7 @@ footage on import.
 | `ARCHITECTURE.md` | Crates, threads, memory | Plugin and UI parts are superseded; see the note at its top |
 | `SYSTEM_DESIGN.md` | Data types, commands, interfaces | Plugin API superseded; see note |
 | `MEDIA_ENGINE.md` | Decoding, cache, proxies | Known design problems listed in its top note |
-| `DATABASE_SCHEMA.md` | Project file tables, loading rules, backups | Known design problems listed in its top note; updated for 0.3.0 |
+| `DATABASE_SCHEMA.md` | Project file tables, loading rules, backups | Known design problems listed in its top note; updated for 0.4.0 |
 
 Where an engine document disagrees with a product or interface document, the product or
 interface document is right.

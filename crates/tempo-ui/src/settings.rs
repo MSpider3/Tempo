@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -13,6 +17,9 @@ pub struct Settings {
     pub playback_height: u32,
     /// Make small proxy files for heavy footage in the background.
     pub auto_proxies: bool,
+    /// Show the behind-the-scenes splash screen on interactive startup.
+    #[serde(default = "default_true")]
+    pub show_splash: bool,
     /// Use the graphics chip to decode video when it can. Off by default until
     /// it has been tried on more machines.
     pub hardware_decode: bool,
@@ -26,7 +33,16 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { autosave_seconds: 120, playback_height: 540, auto_proxies: true, hardware_decode: false, hardware_encode: false, plugins_off: Vec::new(), transition_us: tempo_timeline::STANDARD_TRANSITION_US }
+        Self {
+            autosave_seconds: 120,
+            playback_height: 540,
+            auto_proxies: true,
+            show_splash: true,
+            hardware_decode: false,
+            hardware_encode: false,
+            plugins_off: Vec::new(),
+            transition_us: tempo_timeline::STANDARD_TRANSITION_US,
+        }
     }
 }
 
@@ -84,5 +100,6 @@ mod tests {
         assert_eq!(s.autosave_seconds, 300);
         assert_eq!(s.playback_height, 540);
         assert!(s.auto_proxies);
+        assert!(s.show_splash);
     }
 }

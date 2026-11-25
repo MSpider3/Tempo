@@ -153,6 +153,74 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .tempo .loading progressbar trough   { min-height: 2px; background-color: @tempo_bg_card; }
 .tempo .loading progressbar progress { min-height: 2px; background-color: @tempo_accent; }
 
+.splash-scrim {
+  padding: 36px 44px;
+  background-image: linear-gradient(
+    90deg,
+    alpha(@tempo_bg_active, 0.90) 0%,
+    alpha(@tempo_bg_active, 0.68) 42%,
+    alpha(@tempo_bg_active, 0.18) 100%
+  ),
+  linear-gradient(
+    180deg,
+    alpha(@tempo_bg_active, 0.40) 0%,
+    alpha(@tempo_bg_active, 0.08) 48%,
+    alpha(@tempo_bg_active, 0.92) 100%
+  );
+}
+.splash-brand {
+  font-size: 3.1em;
+  font-weight: 900;
+  letter-spacing: 0.10em;
+  color: @tempo_text_bright;
+}
+.splash-badge {
+  background-color: @tempo_accent;
+  color: @tempo_text_bright;
+  font-size: 0.78em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 2px 10px;
+  border-radius: 3px;
+}
+.splash-counter {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: @tempo_text_dim;
+}
+.splash-slide-title {
+  font-size: 1.35em;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: @tempo_warn;
+}
+.splash-caption {
+  font-size: 1.05em;
+  font-weight: 500;
+  color: @tempo_text_bright;
+}
+.splash-tip {
+  font-size: 0.92em;
+  color: @tempo_text;
+  background-color: alpha(@tempo_bg_card, 0.78);
+  border-left: 3px solid @tempo_accent;
+  border-radius: 3px;
+  padding: 6px 10px;
+  margin-top: 4px;
+  margin-bottom: 6px;
+}
+.splash-status {
+  font-size: 0.82em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: @tempo_text_dim;
+}
+.tempo .splash-progress trough { min-height: 4px; background-color: alpha(@tempo_bg_card, 0.85); border-radius: 2px; }
+.tempo .splash-progress progress { min-height: 4px; background-color: @tempo_accent; border-radius: 2px; }
+.tempo button.splash-skip { background-color: alpha(@tempo_bg_bar, 0.80); border-color: @tempo_text_dim; color: @tempo_text_bright; }
+.tempo button.splash-skip:hover { background-color: @tempo_bg_hover; border-color: @tempo_text_bright; }
+.splash-skip-hint { font-size: 0.78em; color: @tempo_text_dim; }
+
 /* ---- Project manager ------------------------------------------------- */
 .tempo gridview.projects { background: none; }
 .tempo gridview.projects > child { background: none; padding: 10px; border-radius: 6px; }
@@ -168,9 +236,30 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 /* ---- Media pool / effects ------------------------------------------- */
 .tempo gridview.media { background-color: @tempo_bg_surface; }
 .tempo gridview.media > child { background: none; padding: 6px; border-radius: 4px; }
+.tempo columnview.media { background-color: @tempo_bg_surface; color: @tempo_text; }
+.tempo columnview.media > listview { background-color: @tempo_bg_surface; }
+.tempo columnview.media > listview > row { padding: 2px 4px; color: @tempo_text; }
+.tempo columnview.media > listview > row:hover { background-color: @tempo_bg_hover; }
+.tempo columnview.media > listview > row:selected { background-color: @tempo_bg_card; color: @tempo_text_bright; }
+.tempo columnview.media > header > button { background-color: @tempo_bg_panel; color: @tempo_text_dim; border-bottom: 1px solid @tempo_line; font-size: 0.85em; min-height: 24px; }
 .media-thumb { background-color: @tempo_bg_inset; border-radius: 3px; border: 2px solid transparent;
                color: @tempo_text_off; }
+.media-thumb.bin-cell { background-color: @tempo_bg_card; color: @tempo_text; }
+.media-thumb.drop-hover { border-color: @tempo_accent; }
 .tempo gridview.media > child:selected .media-thumb { border-color: @tempo_accent; }
+.media-used-bar { background-color: @tempo_accent; min-height: 3px; }
+.bin-sidebar { background-color: @tempo_bg_deep; border-right: 1px solid @tempo_line; }
+.tempo .bin-sidebar listbox { background: none; }
+.tempo .bin-sidebar listbox > row { padding: 4px 8px; color: @tempo_text_dim; border-radius: 3px; margin: 1px 4px; }
+.tempo .bin-sidebar listbox > row:hover { background-color: @tempo_bg_hover; color: @tempo_text; }
+.tempo .bin-sidebar listbox > row:selected { background-color: @tempo_bg_bar; color: @tempo_text_bright; }
+.bin-row { min-height: 24px; }
+.bin-row.drop-hover { background-color: @tempo_bg_hover; color: @tempo_text_bright; }
+.bin-breadcrumb { padding: 0; }
+.tempo .bin-breadcrumb button { background: none; box-shadow: none; border: none; border-radius: 3px;
+                               min-height: 24px; padding: 0 4px; color: @tempo_text_dim; font-weight: 600; }
+.tempo .bin-breadcrumb button:hover { color: @tempo_text_bright; background-color: @tempo_bg_hover; }
+.tempo .bin-breadcrumb button.current { color: @tempo_text_bright; }
 .drop-hint { border: 1px dashed @tempo_line_button; border-radius: 6px; color: @tempo_text_dim;
              margin: 12px; padding: 16px; }
 
@@ -249,6 +338,7 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .tempo button.format:hover   { color: @tempo_text; }
 .tempo button.format:checked { color: @tempo_text_bright; border-bottom-color: @tempo_accent; }
 .job-card { background-color: @tempo_bg_card; border: 1px solid @tempo_line; border-radius: 3px; }
+.job-card.selected { border-color: @tempo_accent; }
 .job-card .job-header { border-bottom: 1px solid @tempo_line; padding: 4px 8px; }
 .tempo .job-card progressbar trough   { min-height: 3px; background-color: @tempo_bg_inset; }
 .tempo .job-card progressbar progress { min-height: 3px; background-color: @tempo_accent; }
@@ -286,3 +376,50 @@ window.tempo { background-color: @tempo_bg_panel; color: @tempo_text; }
 .marker-overlay.marker-cocoa { border-left-color: @tempo_marker_cocoa; }
 .marker-overlay.marker-cream { border-left-color: @tempo_marker_cream; }
 .marker-overlay.marker-orange { border-left-color: @tempo_marker_orange; }
+
+/* ---- Beginner Helpers ------------------------------------------------ */
+.tempo button.tool.panel-help-btn,
+.tempo menubutton.panel-help-btn > button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 6px;
+  font-weight: 700;
+  color: @tempo_text_dim;
+  background: none;
+  border: 1px solid @tempo_line_button;
+  border-radius: 9999px;
+}
+.tempo button.tool.panel-help-btn:hover,
+.tempo menubutton.panel-help-btn > button:hover {
+  color: @tempo_text_bright;
+  border-color: @tempo_text_dim;
+  background-color: @tempo_bg_hover;
+}
+.tempo menubutton.checklist-pill > button {
+  min-height: 26px;
+  padding: 0 10px;
+  background-color: @tempo_bg_card;
+  border: 1px solid @tempo_line_button;
+  border-radius: 9999px;
+  color: @tempo_text;
+}
+.tempo menubutton.checklist-pill > button:hover {
+  background-color: @tempo_bg_hover;
+  color: @tempo_text_bright;
+}
+.tempo menubutton.checklist-pill.checklist-done > button {
+  border-color: @tempo_ok;
+}
+.checklist-done { color: @tempo_ok; font-weight: 700; }
+.help-card {
+  background-color: @tempo_bg_card;
+  border: 1px solid @tempo_line;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.help-shortcut-pill {
+  background-color: @tempo_bg_deep;
+  border: 1px solid @tempo_line_button;
+  border-radius: 4px;
+  padding: 2px 7px;
+}

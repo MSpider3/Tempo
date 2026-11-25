@@ -20,7 +20,13 @@
 > - §16.8 computes duration from enabled tracks only, so hiding a track would shorten the
 >   export. Duration should count every track.
 >
-> **Updated 2026-11-19.** The schema is now **version 6**. Migration 6 adds `fps_num` and
+> **Updated 2026-11-25 (0.4.0 alpha).** The schema is now **version 8**. Migration 7 adds
+> `bin_id` to `timelines` (the Media Pool bin it sits in; NULL or the Master bin's id = Master).
+> Migration 8 adds Clip Attributes to `media_sources`: `display_name` (NULL = file name),
+> `conform_fps_num` and `conform_fps_den` (Video Frame Rate Conform; NULL = native rate) and
+> `audio_channel_map` (`stereo`, the default, or another Audio Channel Mapping choice).
+>
+> **Earlier on 2026-11-19.** The schema became **version 6**. Migration 6 adds `fps_num` and
 > `fps_den` to `timelines` (own frame rate when "Use Project Settings" was off, NULL = the
 > project's) and `enabled` to `transitions` (the Inspector's Video/Audio switch; 0 plays as
 > a cut). Marker colours 6-16 are Resolve's other colours (the column was already an integer).
@@ -104,7 +110,7 @@ INSERT INTO schema_version (version, applied_at, description)
 VALUES (1, strftime('%s', 'now') * 1000000, 'Initial schema');
 ```
 
-Current schema version: **6**
+Current schema version: **8**
 
 ---
 
@@ -183,7 +189,13 @@ CREATE TABLE media_sources (
     -- Organization
     imported_at     INTEGER NOT NULL,
     import_order    INTEGER NOT NULL DEFAULT 0,  -- for stable ordering in Media Pool
-    thumbnail_data  BLOB                    -- 160×90 RGBA, stored inline for small overhead
+    thumbnail_data  BLOB,                   -- 160×90 RGBA, stored inline for small overhead
+
+    -- Clip Attributes (migration 8)
+    display_name       TEXT,                -- NULL = file name
+    conform_fps_num    INTEGER,             -- NULL = play at the native rate
+    conform_fps_den    INTEGER,
+    audio_channel_map  TEXT NOT NULL DEFAULT 'stereo'
 );
 ```
 
@@ -230,6 +242,7 @@ CREATE TABLE timelines (
 );
 ALTER TABLE tracks  ADD COLUMN timeline_id TEXT;   -- migration 3
 ALTER TABLE markers ADD COLUMN timeline_id TEXT;   -- migration 3
+ALTER TABLE timelines ADD COLUMN bin_id TEXT;      -- migration 7, Media Pool bin
 ```
 
 ```sql

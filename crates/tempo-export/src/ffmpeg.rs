@@ -59,6 +59,17 @@ pub fn h264_encoder() -> H264Encoder {
     })
 }
 
+/// Whether this FFmpeg has the software H.265 encoder, found once by asking
+/// `ffmpeg -encoders` (Fedora's `ffmpeg-free` leaves it out). Blocking.
+pub fn x265_available() -> bool {
+    static FOUND: OnceLock<bool> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let listing = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output();
+        let text = listing.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        text.is_empty() || text.contains(" libx265 ")
+    })
+}
+
 /// Encoder arguments for a quality level given as an x264 CRF (18 high … 28 small).
 /// `fast` trades size for speed (used for proxies).
 pub fn h264_args(crf: u8, width: u32, height: u32, fast: bool) -> Vec<String> {

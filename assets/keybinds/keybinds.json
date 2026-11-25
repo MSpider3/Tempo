@@ -64,6 +64,16 @@
   },
   {
    "group": "Playback",
+   "action": "win.play-again",
+   "keys": [
+    "<Alt>l"
+   ],
+   "alt": [],
+   "label": "Play Again",
+   "resolve": "controlPlayAgain"
+  },
+  {
+   "group": "Playback",
    "action": "win.stop",
    "keys": [
     "k"
@@ -153,6 +163,66 @@
    "resolve": "controlTimelineEnd"
   },
   {
+   "group": "Playback",
+   "action": "win.first-frame",
+   "keys": [
+    "semicolon"
+   ],
+   "alt": [],
+   "label": "First Frame of Clip",
+   "resolve": "controlFirstFrame"
+  },
+  {
+   "group": "Playback",
+   "action": "win.last-frame",
+   "keys": [
+    "apostrophe"
+   ],
+   "alt": [],
+   "label": "Last Frame of Clip",
+   "resolve": "controlLastFrame"
+  },
+  {
+   "group": "Playback",
+   "action": "win.loop-toggle",
+   "keys": [
+    "<Primary>slash"
+   ],
+   "alt": [],
+   "label": "Loop Playback",
+   "resolve": "controlLoop"
+  },
+  {
+   "group": "Playback",
+   "action": "win.play-around",
+   "keys": [
+    "slash"
+   ],
+   "alt": [],
+   "label": "Play Around Selection",
+   "resolve": "controlPlayAroundToPlayAroundCurrentSelection"
+  },
+  {
+   "group": "Playback",
+   "action": "win.play-in-to-out",
+   "keys": [
+    "<Alt>slash"
+   ],
+   "alt": [],
+   "label": "Play In to Out",
+   "resolve": "controlPlayAroundToPlayInToOut"
+  },
+  {
+   "group": "Playback",
+   "action": "win.scrub-audio-toggle",
+   "keys": [
+    "<Shift>s"
+   ],
+   "alt": [],
+   "label": "Audio Scrubbing",
+   "resolve": "editScrubAudio"
+  },
+  {
    "group": "In and Out",
    "action": "win.mark-in",
    "keys": [
@@ -214,6 +284,16 @@
   },
   {
    "group": "In and Out",
+   "action": "win.mark-selection",
+   "keys": [
+    "<Shift>a"
+   ],
+   "alt": [],
+   "label": "Mark Selection",
+   "resolve": "markSelected"
+  },
+  {
+   "group": "In and Out",
    "action": "win.goto-in",
    "keys": [
     "<Shift>i"
@@ -241,6 +321,16 @@
    "alt": [],
    "label": "New Timeline",
    "resolve": "fileNewTimeline"
+  },
+  {
+   "group": "File",
+   "action": "win.new-bin",
+   "keys": [
+    "<Primary><Shift>n"
+   ],
+   "alt": [],
+   "label": "New Bin",
+   "resolve": "fileNewFolder"
   },
   {
    "group": "Markers",
@@ -394,6 +484,16 @@
   },
   {
    "group": "Editing",
+   "action": "win.edit-ripple-overwrite",
+   "keys": [
+    "<Shift>F10"
+   ],
+   "alt": [],
+   "label": "Ripple Overwrite",
+   "resolve": "editInsertOverwriteActionRippleOverwrite"
+  },
+  {
+   "group": "Editing",
    "action": "win.edit-append",
    "keys": [
     "<Shift>F12"
@@ -421,6 +521,16 @@
    "alt": [],
    "label": "Split Clip",
    "resolve": "editM2SplitClip"
+  },
+  {
+   "group": "Editing",
+   "action": "win.join-clip",
+   "keys": [
+    "<Alt>backslash"
+   ],
+   "alt": [],
+   "label": "Join Clip",
+   "resolve": "editM2JoinClip"
   },
   {
    "group": "Editing",
@@ -505,6 +615,16 @@
   },
   {
    "group": "Editing",
+   "action": "win.paste-insert",
+   "keys": [
+    "<Primary><Shift>v"
+   ],
+   "alt": [],
+   "label": "Paste Insert",
+   "resolve": "editPasteInsert"
+  },
+  {
+   "group": "Editing",
    "action": "win.undo",
    "keys": [
     "<Primary>z"
@@ -552,6 +672,46 @@
    "alt": [],
    "label": "Deselect All",
    "resolve": "editDeselectAll"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-track-after",
+   "keys": [
+    "y"
+   ],
+   "alt": [],
+   "label": "Select Clips Forward on This Track",
+   "resolve": "editSelectClipsSelectTrackAfter"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-all-after",
+   "keys": [
+    "<Alt>y"
+   ],
+   "alt": [],
+   "label": "Select Clips Forward on All Tracks",
+   "resolve": "editSelectClipsSelectAllAfter"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-track-before",
+   "keys": [
+    "<Primary>y"
+   ],
+   "alt": [],
+   "label": "Select Clips Backward on This Track",
+   "resolve": "editSelectClipsSelectTrackBefore"
+  },
+  {
+   "group": "Editing",
+   "action": "win.select-all-before",
+   "keys": [
+    "<Primary><Alt>y"
+   ],
+   "alt": [],
+   "label": "Select Clips Backward on All Tracks",
+   "resolve": "editSelectClipsSelectAllBefore"
   },
   {
    "group": "Editing",
@@ -726,6 +886,140 @@
    "resolve": "editMoveClipsDown"
   },
   {
+   "group": "Trimming",
+   "action": "win.select-edit-point",
+   "keys": [
+    "v"
+   ],
+   "alt": [],
+   "label": "Select Nearest Edit Point",
+   "resolve": "editSelectEditPoint"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.swap-reverse",
+   "keys": [
+    "<Primary><Shift>comma"
+   ],
+   "alt": [
+    "<Primary><Shift>less",
+    "<Primary>less"
+   ],
+   "label": "Swap Clip Backward",
+   "resolve": "editNudgeSwapEditReverse"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.swap-forward",
+   "keys": [
+    "<Primary><Shift>period"
+   ],
+   "alt": [
+    "<Primary><Shift>greater",
+    "<Primary>greater"
+   ],
+   "label": "Swap Clip Forward",
+   "resolve": "editNudgeSwapEditForward"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.volume-up-1",
+   "keys": [
+    "<Primary><Alt>equal"
+   ],
+   "alt": [],
+   "label": "Clip Volume +1 dB",
+   "resolve": "clipAudioIncreaseAudioLevel1dB"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.volume-down-1",
+   "keys": [
+    "<Primary><Alt>minus"
+   ],
+   "alt": [],
+   "label": "Clip Volume −1 dB",
+   "resolve": "clipAudioDecreaseAudioLevel1dB"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.volume-up-3",
+   "keys": [
+    "<Alt><Shift>equal"
+   ],
+   "alt": [
+    "<Alt><Shift>plus",
+    "<Alt>plus"
+   ],
+   "label": "Clip Volume +3 dB",
+   "resolve": "clipAudioIncreaseAudioLevel3dB"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.volume-down-3",
+   "keys": [
+    "<Alt><Shift>minus"
+   ],
+   "alt": [
+    "<Alt><Shift>underscore",
+    "<Alt>underscore"
+   ],
+   "label": "Clip Volume −3 dB",
+   "resolve": "clipAudioDecreaseAudioLevel3dB"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.video-track-toggle-1",
+   "keys": [
+    "<Primary><Shift>1"
+   ],
+   "alt": [
+    "<Primary>exclam",
+    "<Primary><Shift>exclam"
+   ],
+   "label": "Enable / Disable Video Track 1",
+   "resolve": "editEnableDisableToggleVideoTrack1"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.video-track-toggle-2",
+   "keys": [
+    "<Primary><Shift>2"
+   ],
+   "alt": [
+    "<Primary>at",
+    "<Primary><Shift>at"
+   ],
+   "label": "Enable / Disable Video Track 2",
+   "resolve": "editEnableDisableToggleVideoTrack2"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.video-track-toggle-3",
+   "keys": [
+    "<Primary><Shift>3"
+   ],
+   "alt": [
+    "<Primary>numbersign",
+    "<Primary><Shift>numbersign"
+   ],
+   "label": "Enable / Disable Video Track 3",
+   "resolve": "editEnableDisableToggleVideoTrack3"
+  },
+  {
+   "group": "Trimming",
+   "action": "win.video-track-toggle-4",
+   "keys": [
+    "<Primary><Shift>4"
+   ],
+   "alt": [
+    "<Primary>dollar",
+    "<Primary><Shift>dollar"
+   ],
+   "label": "Enable / Disable Video Track 4",
+   "resolve": "editEnableDisableToggleVideoTrack4"
+  },
+  {
    "group": "View",
    "action": "win.zoom-in",
    "keys": [
@@ -769,6 +1063,36 @@
   },
   {
    "group": "View",
+   "action": "win.viewer-fit",
+   "keys": [
+    "z"
+   ],
+   "alt": [],
+   "label": "Fit Picture to Viewer",
+   "resolve": "viewZoomViewerToFit"
+  },
+  {
+   "group": "View",
+   "action": "win.viewer-actual-size",
+   "keys": [
+    "<Alt><Shift>z"
+   ],
+   "alt": [],
+   "label": "Viewer Actual Size (100%)",
+   "resolve": "viewZoomActualSize"
+  },
+  {
+   "group": "View",
+   "action": "win.viewer-full-page",
+   "keys": [
+    "<Shift>f"
+   ],
+   "alt": [],
+   "label": "Full-Page Viewer",
+   "resolve": "workspaceViewerModeFullViewer"
+  },
+  {
+   "group": "View",
    "action": "win.viewer-cinema",
    "keys": [
     "<Primary>f",
@@ -790,6 +1114,16 @@
   },
   {
    "group": "Panels",
+   "action": "win.focus-source-viewer",
+   "keys": [
+    "<Primary>3"
+   ],
+   "alt": [],
+   "label": "Go to Source Viewer",
+   "resolve": "viewActiveWindowSelectionSourceViewer"
+  },
+  {
+   "group": "Panels",
    "action": "win.focus-timeline",
    "keys": [
     "<Primary>4"
@@ -797,6 +1131,16 @@
    "alt": [],
    "label": "Go to Timeline",
    "resolve": "viewActiveWindowSelectionTimeline"
+  },
+  {
+   "group": "Panels",
+   "action": "win.focus-timeline-viewer",
+   "keys": [
+    "<Primary>5"
+   ],
+   "alt": [],
+   "label": "Go to Timeline Viewer",
+   "resolve": "viewActiveWindowSelectionTimelineViewer"
   },
   {
    "group": "Panels",
@@ -855,6 +1199,18 @@
    "resolve": "workspacePrimaryWorkspaceDeliver"
   },
   {
+   "group": "Pages",
+   "action": "win.project-settings",
+   "keys": [
+    "<Shift>9"
+   ],
+   "alt": [
+    "parenleft"
+   ],
+   "label": "Project Settings",
+   "resolve": "fileProjectSettings"
+  },
+  {
    "group": "File",
    "action": "app.save",
    "keys": [
@@ -863,6 +1219,16 @@
    "alt": [],
    "label": "Save Project",
    "resolve": "fileSaveProject"
+  },
+  {
+   "group": "File",
+   "action": "app.save-as",
+   "keys": [
+    "<Primary><Shift>s"
+   ],
+   "alt": [],
+   "label": "Save Project As",
+   "resolve": "fileSaveProjectAs"
   },
   {
    "group": "File",

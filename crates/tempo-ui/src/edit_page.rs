@@ -200,6 +200,19 @@ impl EditPage {
     }
 }
 
+fn attach_drag(button: &gtk::Button, icon_widget: &gtk::Widget, payload: String) {
+    let source = gtk::DragSource::builder().actions(gtk::gdk::DragAction::COPY).build();
+    source.connect_prepare(move |_, _, _| Some(gtk::gdk::ContentProvider::for_value(&payload.to_value())));
+    // The icon follows the pointer; downgrade avoids retaining a child-to-parent ref cycle.
+    let weak = icon_widget.downgrade();
+    source.connect_drag_begin(move |source, _| {
+        if let Some(widget) = weak.upgrade() {
+            source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&widget))), 28, 12);
+        }
+    });
+    button.add_controller(source);
+}
+
 /// Effects: fades and titles. One click applies an item to the selected clip
 /// or adds it at the playhead.
 fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
@@ -221,8 +234,7 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         sub.set_xalign(0.0);
         list.append(&sub);
     };
-    // `drag`: a transition kind that can also be dragged onto the timeline.
-    let item = |name: &str, tip: &str, icon: &str, drag: Option<&str>, run: Box<dyn Fn(&Rc<AppState>)>| {
+    let item = |name: &str, tip: &str, icon: &str, drag_payload: Option<String>, run: Box<dyn Fn(&Rc<AppState>)>| {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         // hexpand(false): the centred icon inside must not stretch the cell across the row.
         let cell = gtk::Box::builder().width_request(56).hexpand(false).css_classes(["effect-icon"]).build();
@@ -238,14 +250,8 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
         let button = gtk::Button::builder().child(&content).tooltip_text(tip).css_classes(["effect-row"]).build();
         let s = state.clone();
         button.connect_clicked(move |_| run(&s));
-        if let Some(kind) = drag {
-            let source = gtk::DragSource::builder().actions(gtk::gdk::DragAction::COPY).build();
-            let payload = format!("{TRANSITION_PREFIX}{kind}");
-            source.connect_prepare(move |_, _, _| Some(gtk::gdk::ContentProvider::for_value(&payload.to_value())));
-            // The icon follows the pointer.
-            let icon = cell.clone();
-            source.connect_drag_begin(move |source, _| source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&icon))), 28, 12));
-            button.add_controller(source);
+        if let Some(payload) = drag_payload {
+            attach_drag(&button, cell.upcast_ref(), payload);
         }
         list.append(&button);
     };
@@ -268,26 +274,36 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
             _ => ("Dissolve from the previous clip into the next. Drag onto a cut or the start or end of a clip; on a clip edge with no clip next to it, fades from or to transparent", "view-dual-symbolic"),
         };
         let (name, id) = (kind.resolve_name(), kind.effect_id());
-        item(&name, tip, icon, id, Box::new(move |s| actions::add_transition(s, kind.clone())));
+        item(&name, tip, icon, id.map(|id| format!("{TRANSITION_PREFIX}{id}")), Box::new(move |s| actions::add_transition(s, kind.clone())));
     }
     group("Clip Fades");
-    item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some("fade-in"), Box::new(move |s| actions::set_fade(s, true, standard)));
-    item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some("fade-out"), Box::new(move |s| actions::set_fade(s, false, standard)));
+    item("Fade In", "Fade the selected clip in over one second", "go-first-symbolic", Some(format!("{TRANSITION_PREFIX}fade-in")), Box::new(move |s| actions::set_fade(s, true, standard)));
+    item("Fade Out", "Fade the selected clip out over one second", "go-last-symbolic", Some(format!("{TRANSITION_PREFIX}fade-out")), Box::new(move |s| actions::set_fade(s, false, standard)));
     item(
         "Fade In and Out",
         "Fade the selected clip in and out over one second each",
         "media-playback-start-symbolic",
-        Some("fade-in-out"),
+        Some(format!("{TRANSITION_PREFIX}fade-in-out")),
         Box::new(move |s| {
             actions::set_fade(s, true, standard);
             actions::set_fade(s, false, standard);
         }),
     );
-    heading("Titles", "Click to add at the playhead");
-    item("Text", "A title in the middle of the picture", "document-edit-symbolic", None, Box::new(|s| actions::add_title(s, false)));
-    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", None, Box::new(|s| actions::add_title(s, true)));
 
-    heading("Filters", "Click to apply to the selected clip");
+    heading("Audio Transitions", "Drag onto an audio cut or clip edge, or click to add to the selected edit or clip (Shift+T)");
+    item(
+        "Crossfade",
+        "Equal-power crossfade between audio clips. Drag onto an audio cut or clip edge",
+        "audio-volume-high-symbolic",
+        Some(format!("{TRANSITION_PREFIX}crossfade")),
+        Box::new(|s| actions::add_transition(s, TransitionKind::Crossfade)),
+    );
+
+    heading("Titles", "Drag onto the timeline or click to add at the playhead");
+    item("Text", "A title in the middle of the picture", "document-edit-symbolic", Some("TITLE:text".into()), Box::new(|s| actions::add_title(s, false)));
+    item("Lower Third", "A name line near the bottom of the picture", "document-properties-symbolic", Some("TITLE:lower_third".into()), Box::new(|s| actions::add_title(s, true)));
+
+    heading("Filters", "Drag onto a video clip or click to apply to the selected clip");
     // Filters come from plugins, so this part is rebuilt when plugins change.
     let filters = gtk::Box::new(gtk::Orientation::Vertical, 6);
     list.append(&filters);
@@ -302,8 +318,10 @@ fn effects_panel(state: &Rc<AppState>) -> gtk::Box {
                 let text = label(&filter.name, &[]);
                 text.set_xalign(0.0);
                 let button = gtk::Button::builder().child(&text).tooltip_text(format!("Apply {} to the selected clip", filter.name)).css_classes(["effect-row"]).build();
+                let payload = format!("FILTER:{}", filter.id);
                 let s = state.clone();
                 button.connect_clicked(move |_| actions::add_filter(&s, &filter));
+                attach_drag(&button, text.upcast_ref(), payload);
                 filters.append(&button);
             }
             if filters.first_child().is_none() {
@@ -450,5 +468,16 @@ fn toolbar(state: &Rc<AppState>, timeline: &TimelineArea) -> (gtk::CenterBox, [g
 
     let bar = gtk::CenterBox::builder().css_classes(["timeline-toolbar"]).build();
     bar.set_center_widget(Some(&centre));
+    let timeline_help = crate::help::panel_guide_button(
+        "Timeline",
+        "Edit Page Timeline",
+        "Arrange video and audio tracks horizontally. Every cut, trim, transition, and marker edit is undoable with Ctrl+Z.",
+        &[
+            ("Ctrl+\\", "Split under playhead"),
+            ("Shift+Backspace", "Delete & close gap"),
+            ("V then Ctrl+T", "Add transition to cut"),
+        ],
+    );
+    bar.set_end_widget(Some(&timeline_help));
     (bar, [select, trim, blade], [snap, link])
 }
