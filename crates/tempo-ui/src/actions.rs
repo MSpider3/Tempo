@@ -1217,7 +1217,8 @@ pub fn swap_clips(state: &Rc<AppState>, forward: bool) {
     }
 }
 
-/// Adjust selected audio clips' volume by `db` decibels (clamped to the Inspector's 0.0..=2.0).
+/// Adjust selected audio clips' volume by `db` decibels. A nudge never goes past the Inspector's
+/// 200%, and never pulls a clip already above that (set by a plugin or an older project) down.
 pub fn adjust_volume_db(state: &Rc<AppState>, db: f32) {
     let factor = 10.0f32.powf(db / 20.0);
     let done = for_selected(state, "Adjust Volume", |_, clip| {
@@ -1225,7 +1226,7 @@ pub fn adjust_volume_db(state: &Rc<AppState>, db: f32) {
             return None;
         }
         let cur = clip.properties.volume;
-        let next = if db > 0.0 && cur < 0.001 { 0.001 * factor } else { cur * factor }.clamp(0.0, 2.0);
+        let next = if db > 0.0 && cur < 0.001 { 0.001 * factor } else { cur * factor }.clamp(0.0, cur.max(2.0));
         Some(Box::new(SetClipPropertyCommand::new(clip.id, PropertyChange::Volume(next))) as Box<dyn Command>)
     });
     if !done && state.selected_ids().is_empty() {
@@ -2217,6 +2218,13 @@ mod tests {
             adjust_volume_db(&state, 3.0);
         }
         assert_eq!(state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume), Some(2.0));
+        // A clip already above 200% is not turned down by Up, and Down still lowers it.
+        state.execute(Box::new(SetClipPropertyCommand::new(audio_id, PropertyChange::Volume(3.0))));
+        adjust_volume_db(&state, 3.0);
+        assert_eq!(state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume), Some(3.0));
+        adjust_volume_db(&state, -3.0);
+        let vol = state.with_timeline(|t| t.find_clip(audio_id).unwrap().1.properties.volume).unwrap();
+        assert!(vol < 3.0);
 
         // Toggle video track 1 enabled state and undo.
         toggle_video_track(&state, 1);
